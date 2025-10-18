@@ -9,7 +9,7 @@ import generationsRoutes from './routes/generations.routes.js';
 dotenv.config();
 
 const app = express();
-
+console.log(process.env.CORS_ORIGIN);
 // CORS middleware - allow requests from React frontend
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || 'http://localhost:5173');
