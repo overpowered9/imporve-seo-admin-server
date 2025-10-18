@@ -66,3 +66,4 @@ src/data/**/*.sqlite
 src/data/**/*.sqlite3
 src/data/**/*.db-wal
 src/data/**/*.db-shm
+.env.example
