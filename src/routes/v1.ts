@@ -5,6 +5,9 @@ import { generateAiHtmlPost } from '../services/ai_content_genrator.js';
 import { EnhancedAIContentGenerator } from '../services/enhanced-ai-generator.service.js';
 import { PromptManagementService } from '../services/prompt-management.service.js';
 import generationRoutes from './generation.routes.js';
+import authRoutes from './auth.routes.js';
+import websitesRoutes from './websites.routes.js';
+import usersRoutes from './users.routes.js';
 
 export const router = Router();
 
@@ -128,3 +131,6 @@ router.post('/generate', async (req: Request, res: Response, next: NextFunction)
 
 // Mount generation routes
 router.use('/generate', generationRoutes);
+router.use('/auth', authRoutes);
+router.use('/websites', websitesRoutes);
+router.use('/users', usersRoutes);

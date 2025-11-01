@@ -3,6 +3,7 @@ import { contentGenerationService, ContentGenerationRequest } from '../services/
 import { promptService } from '../services/promptService.js';
 import { EnhancedAIContentGenerator } from '../services/enhanced-ai-generator.service.js';
 import { PromptManagementService } from '../services/prompt-management.service.js';
+import { validateApiAccess, validateCredits } from '../middleware/apiAuth.middleware.js';
 
 const router = Router();
 
@@ -325,7 +326,8 @@ router.get('/default-config', async (req: Request, res: Response) => {
  * Generate content using active prompts from database (focused approach)
  * POST /api/generate/active
  */
-router.post('/active', async (req: Request, res: Response) => {
+router.post('/active',validateApiAccess,
+  validateCredits('content', 1), async (req: Request, res: Response) => {
   try {
     const {
       seed_keyword,

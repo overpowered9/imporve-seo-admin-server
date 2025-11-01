@@ -1,41 +1,44 @@
 import express from 'express';
+import cors from 'cors';
 import dotenv from 'dotenv';
 import { router as v1 } from './routes/v1.js';
 import { errorHandler } from './utils/error-handler.js';
 import { connectToDatabase } from './config/database.js';
 import adminPromptRoutes from './routes/admin/prompts.routes.js';
 import generationsRoutes from './routes/generations.routes.js';
+import { testConnection } from './data/db.js';
 
 dotenv.config();
 
 const app = express();
-console.log(process.env.CORS_ORIGIN);
-// CORS middleware - allow requests from React frontend
+
+// CORS configuration
+const corsOptions = {
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:3000',
+    process.env.CORS_ORIGIN || 'http://localhost:5173'
+  ],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization', 'x-api-key', 'x-site-code'],
+  credentials: true
+};
+
+app.use(cors(corsOptions));
+
+// Body parsing middleware - MUST come before routes
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Debug middleware to log requests
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || 'http://localhost:5173');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  
-  // Handle preflight requests
-  if (req.method === 'OPTIONS') {
-    res.sendStatus(200);
-  } else {
-    next();
-  }
+  console.log(`${req.method} ${req.path}`, req.body);
+  next();
 });
 
-app.use(express.json({ limit: '1mb' }));
-
 // ===== ROUTES CONFIGURATION =====
-// Primary AI generation endpoints
 app.use('/api/v1', v1);
-
-// Generation history management
 app.use('/api/v1/generations', generationsRoutes);
-
-// Simplified admin interface for prompt management (focused approach)
-// Features: Read-only templates, version management, testing utilities
-// Supports 12 fixed template types with version control
 app.use('/api/admin', adminPromptRoutes);
 
 // Root health check
@@ -45,6 +48,9 @@ app.get('/health', (req, res) => {
     service: 'improveseo-ai-server',
     features: [
       'AI Content Generation',
+      'User Management',
+      'Website Management',
+      'Credit System',
       'MongoDB Prompt Management',
       'Template Version Control'
     ],
@@ -59,15 +65,22 @@ const port = Number(process.env.PORT || 8080);
 // Initialize database and start server
 async function startServer() {
   try {
+     // Test PostgreSQL connection first
+    const pgConnected = await testConnection();
+    if (!pgConnected) {
+      console.error('❌ Cannot start server without PostgreSQL connection');
+      process.exit(1);
+    }
     // Connect to MongoDB
     await connectToDatabase();
     
     // Start Express server
     app.listen(port, () => {
       console.log(`[improveseo-ai-server] listening on http://localhost:${port}`);
-      console.log(`🚀 Server ready with focused prompt management system`);
+      console.log(`🚀 Server ready with user management system`);
       console.log(`📋 Admin Panel: http://localhost:${port}/api/admin/prompts/health`);
-      console.log(`🔧 Features: 12 fixed templates + version management`);
+      console.log(`🔧 Features: Authentication + Website Management + Credit System`);
+      console.log(`🧪 Test signup: POST ${port}/api/v1/auth/signup`);
     });
   } catch (error) {
     console.error('❌ Failed to start server:', error);
