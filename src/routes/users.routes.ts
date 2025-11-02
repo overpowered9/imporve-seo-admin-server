@@ -217,6 +217,31 @@ router.get('/subscription/:user_id', async (req, res) => {
   }
 });
 
+// Get user generations
+router.get('/generations/:user_id', async (req, res) => {
+  try {
+    const user_id = parseInt(req.params.user_id);
+    const limit = parseInt(req.query.limit as string) || 10;
+    const page = parseInt(req.query.page as string) || 1;
+    const offset = (page - 1) * limit;
+    
+    console.log('🔍 User generations route called:', { user_id, limit, page, offset });
+    
+    const generations = await getUserGenerations(user_id, { limit, offset });
+    
+    res.json({
+      success: true,
+      data: generations
+    });
+  } catch (error) {
+    console.error('Get user generations error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get user generations'
+    });
+  }
+});
+
 // Get user analytics
 router.get('/analytics/:user_id', async (req, res) => {
   try {

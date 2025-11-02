@@ -12,13 +12,9 @@ dotenv.config();
 
 const app = express();
 
-// CORS configuration
+// CORS configuration - Allow all origins for API access
 const corsOptions = {
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:3000',
-    process.env.CORS_ORIGIN || 'http://localhost:5173'
-  ],
+  origin: true, // Allow all origins
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization', 'x-api-key', 'x-site-code'],
   credentials: true
