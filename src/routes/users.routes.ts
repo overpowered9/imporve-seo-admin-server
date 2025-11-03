@@ -1,5 +1,6 @@
 import express from 'express';
 import { z } from 'zod';
+import { validateApiAccess } from '../middleware/apiAuth.middleware.js';
 import { 
   findUserByEmail,
   findUserByApiKey,
@@ -15,6 +16,45 @@ import {
 } from '../models/user.models.js';
 
 const router = express.Router();
+
+// User status endpoint for WordPress plugin connection testing
+router.get('/status', validateApiAccess, async (req, res) => {
+  try {
+    // This endpoint is called with API key authentication
+    // The middleware should have populated req.user and req.website
+    const user = (req as any).user;
+    const website = (req as any).website;
+    
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'User not authenticated'
+      });
+    }
+
+    // Get user credit balances
+    const credits = await getUserCreditBalances(user.id);
+    
+    res.json({
+      success: true,
+      user: user.name || user.email,
+      website: website?.domain,
+      credits: {
+        images: credits.find(c => c.credit_type === 'images')?.amount || 0,
+        content: credits.find(c => c.credit_type === 'content')?.amount || 0,
+        keywords: credits.find(c => c.credit_type === 'keywords')?.amount || 0
+      },
+      server_status: 'connected',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('User status error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get user status'
+    });
+  }
+});
 
 // Get user by email (for frontend auth context)
 router.post('/by-email', async (req, res) => {
