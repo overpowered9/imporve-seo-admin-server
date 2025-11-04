@@ -360,8 +360,8 @@ export class EnhancedAIContentGenerator {
     // Ensure TOC anchors match headings
     content = this.verifyAndFixTOCLinks(content);
 
-    // Optional smooth scroll style (kept minimal)
-    content += '<style>p{padding-bottom:2px!important}html{scroll-behavior:smooth}</style>';
+    // Optional smooth scroll style (properly formatted, without padding for bulk posts)
+    content += '\n<style>\nhtml { scroll-behavior: smooth; }\n</style>';
 
     return content;
   }
@@ -595,15 +595,23 @@ export class EnhancedAIContentGenerator {
   }
 
   private convert_urls_to_links(content: string): string {
-    return content.replace(/(<a\b[^>]*>.*?<\/a>)|((https?:\/\/|www\.)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6}([\/\w.-]*)?)/g, (m, anchor, url) => {
-      if (anchor) return anchor;
+    // Match URLs but skip those already inside anchor tags
+    return content.replace(/(<a\b[^>]*>.*?<\/a>)|((https?:\/\/|www\.)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}([\/\w.~:?#[\]@!$&'()*+,;=%-]*)?)/g, (match, anchorTag, url) => {
+      // If this is already an anchor tag, return it unchanged
+      if (anchorTag) return anchorTag;
+      
+      // Determine the href (add http:// if missing)
       const href = /^https?:\/\//.test(url) ? url : `http://${url}`;
+      
+      // For display text, keep the original format (with https:// or www.)
       return `<a href="${href}" target="_blank" rel="noopener">${url}</a>`;
     });
   }
 
   private stripParenthesesWrappingContactTokens(content: string): string {
+    // Remove parentheses around URLs (preserving the full URL including trailing slashes)
     content = content.replace(/\(\s*((?:https?:\/\/|www\.)[^\s)]+)\s*\)/gi, '$1');
+    // Remove parentheses around emails
     content = content.replace(/\(\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,})\s*\)/g, '$1');
     return content;
   }

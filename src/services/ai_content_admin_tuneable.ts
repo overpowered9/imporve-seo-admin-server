@@ -168,8 +168,8 @@ export async function generateAiHtmlPost2(params: GeneratePostParams): Promise<G
   // Ensure TOC anchors match headings
   content_final = verifyAndFixTOCLinks(content_final);
 
-  // Optional smooth scroll style (kept minimal)
-  content_final += '<style>p{padding-bottom:2px!important}html{scroll-behavior:smooth}</style>';
+  // Optional smooth scroll style (properly formatted, without padding for bulk posts)
+  content_final += '\n<style>\nhtml { scroll-behavior: smooth; }\n</style>';
 
   // Optional meta generation (same style as WP)
   const meta_title = await generateMetaTitle({ apiKey, model, aigeneratedtitle: title || seed_keyword, seed_keyword });
@@ -495,17 +495,23 @@ function convert_emails_to_links(content: string): string {
 }
 
 function convert_urls_to_links(content: string): string {
-  return content.replace(/(<a\b[^>]*>.*?<\/a>)|((https?:\/\/|www\.)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6}([\/\w.-]*)?)/g, (m, anchor, url) => {
-    if (anchor) return anchor; // keep existing anchors
+  // Match URLs but skip those already inside anchor tags
+  return content.replace(/(<a\b[^>]*>.*?<\/a>)|((https?:\/\/|www\.)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}([\/\w.~:?#[\]@!$&'()*+,;=%-]*)?)/g, (match, anchorTag, url) => {
+    // If this is already an anchor tag, return it unchanged
+    if (anchorTag) return anchorTag;
+    
+    // Determine the href (add http:// if missing)
     const href = /^https?:\/\//.test(url) ? url : `http://${url}`;
+    
+    // For display text, keep the original format (with https:// or www.)
     return `<a href="${href}" target="_blank" rel="noopener">${url}</a>`;
   });
 }
 
 function stripParenthesesWrappingContactTokens(content: string): string {
-  // URLs wrapped in parentheses
+  // Remove parentheses around URLs (preserving the full URL including trailing slashes)
   content = content.replace(/\(\s*((?:https?:\/\/|www\.)[^\s)]+)\s*\)/gi, '$1');
-  // Emails wrapped in parentheses
+  // Remove parentheses around emails
   content = content.replace(/\(\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,})\s*\)/g, '$1');
   return content;
 }
