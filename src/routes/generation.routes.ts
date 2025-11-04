@@ -3,7 +3,10 @@ import { contentGenerationService, ContentGenerationRequest } from '../services/
 import { promptService } from '../services/promptService.js';
 import { EnhancedAIContentGenerator } from '../services/enhanced-ai-generator.service.js';
 import { PromptManagementService } from '../services/prompt-management.service.js';
-import { validateApiAccess, validateCredits } from '../middleware/apiAuth.middleware.js';
+import { validateApiAccess, validateCredits, AuthenticatedRequest } from '../middleware/apiAuth.middleware.js';
+import { deductCredits } from '../models/user.models.js';
+import sql from '../data/db.js';
+import { FluxAIService } from '../services/fluxai.service.js';
 
 const router = Router();
 
@@ -326,8 +329,7 @@ router.get('/default-config', async (req: Request, res: Response) => {
  * Generate content using active prompts from database (focused approach)
  * POST /api/generate/active
  */
-router.post('/active',validateApiAccess,
-  validateCredits('content', 1), async (req: Request, res: Response) => {
+router.post('/active', validateApiAccess, validateCredits('content', 1), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const {
       seed_keyword,
@@ -410,9 +412,61 @@ router.post('/active',validateApiAccess,
     console.log(`✅ Dynamic content generated successfully for: "${seed_keyword}"`);
     console.log(`📊 Generation metadata:`, result.generationMetadata);
 
+    // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION
+    const userId = req.user.id;
+    const websiteId = req.website?.id || null;
+    
+    await deductCredits(
+      userId,
+      'content',
+      1,
+      `Content generation for keyword: ${seed_keyword}`
+    );
+
+    // 📝 SAVE GENERATION TO DATABASE
+    const generationRecord = await sql`
+      INSERT INTO user_generations (
+        user_id,
+        website_id,
+        type,
+        status,
+        parameters,
+        result,
+        metadata,
+        processing_time_ms
+      ) VALUES (
+        ${userId},
+        ${websiteId},
+        'content',
+        'success',
+        ${JSON.stringify({
+          seed_keyword,
+          nos_of_words,
+          content_lang,
+          voice_tone,
+          point_of_view,
+          title
+        })},
+        ${JSON.stringify({
+          content: result.content,
+          meta_title: result.meta_title,
+          meta_description: result.meta_descreption
+        })},
+        ${JSON.stringify({
+          promptsUsed: result.promptsUsed,
+          generationMetadata: result.generationMetadata
+        })},
+        ${result.generationMetadata?.processingTime || 0}
+      )
+      RETURNING id
+    `;
+
+    console.log(`💳 Credits deducted and generation saved (ID: ${generationRecord[0].id})`);
+
     res.json({
       success: true,
       data: {
+        generation_id: generationRecord[0].id,
         search_data: result.search_data,
         content: result.content,
         meta_title: result.meta_title,
@@ -558,6 +612,245 @@ router.post('/immediateVersionTesting', async (req: Request, res: Response) => {
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to generate content with version testing'
+    });
+  }
+});
+
+/**
+ * Generate AI Image
+ * POST /api/v1/generate/generateimage
+ */
+router.post('/generateimage', validateApiAccess, validateCredits('images', 1), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const {
+      title,
+      prompt,
+      noedit = false,
+      seed_title,
+      width = 1024,
+      height = 768
+    } = req.body;
+
+    if (!title && !prompt) {
+      return res.status(400).json({
+        success: false,
+        error: 'Either title or prompt is required'
+      });
+    }
+
+    console.log(`🎨 Starting Flux AI image generation for: "${title || prompt}"`);
+
+    const userId = req.user.id;
+    const websiteId = req.website?.id || null;
+    const startTime = Date.now();
+
+    // Initialize Flux AI service
+    const fluxAI = new FluxAIService();
+    const openAiKey = process.env.OPENAI_API_KEY || '';
+
+    if (!openAiKey) {
+      return res.status(500).json({
+        success: false,
+        error: 'OpenAI API key not configured for prompt generation'
+      });
+    }
+
+    let imageUrl: string;
+    let imagePrompt: string;
+
+    if (noedit && prompt) {
+      // Use custom prompt directly (no OpenAI prompt generation)
+      imagePrompt = prompt;
+      console.log('📝 Using custom prompt (no edit mode)');
+
+      const taskId = await fluxAI.generateImage({
+        prompt: imagePrompt,
+        width,
+        height,
+        prompt_upsampling: false,
+        safety_tolerance: 2,
+        output_format: 'jpeg'
+      });
+
+      imageUrl = await fluxAI.getResult(taskId);
+    } else {
+      // Generate prompt using OpenAI + Flux AI (WordPress plugin default flow)
+      const result = await fluxAI.generateImageWithPolling(
+        title || prompt,
+        openAiKey,
+        { width, height }
+      );
+
+      imageUrl = result.imageUrl;
+      imagePrompt = result.promptUsed;
+    }
+
+    const processingTime = Date.now() - startTime;
+
+    // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION
+    await deductCredits(
+      userId,
+      'images',
+      1,
+      `AI image generation for: ${title || prompt}`
+    );
+
+    // 📝 SAVE GENERATION TO DATABASE
+    const generationRecord = await sql`
+      INSERT INTO user_generations (
+        user_id,
+        website_id,
+        type,
+        status,
+        parameters,
+        result,
+        metadata,
+        processing_time_ms
+      ) VALUES (
+        ${userId},
+        ${websiteId},
+        'image',
+        'success',
+        ${JSON.stringify({
+          title: title || prompt,
+          prompt: imagePrompt,
+          width,
+          height,
+          noedit
+        })},
+        ${JSON.stringify({
+          image_url: imageUrl,
+          prompt_used: imagePrompt
+        })},
+        ${JSON.stringify({
+          provider: 'flux-ai',
+          model: 'flux-pro-1.1',
+          generation_time: new Date().toISOString()
+        })},
+        ${processingTime}
+      )
+      RETURNING id
+    `;
+
+    console.log(`✅ Flux AI image generated and saved (ID: ${generationRecord[0].id})`);
+    console.log(`💳 1 image credit deducted for user ${userId}`);
+    console.log(`⏱️ Processing time: ${processingTime}ms`);
+
+    res.json({
+      success: true,
+      data: {
+        generation_id: generationRecord[0].id,
+        image_url: imageUrl,
+        prompt_used: imagePrompt,
+        width,
+        height,
+        processing_time_ms: processingTime
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Flux AI image generation error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to generate AI image'
+    });
+  }
+});
+
+/**
+ * Generate Keyword List
+ * POST /api/v1/generate/generatekeyword
+ */
+router.post('/generatekeyword', validateApiAccess, validateCredits('keywords', 1), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const {
+      seed_keyword,
+      niche,
+      count = 50,
+      include_search_volume = false
+    } = req.body;
+
+    if (!seed_keyword) {
+      return res.status(400).json({
+        success: false,
+        error: 'seed_keyword is required'
+      });
+    }
+
+    console.log(`🔍 Starting keyword generation for: "${seed_keyword}"`);
+
+    // TODO: Replace with actual keyword research service
+    // For now, return mock response
+    const keywords = Array.from({ length: count }, (_, i) => ({
+      keyword: `${seed_keyword} ${['guide', 'tips', 'tutorial', 'benefits', 'examples', 'best practices', 'tools', 'strategies', 'techniques', 'ideas'][i % 10]} ${i + 1}`,
+      search_volume: include_search_volume ? Math.floor(Math.random() * 10000) + 100 : undefined,
+      difficulty: include_search_volume ? Math.floor(Math.random() * 100) : undefined,
+      cpc: include_search_volume ? (Math.random() * 5).toFixed(2) : undefined
+    }));
+
+    const userId = req.user.id;
+    const websiteId = req.website?.id || null;
+
+    // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION
+    await deductCredits(
+      userId,
+      'keywords',
+      1,
+      `Keyword research for: ${seed_keyword}`
+    );
+
+    // 📝 SAVE GENERATION TO DATABASE
+    const generationRecord = await sql`
+      INSERT INTO user_generations (
+        user_id,
+        website_id,
+        type,
+        status,
+        parameters,
+        result,
+        metadata
+      ) VALUES (
+        ${userId},
+        ${websiteId},
+        'keywords',
+        'success',
+        ${JSON.stringify({
+          seed_keyword,
+          niche,
+          count,
+          include_search_volume
+        })},
+        ${JSON.stringify({
+          keywords,
+          total_count: keywords.length
+        })},
+        ${JSON.stringify({
+          provider: 'keyword-research-api',
+          generation_time: Date.now()
+        })}
+      )
+      RETURNING id
+    `;
+
+    console.log(`✅ ${keywords.length} keywords generated and saved (ID: ${generationRecord[0].id})`);
+    console.log(`💳 1 keyword credit deducted for user ${userId}`);
+
+    res.json({
+      success: true,
+      data: {
+        generation_id: generationRecord[0].id,
+        seed_keyword,
+        keywords,
+        total_count: keywords.length,
+        message: '🚧 Mock response - Keyword research service to be integrated'
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Keyword generation error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to generate keywords'
     });
   }
 });

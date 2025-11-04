@@ -8,6 +8,7 @@ export const config = {
   mongoUri: process.env.MONGODB_URI || 'mongodb://localhost:27017/improveseo',
   openaiApiKey: process.env.OPENAI_API_KEY || '',
   openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+  fluxAiApiKey: process.env.FLUX_AI_API_KEY || '',
   corsOrigin: process.env.CORS_ORIGIN || 'http://localhost:5173',
   nodeEnv: process.env.NODE_ENV || 'development'
 };
@@ -15,6 +16,10 @@ export const config = {
 // Validate required environment variables
 if (!config.openaiApiKey) {
   console.warn('⚠️  OPENAI_API_KEY is not set. Content generation will fail.');
+}
+
+if (!config.fluxAiApiKey) {
+  console.warn('⚠️  FLUX_AI_API_KEY is not set. Image generation will fail.');
 }
 
 if (!config.mongoUri) {
