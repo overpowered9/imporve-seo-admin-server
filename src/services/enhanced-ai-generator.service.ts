@@ -613,40 +613,65 @@ export class EnhancedAIContentGenerator {
   }
 
   private removeConsecutiveSpecialCharacters(content: string): string {
+    // Split content into tags and text nodes
     const parts = content.split(/(<[^>]+>)/g);
+    
     for (let i = 0; i < parts.length; i++) {
-      if (/^<[^>]+>$/.test(parts[i])) continue;
-      parts[i] = parts[i].replace(/([#*!\-_.?])\1{2,}/g, '$1');
+      // Skip HTML tags
+      if (parts[i] && parts[i][0] === '<') {
+        continue;
+      }
+      // Within text nodes, remove any run of 2+ non-alphanumeric, non-space characters
+      // This preserves single occurrences but strips sequences (e.g., ### -> '', ** -> '')
+      // Using Unicode-aware pattern to match PHP's \p{L} (letters) and \p{N} (numbers)
+      parts[i] = parts[i].replace(/[^\p{L}\p{N}\s]{2,}/gu, '');
     }
+    
     return parts.join('');
   }
 
   private verifyAndFixTOCLinks(content: string): string {
+    // Parse the content to extract TOC links and headings
     const tocLinks: Record<string, string> = {};
+    const headings: Record<string, string> = {};
+    
+    // Extract TOC links using regex
     const tocRe = /<a href="#([^"]+)">([^<]+)<\/a>/gi;
-    let m: RegExpExecArray | null;
-    
-    while ((m = tocRe.exec(content)) !== null) {
-      tocLinks[m[1]] = (m[2] || '').trim();
+    let tocMatch: RegExpExecArray | null;
+    while ((tocMatch = tocRe.exec(content)) !== null) {
+      tocLinks[tocMatch[1]] = tocMatch[2].trim();
     }
-
-    let updated = content;
-    const headingRe = /<h([2-6])([^>]*)>([^<]+)<\/h\1>/gi;
     
-    updated = updated.replace(headingRe, (full, level, attrs, text) => {
-      let idMatch = (attrs as string).match(/\sid=\"([^\"]+)\"/i);
-      let id = idMatch ? idMatch[1] : null;
-      const cleanText = (text || '').trim();
-      
-      if (!id) {
-        id = this.generateAnchorId(cleanText);
-        const space = attrs && attrs.trim().length ? ' ' : '';
-        return `<h${level}${attrs}${space}id="${id}">${cleanText}</h${level}>`;
+    // Extract headings with IDs using regex
+    const headingRe = /<h([2-6])(?:\s+id="([^"]+)")?>([^<]+)<\/h[2-6]>/gi;
+    let headingMatch: RegExpExecArray | null;
+    while ((headingMatch = headingRe.exec(content)) !== null) {
+      if (headingMatch[2]) {
+        headings[headingMatch[2]] = headingMatch[3].trim();
       }
-      
-      return full;
-    });
-
+    }
+    
+    // Check for missing IDs and fix them
+    let updated = content;
+    
+    for (const [anchor, title] of Object.entries(tocLinks)) {
+      if (!headings[anchor]) {
+        // Find the heading with matching title and add ID
+        const escapedTitle = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const headingPattern = new RegExp(`<h([2-6])(?:\\s+[^>]*)?>\\s*(${escapedTitle})\\s*<\\/h[2-6]>`, 'i');
+        updated = updated.replace(headingPattern, (match, level, text) => {
+          return `<h${level} id="${anchor}">${text}</h${level}>`;
+        });
+      }
+    }
+    
+    // Generate missing TOC links for headings without them (for debugging)
+    for (const [id, title] of Object.entries(headings)) {
+      if (!tocLinks[id]) {
+        console.log(`Missing TOC link for heading: ${title} (ID: ${id})`);
+      }
+    }
+    
     return updated;
   }
 
