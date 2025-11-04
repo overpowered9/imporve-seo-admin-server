@@ -176,15 +176,135 @@ export const getUserSubscription = async (user_id: number) => {
       s.*,
       sp.name as plan_name,
       sp.slug as plan_slug,
+      sp.price_cents as plan_price,
+      sp.image_credits as plan_image_credits,
+      sp.content_credits as plan_content_credits,
+      sp.keyword_credits as plan_keyword_credits,
       sp.scheduled_publishing,
-      sp.course_access
+      sp.course_access,
+      pending_sp.name as pending_plan_name,
+      pending_sp.slug as pending_plan_slug
     FROM subscriptions s
     LEFT JOIN subscription_plans sp ON s.plan_id = sp.id
+    LEFT JOIN subscription_plans pending_sp ON s.pending_plan_id = pending_sp.id
     WHERE s.user_id = ${user_id}
     ORDER BY s.created_at DESC
     LIMIT 1
   `;
   return result[0] || null;
+};
+
+// Get all available subscription plans
+export const getAllSubscriptionPlans = async () => {
+  const result = await sql`
+    SELECT * FROM subscription_plans
+    ORDER BY price_cents ASC
+  `;
+  return result;
+};
+
+// Change subscription plan (upgrade/downgrade)
+export const changePlan = async (
+  user_id: number, 
+  new_plan_id: number, 
+  immediate: boolean = true
+) => {
+  const currentSub = await getUserSubscription(user_id);
+  
+  if (!currentSub) {
+    throw new Error('No active subscription found');
+  }
+
+  if (immediate) {
+    // UPGRADE: Immediate effect + add credits
+    await sql.begin(async sql => {
+      // Update subscription
+      await sql`
+        UPDATE subscriptions
+        SET 
+          previous_plan_id = plan_id,
+          plan_id = ${new_plan_id}
+        WHERE user_id = ${user_id}
+      `;
+
+      // ADD credits (not replace)
+      const newPlan = await sql`SELECT * FROM subscription_plans WHERE id = ${new_plan_id}`;
+      if (newPlan.length > 0) {
+        const plan = newPlan[0];
+        
+        // Add credits to existing balance
+        await sql`
+          UPDATE credit_balances
+          SET amount = amount + ${plan.image_credits}, updated_at = NOW()
+          WHERE user_id = ${user_id} AND credit_type = 'images'
+        `;
+        
+        await sql`
+          UPDATE credit_balances
+          SET amount = amount + ${plan.content_credits}, updated_at = NOW()
+          WHERE user_id = ${user_id} AND credit_type = 'content'
+        `;
+        
+        await sql`
+          UPDATE credit_balances
+          SET amount = amount + ${plan.keyword_credits}, updated_at = NOW()
+          WHERE user_id = ${user_id} AND credit_type = 'keywords'
+        `;
+
+        // Log credit additions
+        await sql`
+          INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
+          VALUES 
+            (${user_id}, 'images', ${plan.image_credits}, 'Plan upgrade credit bonus'),
+            (${user_id}, 'content', ${plan.content_credits}, 'Plan upgrade credit bonus'),
+            (${user_id}, 'keywords', ${plan.keyword_credits}, 'Plan upgrade credit bonus')
+        `;
+      }
+    });
+  } else {
+    // DOWNGRADE: Schedule for next billing date
+    await sql`
+      UPDATE subscriptions
+      SET 
+        pending_plan_id = ${new_plan_id},
+        pending_plan_effective_date = next_billing_date,
+        status = 'pending_downgrade'
+      WHERE user_id = ${user_id}
+    `;
+  }
+};
+
+// Pause subscription
+export const pauseSubscription = async (user_id: number, stripe_subscription_id: string) => {
+  await sql`
+    UPDATE subscriptions
+    SET 
+      status = 'paused',
+      pause_requested_at = NOW()
+    WHERE user_id = ${user_id} AND stripe_subscription_id = ${stripe_subscription_id}
+  `;
+};
+
+// Resume subscription
+export const resumeSubscription = async (user_id: number) => {
+  await sql`
+    UPDATE subscriptions
+    SET 
+      status = 'active',
+      pause_requested_at = NULL
+    WHERE user_id = ${user_id}
+  `;
+};
+
+// Cancel subscription (at period end)
+export const cancelSubscription = async (user_id: number) => {
+  await sql`
+    UPDATE subscriptions
+    SET 
+      cancel_at_period_end = TRUE,
+      cancelled_at = NOW()
+    WHERE user_id = ${user_id}
+  `;
 };
 
 export const getUserAnalytics = async (user_id: number) => {

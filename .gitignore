@@ -69,3 +69,4 @@ src/data/**/*.db-shm
 .env.example
 .env.sample
 .env.sample
+DATABASE_MIGRATIONS.sql

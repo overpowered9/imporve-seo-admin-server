@@ -2,7 +2,16 @@ import express, { Request, Response } from 'express';
 import Stripe from 'stripe';
 import { z } from 'zod';
 import sql from '../data/db.js';
-import { findUserByEmail, getUserCreditBalances, getUserSubscription } from '../models/user.models.js';
+import { 
+  findUserByEmail, 
+  getUserCreditBalances, 
+  getUserSubscription,
+  getAllSubscriptionPlans,
+  changePlan,
+  pauseSubscription,
+  resumeSubscription,
+  cancelSubscription
+} from '../models/user.models.js';
 
 const router = express.Router();
 
@@ -291,7 +300,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
           console.log(`✅ Added ${quantity} ${creditType} credits to user ${userId}`);
         } else {
-          // Handle subscription/plan upgrade
+          // Handle subscription/plan upgrade (checkout completed)
           const planId = parseInt(session.metadata?.plan_id || '1');
 
           // Update user's plan
@@ -301,22 +310,66 @@ router.post('/webhook', async (req: Request, res: Response) => {
             WHERE id = ${userId}
           `;
 
-          // Update or create subscription
+          console.log(`✅ Updated user ${userId} plan to ${planId} (will be activated on subscription.created)`);
+        }
+        break;
+      }
+
+      case 'customer.subscription.created': {
+        const subscription = event.data.object as Stripe.Subscription;
+        
+        // Get user_id from subscription metadata or find by customer
+        const metadata = subscription.metadata;
+        let userId = parseInt(metadata?.user_id || '0');
+
+        if (!userId && subscription.customer) {
+          // Try to find user by checking existing subscriptions or users table
+          const userResult = await sql`
+            SELECT id FROM users WHERE stripe_customer_id = ${subscription.customer as string}
+          `;
+          if (userResult.length > 0) {
+            userId = userResult[0].id;
+          }
+        }
+
+        if (userId) {
+          // Get plan_id from metadata or user's current plan
+          let planId = parseInt(metadata?.plan_id || '0');
+          if (!planId) {
+            const userResult = await sql`SELECT plan_id FROM users WHERE id = ${userId}`;
+            planId = userResult.length > 0 ? userResult[0].plan_id : 1;
+          }
+
+          // Calculate next billing date (use current_period_end timestamp)
+          const nextBillingTimestamp = (subscription as any).current_period_end || Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+
+          // Update or create subscription (user_id is UNIQUE)
           await sql`
-            INSERT INTO subscriptions (user_id, plan_id, status, stripe_subscription_id, next_billing_date)
+            INSERT INTO subscriptions (
+              user_id, 
+              plan_id, 
+              status, 
+              stripe_subscription_id,
+              stripe_customer_id,
+              start_date,
+              next_billing_date
+            )
             VALUES (
               ${userId}, 
               ${planId}, 
               'active', 
-              ${session.subscription as string}, 
-              NOW() + INTERVAL '1 month'
+              ${subscription.id},
+              ${subscription.customer as string},
+              NOW(),
+              TO_TIMESTAMP(${nextBillingTimestamp})
             )
             ON CONFLICT (user_id) 
             DO UPDATE SET 
               plan_id = ${planId},
               status = 'active',
-              stripe_subscription_id = ${session.subscription as string},
-              updated_at = NOW()
+              stripe_subscription_id = ${subscription.id},
+              stripe_customer_id = ${subscription.customer as string},
+              next_billing_date = TO_TIMESTAMP(${nextBillingTimestamp})
           `;
 
           // Refill credits based on new plan
@@ -333,9 +386,37 @@ router.post('/webhook', async (req: Request, res: Response) => {
               ON CONFLICT (user_id, credit_type)
               DO UPDATE SET amount = EXCLUDED.amount, updated_at = NOW()
             `;
-          }
 
-          console.log(`✅ Upgraded user ${userId} to plan ${planId}`);
+            console.log(`✅ Subscription created for user ${userId}, plan ${planId}, credits refilled`);
+          }
+        } else {
+          console.warn(`⚠️ Could not determine user_id for subscription ${subscription.id}`);
+        }
+        break;
+      }
+
+      case 'customer.subscription.updated': {
+        const subscription = event.data.object as Stripe.Subscription;
+        
+        // Find user by subscription ID
+        const subResult = await sql`
+          SELECT user_id FROM subscriptions 
+          WHERE stripe_subscription_id = ${subscription.id}
+        `;
+
+        if (subResult.length > 0) {
+          const userId = subResult[0].user_id;
+          const nextBillingTimestamp = (subscription as any).current_period_end || Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+
+          await sql`
+            UPDATE subscriptions 
+            SET 
+              status = ${subscription.status},
+              next_billing_date = TO_TIMESTAMP(${nextBillingTimestamp})
+            WHERE stripe_subscription_id = ${subscription.id}
+          `;
+
+          console.log(`✅ Subscription updated for user ${userId}, status: ${subscription.status}`);
         }
         break;
       }
@@ -360,17 +441,70 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
           await sql`
             UPDATE subscriptions 
-            SET status = 'cancelled', updated_at = NOW()
+            SET status = 'cancelled'
             WHERE user_id = ${userId}
           `;
 
-          console.log(`⚠️ Subscription cancelled for user ${userId}`);
+          console.log(`⚠️ Subscription cancelled for user ${userId}, downgraded to basic plan`);
+        }
+        break;
+      }
+
+      case 'invoice.payment_succeeded': {
+        const invoice = event.data.object as Stripe.Invoice;
+        
+        if ((invoice as any).subscription) {
+          // Find user by subscription ID
+          const subResult = await sql`
+            SELECT user_id, plan_id FROM subscriptions 
+            WHERE stripe_subscription_id = ${(invoice as any).subscription as string}
+          `;
+
+          if (subResult.length > 0) {
+            const { user_id, plan_id } = subResult[0];
+
+            // Refill credits for monthly billing
+            const planResult = await sql`SELECT * FROM subscription_plans WHERE id = ${plan_id}`;
+            if (planResult.length > 0) {
+              const plan = planResult[0];
+
+              await sql`
+                INSERT INTO credit_balances (user_id, credit_type, amount)
+                VALUES 
+                  (${user_id}, 'images', ${plan.image_credits}),
+                  (${user_id}, 'content', ${plan.content_credits}),
+                  (${user_id}, 'keywords', ${plan.keyword_credits})
+                ON CONFLICT (user_id, credit_type)
+                DO UPDATE SET amount = EXCLUDED.amount, updated_at = NOW()
+              `;
+
+              console.log(`✅ Monthly credits refilled for user ${user_id} (invoice paid)`);
+            }
+          }
+        }
+        break;
+      }
+
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object as Stripe.Invoice;
+        
+        if ((invoice as any).subscription) {
+          const subResult = await sql`
+            SELECT user_id FROM subscriptions 
+            WHERE stripe_subscription_id = ${(invoice as any).subscription as string}
+          `;
+
+          if (subResult.length > 0) {
+            const userId = subResult[0].user_id;
+            console.warn(`⚠️ Payment failed for user ${userId}, subscription may be at risk`);
+            // You could send an email notification here
+          }
         }
         break;
       }
 
       default:
-        console.log(`Unhandled event type: ${event.type}`);
+        console.log(`ℹ️ Unhandled event type: ${event.type}`);
     }
 
     res.json({ received: true });
@@ -384,24 +518,248 @@ router.post('/webhook', async (req: Request, res: Response) => {
 });
 
 /**
- * Get subscription plans
+ * Get subscription plans with comparison to user's current plan
  * GET /api/v1/stripe/plans
  */
 router.get('/plans', async (req: Request, res: Response) => {
   try {
-    const plans = await sql`
-      SELECT * FROM subscription_plans
-      ORDER BY price_cents ASC
-    `;
+    const user_id = req.query.user_id ? parseInt(req.query.user_id as string) : null;
+    
+    const plans = await getAllSubscriptionPlans();
+    
+    let currentPlanId = null;
+    if (user_id) {
+      const subscription = await getUserSubscription(user_id);
+      currentPlanId = subscription?.plan_id;
+    }
 
     res.json({
       success: true,
-      data: plans
+      data: plans.map((plan: any) => ({
+        ...plan,
+        is_current: plan.id === currentPlanId,
+        can_upgrade: currentPlanId ? plan.price_cents > plans.find((p: any) => p.id === currentPlanId)?.price_cents : true,
+        can_downgrade: currentPlanId ? plan.price_cents < plans.find((p: any) => p.id === currentPlanId)?.price_cents : false
+      }))
     });
   } catch (error) {
     res.status(500).json({
       success: false,
       error: 'Failed to fetch plans'
+    });
+  }
+});
+
+/**
+ * Change subscription plan (upgrade or downgrade)
+ * POST /api/v1/stripe/change-plan
+ */
+router.post('/change-plan', async (req: Request, res: Response) => {
+  try {
+    const { user_id, new_plan_id } = z.object({
+      user_id: z.number(),
+      new_plan_id: z.number()
+    }).parse(req.body);
+
+    // Get current subscription
+    const currentSub = await getUserSubscription(user_id);
+    if (!currentSub) {
+      return res.status(404).json({
+        success: false,
+        error: 'No active subscription found'
+      });
+    }
+
+    // Get plan details
+    const [currentPlan, newPlan] = await Promise.all([
+      sql`SELECT * FROM subscription_plans WHERE id = ${currentSub.plan_id}`,
+      sql`SELECT * FROM subscription_plans WHERE id = ${new_plan_id}`
+    ]);
+
+    if (newPlan.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'New plan not found'
+      });
+    }
+
+    const isUpgrade = newPlan[0].price_cents > currentPlan[0].price_cents;
+
+    // Change plan in database
+    await changePlan(user_id, new_plan_id, isUpgrade);
+
+    // Update Stripe subscription if exists
+    if (currentSub.stripe_subscription_id) {
+      try {
+        // For now, we'll handle plan changes via Stripe dashboard or Price IDs
+        // In production, store Stripe Price IDs in subscription_plans table
+        
+        if (isUpgrade) {
+          // Immediate billing for upgrades
+          await stripe.subscriptions.update(currentSub.stripe_subscription_id, {
+            proration_behavior: 'create_prorations',
+            billing_cycle_anchor: 'now'
+          });
+        } else {
+          // Schedule downgrade for next billing cycle
+          await stripe.subscriptions.update(currentSub.stripe_subscription_id, {
+            proration_behavior: 'none'
+          });
+        }
+      } catch (stripeError) {
+        console.error('Stripe update error:', stripeError);
+        // Continue anyway as DB is already updated
+      }
+    }
+
+    res.json({
+      success: true,
+      message: isUpgrade 
+        ? 'Plan upgraded successfully! Credits have been added to your account.' 
+        : `Plan downgrade scheduled for ${currentSub.next_billing_date}`,
+      data: {
+        isUpgrade,
+        effective_date: isUpgrade ? new Date() : currentSub.next_billing_date,
+        new_plan: newPlan[0].name
+      }
+    });
+
+  } catch (error) {
+    console.error('Change plan error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to change plan'
+    });
+  }
+});
+
+/**
+ * Pause subscription
+ * POST /api/v1/stripe/pause-subscription
+ */
+router.post('/pause-subscription', async (req: Request, res: Response) => {
+  try {
+    const { user_id } = z.object({
+      user_id: z.number()
+    }).parse(req.body);
+
+    const subscription = await getUserSubscription(user_id);
+    if (!subscription) {
+      return res.status(404).json({
+        success: false,
+        error: 'No active subscription found'
+      });
+    }
+
+    // Pause in Stripe
+    if (subscription.stripe_subscription_id) {
+      await stripe.subscriptions.update(subscription.stripe_subscription_id, {
+        pause_collection: {
+          behavior: 'void'
+        }
+      });
+    }
+
+    // Pause in database
+    await pauseSubscription(user_id, subscription.stripe_subscription_id);
+
+    res.json({
+      success: true,
+      message: 'Subscription paused successfully. Billing has been stopped.'
+    });
+
+  } catch (error) {
+    console.error('Pause subscription error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to pause subscription'
+    });
+  }
+});
+
+/**
+ * Resume subscription
+ * POST /api/v1/stripe/resume-subscription
+ */
+router.post('/resume-subscription', async (req: Request, res: Response) => {
+  try {
+    const { user_id } = z.object({
+      user_id: z.number()
+    }).parse(req.body);
+
+    const subscription = await getUserSubscription(user_id);
+    if (!subscription) {
+      return res.status(404).json({
+        success: false,
+        error: 'No subscription found'
+      });
+    }
+
+    // Resume in Stripe
+    if (subscription.stripe_subscription_id) {
+      await stripe.subscriptions.update(subscription.stripe_subscription_id, {
+        pause_collection: null as any
+      });
+    }
+
+    // Resume in database
+    await resumeSubscription(user_id);
+
+    res.json({
+      success: true,
+      message: 'Subscription resumed successfully. Billing will continue.'
+    });
+
+  } catch (error) {
+    console.error('Resume subscription error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to resume subscription'
+    });
+  }
+});
+
+/**
+ * Cancel subscription (at period end)
+ * POST /api/v1/stripe/cancel-subscription
+ */
+router.post('/cancel-subscription', async (req: Request, res: Response) => {
+  try {
+    const { user_id } = z.object({
+      user_id: z.number()
+    }).parse(req.body);
+
+    const subscription = await getUserSubscription(user_id);
+    if (!subscription) {
+      return res.status(404).json({
+        success: false,
+        error: 'No active subscription found'
+      });
+    }
+
+    // Cancel in Stripe at period end
+    if (subscription.stripe_subscription_id) {
+      await stripe.subscriptions.update(subscription.stripe_subscription_id, {
+        cancel_at_period_end: true
+      });
+    }
+
+    // Mark in database
+    await cancelSubscription(user_id);
+
+    res.json({
+      success: true,
+      message: `Subscription will be cancelled on ${subscription.next_billing_date}. You can continue using your credits until then.`,
+      data: {
+        cancellation_date: subscription.next_billing_date
+      }
+    });
+
+  } catch (error) {
+    console.error('Cancel subscription error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to cancel subscription'
     });
   }
 });
