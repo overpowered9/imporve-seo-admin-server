@@ -249,8 +249,9 @@ router.post('/upgrade-plan', async (req: Request, res: Response) => {
 /**
  * Stripe webhook handler
  * POST /api/v1/stripe/webhook
+ * NOTE: Raw body middleware is configured in main server file (index.ts)
  */
-router.post('/webhook', express.raw({ type: 'application/json' }), async (req: Request, res: Response) => {
+router.post('/webhook', async (req: Request, res: Response) => {
   const sig = req.headers['stripe-signature'] as string;
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
 
