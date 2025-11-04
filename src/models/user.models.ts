@@ -263,7 +263,14 @@ export const getUserWebsiteStats = async (user_id: number) => {
   }));
 };
 
-export const deductCredits = async (user_id: number, credit_type: string, amount: number, reason: string) => {
+export const deductCredits = async (
+  user_id: number, 
+  credit_type: string, 
+  amount: number, 
+  reason: string,
+  website_id?: number,
+  generation_id?: number
+) => {
   await sql.begin(async sql => {
     // Deduct credits
     await sql`
@@ -272,10 +279,17 @@ export const deductCredits = async (user_id: number, credit_type: string, amount
       WHERE user_id = ${user_id} AND credit_type = ${credit_type}
     `;
     
-    // Log transaction
+    // Log transaction with website_id and generation_id
     await sql`
-      INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
-      VALUES (${user_id}, ${credit_type}, ${-amount}, ${reason})
+      INSERT INTO credit_transactions (user_id, credit_type, delta, reason, website_id, generation_id)
+      VALUES (
+        ${user_id}, 
+        ${credit_type}, 
+        ${-amount}, 
+        ${reason},
+        ${website_id || null},
+        ${generation_id || null}
+      )
     `;
   });
 };

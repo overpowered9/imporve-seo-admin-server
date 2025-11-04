@@ -169,7 +169,7 @@ export async function generateAiHtmlPost(params: GeneratePostParams): Promise<Ge
   content_final = verifyAndFixTOCLinks(content_final);
 
   // Optional smooth scroll style (properly formatted, without padding for bulk posts)
-  content_final += '\n<style>\nhtml { scroll-behavior: smooth; }\n</style>';
+  
 
   // Optional meta generation (same style as WP)
   const meta_title = await generateMetaTitle({ apiKey, model, aigeneratedtitle: title || seed_keyword, seed_keyword });

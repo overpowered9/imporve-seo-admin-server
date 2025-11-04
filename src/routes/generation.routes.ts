@@ -412,18 +412,10 @@ router.post('/active', validateApiAccess, validateCredits('content', 1), async (
     console.log(`✅ Dynamic content generated successfully for: "${seed_keyword}"`);
     console.log(`📊 Generation metadata:`, result.generationMetadata);
 
-    // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION
+    // � SAVE GENERATION TO DATABASE FIRST (to get generation_id)
     const userId = req.user.id;
     const websiteId = req.website?.id || null;
     
-    await deductCredits(
-      userId,
-      'content',
-      1,
-      `Content generation for keyword: ${seed_keyword}`
-    );
-
-    // 📝 SAVE GENERATION TO DATABASE
     const generationRecord = await sql`
       INSERT INTO user_generations (
         user_id,
@@ -461,12 +453,24 @@ router.post('/active', validateApiAccess, validateCredits('content', 1), async (
       RETURNING id
     `;
 
-    console.log(`💳 Credits deducted and generation saved (ID: ${generationRecord[0].id})`);
+    const generationId = generationRecord[0].id;
+
+    // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION (with website_id and generation_id)
+    await deductCredits(
+      userId,
+      'content',
+      1,
+      `Content generation for keyword: ${seed_keyword}`,
+      websiteId,
+      generationId
+    );
+
+    console.log(`💳 Credits deducted and generation saved (ID: ${generationId})`);
 
     res.json({
       success: true,
       data: {
-        generation_id: generationRecord[0].id,
+        generation_id: generationId,
         search_data: result.search_data,
         content: result.content,
         meta_title: result.meta_title,
@@ -687,15 +691,7 @@ router.post('/generateimage', validateApiAccess, validateCredits('images', 1), a
 
     const processingTime = Date.now() - startTime;
 
-    // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION
-    await deductCredits(
-      userId,
-      'images',
-      1,
-      `AI image generation for: ${title || prompt}`
-    );
-
-    // 📝 SAVE GENERATION TO DATABASE
+    // � SAVE GENERATION TO DATABASE FIRST (to get generation_id)
     const generationRecord = await sql`
       INSERT INTO user_generations (
         user_id,
@@ -732,14 +728,26 @@ router.post('/generateimage', validateApiAccess, validateCredits('images', 1), a
       RETURNING id
     `;
 
-    console.log(`✅ Flux AI image generated and saved (ID: ${generationRecord[0].id})`);
+    const generationId = generationRecord[0].id;
+
+    // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION (with website_id and generation_id)
+    await deductCredits(
+      userId,
+      'images',
+      1,
+      `AI image generation for: ${title || prompt}`,
+      websiteId,
+      generationId
+    );
+
+    console.log(`✅ Flux AI image generated and saved (ID: ${generationId})`);
     console.log(`💳 1 image credit deducted for user ${userId}`);
     console.log(`⏱️ Processing time: ${processingTime}ms`);
 
     res.json({
       success: true,
       data: {
-        generation_id: generationRecord[0].id,
+        generation_id: generationId,
         image_url: imageUrl,
         prompt_used: imagePrompt,
         width,
@@ -791,15 +799,7 @@ router.post('/generatekeyword', validateApiAccess, validateCredits('keywords', 1
     const userId = req.user.id;
     const websiteId = req.website?.id || null;
 
-    // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION
-    await deductCredits(
-      userId,
-      'keywords',
-      1,
-      `Keyword research for: ${seed_keyword}`
-    );
-
-    // 📝 SAVE GENERATION TO DATABASE
+    // � SAVE GENERATION TO DATABASE FIRST (to get generation_id)
     const generationRecord = await sql`
       INSERT INTO user_generations (
         user_id,
@@ -832,13 +832,25 @@ router.post('/generatekeyword', validateApiAccess, validateCredits('keywords', 1
       RETURNING id
     `;
 
-    console.log(`✅ ${keywords.length} keywords generated and saved (ID: ${generationRecord[0].id})`);
+    const generationId = generationRecord[0].id;
+
+    // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION (with website_id and generation_id)
+    await deductCredits(
+      userId,
+      'keywords',
+      1,
+      `Keyword research for: ${seed_keyword}`,
+      websiteId,
+      generationId
+    );
+
+    console.log(`✅ ${keywords.length} keywords generated and saved (ID: ${generationId})`);
     console.log(`💳 1 keyword credit deducted for user ${userId}`);
 
     res.json({
       success: true,
       data: {
-        generation_id: generationRecord[0].id,
+        generation_id: generationId,
         seed_keyword,
         keywords,
         total_count: keywords.length,

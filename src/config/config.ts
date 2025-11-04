@@ -9,6 +9,9 @@ export const config = {
   openaiApiKey: process.env.OPENAI_API_KEY || '',
   openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',
   fluxAiApiKey: process.env.FLUX_AI_API_KEY || '',
+  stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
+  stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
+  stripePublishableKey: process.env.STRIPE_PUBLISHABLE_KEY || '',
   corsOrigin: process.env.CORS_ORIGIN || 'http://localhost:5173',
   nodeEnv: process.env.NODE_ENV || 'development'
 };
@@ -20,6 +23,10 @@ if (!config.openaiApiKey) {
 
 if (!config.fluxAiApiKey) {
   console.warn('⚠️  FLUX_AI_API_KEY is not set. Image generation will fail.');
+}
+
+if (!config.stripeSecretKey && config.nodeEnv === 'production') {
+  console.warn('⚠️  STRIPE_SECRET_KEY is not set. Payment processing will fail.');
 }
 
 if (!config.mongoUri) {

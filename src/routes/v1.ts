@@ -8,6 +8,7 @@ import generationRoutes from './generation.routes.js';
 import authRoutes from './auth.routes.js';
 import websitesRoutes from './websites.routes.js';
 import usersRoutes from './users.routes.js';
+import stripeRoutes from './stripe.routes.js';
 
 export const router = Router();
 
@@ -134,3 +135,4 @@ router.use('/generate', generationRoutes);
 router.use('/auth', authRoutes);
 router.use('/websites', websitesRoutes);
 router.use('/users', usersRoutes);
+router.use('/stripe', stripeRoutes);

@@ -361,7 +361,7 @@ export class EnhancedAIContentGenerator {
     content = this.verifyAndFixTOCLinks(content);
 
     // Optional smooth scroll style (properly formatted, without padding for bulk posts)
-    content += '\n<style>\nhtml { scroll-behavior: smooth; }\n</style>';
+    
 
     return content;
   }
