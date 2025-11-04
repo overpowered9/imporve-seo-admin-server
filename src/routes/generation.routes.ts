@@ -867,4 +867,88 @@ router.post('/generatekeyword', validateApiAccess, validateCredits('keywords', 1
   }
 });
 
+/**
+ * Deduct Keyword Credits Only (for plugin-generated keywords)
+ * POST /api/v1/generate/generatekeywordded
+ * 
+ * This endpoint only deducts keyword credits without generating anything.
+ * Used when the WordPress plugin generates keywords on its own but needs to track credit usage.
+ */
+router.post('/generatekeywordded', validateApiAccess, validateCredits('keywords', 1), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const {
+      seed_keyword,
+      count = 1,
+      reason
+    } = req.body;
+
+    const userId = req.user.id;
+    const websiteId = req.website?.id || null;
+
+    console.log(`💳 Deducting keyword credits for plugin generation: "${seed_keyword || 'N/A'}"`);
+
+    // � SAVE MINIMAL GENERATION RECORD (to get generation_id)
+    const generationRecord = await sql`
+      INSERT INTO user_generations (
+        user_id,
+        website_id,
+        type,
+        status,
+        parameters,
+        result,
+        metadata
+      ) VALUES (
+        ${userId},
+        ${websiteId},
+        'keywords',
+        'success',
+        ${JSON.stringify({
+          seed_keyword: seed_keyword || 'Plugin-generated',
+          count,
+          source: 'wordpress-plugin'
+        })},
+        ${JSON.stringify({
+          message: 'Credits deducted for plugin-generated keywords',
+          count
+        })},
+        ${JSON.stringify({
+          provider: 'wordpress-plugin',
+          generation_time: new Date().toISOString()
+        })}
+      )
+      RETURNING id
+    `;
+
+    const generationId = generationRecord[0].id;
+
+    // 🔥 DEDUCT CREDITS (with website_id and generation_id)
+    await deductCredits(
+      userId,
+      'keywords',
+      count,
+      reason || `Plugin keyword generation: ${seed_keyword || 'N/A'}`,
+      websiteId,
+      generationId
+    );
+
+    console.log(`✅ ${count} keyword credit(s) deducted for user ${userId} (Generation ID: ${generationId})`);
+
+    res.json({
+      success: true,
+      data: {
+        generation_id: generationId,
+        credits_deducted: count,
+        message: 'Keyword credits deducted successfully'
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Keyword credit deduction error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to deduct keyword credits'
+    });
+  }
+});
+
 export default router;
