@@ -535,7 +535,7 @@ router.get('/plans', async (req: Request, res: Response) => {
 
     res.json({
       success: true,
-      data: plans.map((plan: any) => ({
+      plans: plans.map((plan: any) => ({
         ...plan,
         is_current: plan.id === currentPlanId,
         can_upgrade: currentPlanId ? plan.price_cents > plans.find((p: any) => p.id === currentPlanId)?.price_cents : true,
