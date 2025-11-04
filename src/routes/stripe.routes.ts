@@ -617,11 +617,9 @@ router.post('/change-plan', async (req: Request, res: Response) => {
       message: isUpgrade 
         ? 'Plan upgraded successfully! Credits have been added to your account.' 
         : `Plan downgrade scheduled for ${currentSub.next_billing_date}`,
-      data: {
-        isUpgrade,
-        effective_date: isUpgrade ? new Date() : currentSub.next_billing_date,
-        new_plan: newPlan[0].name
-      }
+      immediate: isUpgrade,
+      effective_date: isUpgrade ? new Date().toISOString() : currentSub.next_billing_date,
+      new_plan: newPlan[0].name
     });
 
   } catch (error) {
