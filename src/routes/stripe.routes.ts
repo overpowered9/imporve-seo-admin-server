@@ -551,6 +551,89 @@ router.get('/plans', async (req: Request, res: Response) => {
 });
 
 /**
+ * Create checkout session for plan subscription (from FREE to PAID)
+ * POST /api/v1/stripe/subscribe-to-plan
+ */
+router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
+  try {
+    const { user_id, plan_id } = z.object({
+      user_id: z.number(),
+      plan_id: z.number()
+    }).parse(req.body);
+
+    // Get user and plan
+    const [userResult, planResult] = await Promise.all([
+      sql`SELECT email, id FROM users WHERE id = ${user_id}`,
+      sql`SELECT * FROM subscription_plans WHERE id = ${plan_id}`
+    ]);
+
+    if (userResult.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    if (planResult.length === 0) {
+      return res.status(404).json({ success: false, error: 'Plan not found' });
+    }
+
+    const user = userResult[0];
+    const plan = planResult[0];
+
+    // Don't allow subscribing to FREE plan via this endpoint
+    if (plan.price_cents === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot subscribe to free plan via this endpoint'
+      });
+    }
+
+    // Validate plan has Stripe Price ID
+    if (!plan.stripe_price_id) {
+      return res.status(500).json({
+        success: false,
+        error: 'Stripe Price ID not configured for this plan. Please contact support.'
+      });
+    }
+
+    console.log(`🎫 Creating checkout session for user ${user_id} to subscribe to ${plan.name}`);
+
+    // Create Stripe Checkout Session
+    const session = await stripe.checkout.sessions.create({
+      customer_email: user.email,
+      payment_method_types: ['card'],
+      line_items: [{
+        price: plan.stripe_price_id,
+        quantity: 1,
+      }],
+      mode: 'subscription',
+      success_url: `${process.env.FRONTEND_URL || 'http://localhost:3001'}/dashboard?subscription=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:3001'}/dashboard?subscription=cancelled`,
+      metadata: {
+        user_id: user_id.toString(),
+        plan_id: plan_id.toString(),
+        upgrade_from_free: 'true'
+      }
+    });
+
+    console.log(`✅ Checkout session created: ${session.id}`);
+
+    res.json({
+      success: true,
+      data: {
+        session_id: session.id,
+        url: session.url
+      }
+    });
+
+  } catch (error) {
+    console.error('Subscribe to plan error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to create checkout session'
+    });
+  }
+});
+
+/**
  * Change subscription plan (upgrade or downgrade)
  * POST /api/v1/stripe/change-plan
  */
@@ -563,10 +646,13 @@ router.post('/change-plan', async (req: Request, res: Response) => {
 
     // Get current subscription
     const currentSub = await getUserSubscription(user_id);
+    
+    // If no subscription = FREE tier user trying to upgrade
     if (!currentSub) {
-      return res.status(404).json({
+      return res.status(400).json({
         success: false,
-        error: 'No active subscription found'
+        error: 'No active subscription. Use /subscribe-to-plan endpoint for first subscription.',
+        requires_checkout: true
       });
     }
 

@@ -87,17 +87,33 @@ export const validatePassword = async (password: string, hash: string): Promise<
   return await bcrypt.compare(password, hash);
 };
 
-export const initializeUserCredits = async (user_id: number, plan_id: number): Promise<void> => {
+export const initializeUserCredits = async (user_id: number, plan_id?: number): Promise<void> => {
+  // If no plan_id provided, use FREE plan
+  let resolvedPlanId: number;
+  
+  if (!plan_id) {
+    const freePlan = await sql`
+      SELECT * FROM subscription_plans WHERE slug = 'free' LIMIT 1
+    `;
+    if (freePlan.length > 0) {
+      resolvedPlanId = freePlan[0].id as number;
+    } else {
+      throw new Error('FREE plan not configured in database');
+    }
+  } else {
+    resolvedPlanId = plan_id;
+  }
+  
   // Get plan details
   const plan = await sql`
-    SELECT * FROM subscription_plans WHERE id = ${plan_id} LIMIT 1
+    SELECT * FROM subscription_plans WHERE id = ${resolvedPlanId} LIMIT 1
   `;
   
   if (!plan[0]) throw new Error('Invalid plan');
   
   const planData = plan[0] as SubscriptionPlan;
   
-  // Initialize credit balances
+  // Initialize credit balances (one-time for free tier, monthly for paid)
   await sql`
     INSERT INTO credit_balances (user_id, credit_type, amount)
     VALUES 
@@ -106,15 +122,19 @@ export const initializeUserCredits = async (user_id: number, plan_id: number): P
       (${user_id}, 'keywords', ${planData.keyword_credits})
   `;
   
-  // Create subscription record
-  const startDate = new Date();
-  const nextBilling = new Date();
-  nextBilling.setMonth(nextBilling.getMonth() + 1);
-  
-  await sql`
-    INSERT INTO subscriptions (user_id, plan_id, start_date, next_billing_date, status)
-    VALUES (${user_id}, ${plan_id}, ${startDate.toISOString().split('T')[0]}, ${nextBilling.toISOString().split('T')[0]}, 'active')
-  `;
+  // ONLY create subscription record for PAID plans
+  // Free tier users have NO subscription
+  if (planData.price_cents > 0) {
+    const startDate = new Date();
+    const nextBilling = new Date();
+    nextBilling.setMonth(nextBilling.getMonth() + 1);
+    
+    await sql`
+      INSERT INTO subscriptions (user_id, plan_id, start_date, next_billing_date, status)
+      VALUES (${user_id}, ${resolvedPlanId}, ${startDate.toISOString().split('T')[0]}, ${nextBilling.toISOString().split('T')[0]}, 'active')
+    `;
+  }
+  // Free tier: No subscription record is created
 };
 
 export const getUserWithPlan = async (user_id: number) => {
