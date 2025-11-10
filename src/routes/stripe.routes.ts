@@ -571,55 +571,88 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     }
 
     // Get plan details
-    const [currentPlan, newPlan] = await Promise.all([
+    const [currentPlanData, newPlanData] = await Promise.all([
       sql`SELECT * FROM subscription_plans WHERE id = ${currentSub.plan_id}`,
       sql`SELECT * FROM subscription_plans WHERE id = ${new_plan_id}`
     ]);
 
-    if (newPlan.length === 0) {
+    if (newPlanData.length === 0) {
       return res.status(404).json({
         success: false,
         error: 'New plan not found'
       });
     }
 
-    const isUpgrade = newPlan[0].price_cents > currentPlan[0].price_cents;
+    const currentPlan = currentPlanData[0];
+    const newPlan = newPlanData[0];
+    const isUpgrade = newPlan.price_cents > currentPlan.price_cents;
 
-    // Change plan in database
-    await changePlan(user_id, new_plan_id, isUpgrade);
+    // Validate that Stripe Price IDs are configured
+    if (!newPlan.stripe_price_id) {
+      return res.status(500).json({
+        success: false,
+        error: 'Stripe Price ID not configured for the selected plan. Please contact support.'
+      });
+    }
 
     // Update Stripe subscription if exists
     if (currentSub.stripe_subscription_id) {
       try {
-        // For now, we'll handle plan changes via Stripe dashboard or Price IDs
-        // In production, store Stripe Price IDs in subscription_plans table
+        console.log(`🔄 Updating Stripe subscription ${currentSub.stripe_subscription_id}`);
+        console.log(`📊 ${isUpgrade ? 'UPGRADE' : 'DOWNGRADE'}: ${currentPlan.name} → ${newPlan.name}`);
+
+        // Retrieve current subscription to get the subscription item ID
+        const stripeSubscription = await stripe.subscriptions.retrieve(
+          currentSub.stripe_subscription_id
+        );
+
+        if (!stripeSubscription.items.data[0]) {
+          throw new Error('No subscription items found');
+        }
+
+        // Update subscription with new price
+        await stripe.subscriptions.update(currentSub.stripe_subscription_id, {
+          items: [{
+            id: stripeSubscription.items.data[0].id,
+            price: newPlan.stripe_price_id, // ✅ Change the price
+          }],
+          proration_behavior: isUpgrade ? 'create_prorations' : 'none',
+          billing_cycle_anchor: 'unchanged' // Keep same billing date
+        });
+
+        console.log(`✅ Stripe subscription updated successfully`);
         
         if (isUpgrade) {
-          // Immediate billing for upgrades
-          await stripe.subscriptions.update(currentSub.stripe_subscription_id, {
-            proration_behavior: 'create_prorations',
-            billing_cycle_anchor: 'now'
-          });
+          console.log(`💳 Prorated charge will be created automatically by Stripe`);
         } else {
-          // Schedule downgrade for next billing cycle
-          await stripe.subscriptions.update(currentSub.stripe_subscription_id, {
-            proration_behavior: 'none'
-          });
+          console.log(`📅 Downgrade scheduled for next billing date`);
         }
+
       } catch (stripeError) {
-        console.error('Stripe update error:', stripeError);
-        // Continue anyway as DB is already updated
+        console.error('❌ Stripe update error:', stripeError);
+        
+        // Rollback - don't update database if Stripe fails
+        return res.status(500).json({
+          success: false,
+          error: stripeError instanceof Error 
+            ? `Stripe error: ${stripeError.message}` 
+            : 'Failed to update Stripe subscription'
+        });
       }
     }
+
+    // Update database (only after Stripe succeeds)
+    await changePlan(user_id, new_plan_id, isUpgrade);
+    console.log(`✅ Database updated successfully`);
 
     res.json({
       success: true,
       message: isUpgrade 
-        ? 'Plan upgraded successfully! Credits have been added to your account.' 
-        : `Plan downgrade scheduled for ${currentSub.next_billing_date}`,
+        ? 'Plan upgraded! Prorated charge applied. Credits have been added to your account.' 
+        : `Plan downgrade scheduled for ${currentSub.next_billing_date}. No charge today.`,
       immediate: isUpgrade,
       effective_date: isUpgrade ? new Date().toISOString() : currentSub.next_billing_date,
-      new_plan: newPlan[0].name
+      new_plan: newPlan.name
     });
 
   } catch (error) {
