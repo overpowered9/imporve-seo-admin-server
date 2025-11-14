@@ -4,13 +4,25 @@ interface FluxAIGenerateRequest {
   prompt: string;
   width?: number;
   height?: number;
+  steps?: number;
+  guidance?: number;
   prompt_upsampling?: boolean;
   safety_tolerance?: number;
   output_format?: 'jpeg' | 'png';
+  seed?: number;
 }
 
 interface FluxAIGenerateResponse {
   id: string;
+}
+
+interface FluxAIErrorResponse {
+  detail?: string | Array<{
+    loc: string[];
+    msg: string;
+    type: string;
+  }>;
+  error?: string;
 }
 
 interface FluxAIResultResponse {
@@ -23,7 +35,7 @@ interface FluxAIResultResponse {
 
 export class FluxAIService {
   private apiKey: string;
-  private baseUrl: string = 'https://api.us1.bfl.ai/v1';
+  private baseUrl: string = 'https://api.bfl.ai/v1';
 
   constructor(apiKey?: string) {
     this.apiKey = apiKey || process.env.FLUX_AI_API_KEY || '';
@@ -67,50 +79,107 @@ export class FluxAIService {
 
   /**
    * Initiate image generation with Flux AI
+   * Returns immediately with task ID - does not wait for generation to complete
    */
   async generateImage(params: FluxAIGenerateRequest): Promise<string> {
     try {
       console.log('🎨 Initiating Flux AI image generation...');
       console.log('📝 Prompt:', params.prompt);
 
+      const requestBody = {
+        prompt: params.prompt,
+        width: params.width || 1024,
+        height: params.height || 768,
+        steps: params.steps || 28,
+        guidance: params.guidance || 3,
+        prompt_upsampling: params.prompt_upsampling ?? false,
+        safety_tolerance: params.safety_tolerance ?? 2,
+        output_format: params.output_format || 'jpeg'
+      };
+
+      console.log('🔧 Request params:', requestBody);
+
       const response = await axios.post<FluxAIGenerateResponse>(
-        `${this.baseUrl}/flux-pro-1.1`,
-        {
-          prompt: params.prompt,
-          width: params.width || 1024,
-          height: params.height || 768,
-          prompt_upsampling: params.prompt_upsampling ?? false,
-          safety_tolerance: params.safety_tolerance ?? 2,
-          output_format: params.output_format || 'jpeg'
-        },
+        `${this.baseUrl}/flux-dev`,
+        requestBody,
         {
           headers: {
             'Content-Type': 'application/json',
-            'X-Key': this.apiKey
-          }
+            'x-key': this.apiKey
+          },
+          timeout: 30000, // 30 seconds is enough for initial request
+          validateStatus: (status) => status === 200 || status === 422
         }
       );
 
+      // Handle validation errors (422)
+      if (response.status === 422) {
+        const errorData = response.data as unknown as FluxAIErrorResponse;
+        let errorMessage = 'Validation error';
+        
+        if (errorData.detail) {
+          if (Array.isArray(errorData.detail)) {
+            errorMessage = errorData.detail.map(e => `${e.loc.join('.')}: ${e.msg}`).join(', ');
+          } else {
+            errorMessage = errorData.detail;
+          }
+        }
+        
+        console.error('❌ Flux AI validation error:', errorMessage);
+        throw new Error(`Invalid request parameters: ${errorMessage}`);
+      }
+
+      // Handle missing task ID
+      if (!response.data || !response.data.id) {
+        console.error('❌ Invalid API response:', response.data);
+        throw new Error('Invalid response from Flux AI API - no task ID received');
+      }
+
       const taskId = response.data.id;
       console.log('✅ Flux AI task created:', taskId);
+      console.log('⏳ Image generation started (will poll for completion)...');
 
       return taskId;
+      
     } catch (error: any) {
+      // Handle timeout errors
+      if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+        console.error('❌ Flux AI connection timeout');
+        throw new Error('Connection timeout while connecting to Flux AI. Please check your network and try again.');
+      }
+      
+      // Handle network errors
+      if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+        console.error('❌ Flux AI connection failed:', error.code);
+        throw new Error('Unable to connect to Flux AI service. Please try again later.');
+      }
+
+      // Re-throw our custom errors
+      if (error.message.includes('Invalid request parameters') || 
+          error.message.includes('Invalid response')) {
+        throw error;
+      }
+
+      // Handle other errors
       console.error('❌ Flux AI generation error:', error.response?.data || error.message);
       throw new Error(`Flux AI generation failed: ${error.response?.data?.error || error.message}`);
     }
   }
 
   /**
-   * Poll for image generation result
+   * Poll for image generation result with exponential backoff
+   * Flux Dev can take 1-3 minutes to generate images
    */
-  async getResult(taskId: string, maxAttempts: number = 10): Promise<string> {
+  async getResult(taskId: string, maxAttempts: number = 30): Promise<string> {
     console.log(`🔄 Polling for result (max ${maxAttempts} attempts)...`);
+    console.log('⏱️  Expected wait time: 1-3 minutes');
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      // Exponential backoff: start with 2s, increase to max 10s
       if (attempt > 0) {
-        // Wait 4 seconds before checking again (same as WordPress plugin)
-        await this.sleep(4000);
+        const waitTime = Math.min(2000 * Math.pow(1.2, attempt - 1), 10000);
+        console.log(`⏳ Waiting ${Math.round(waitTime / 1000)}s before next check...`);
+        await this.sleep(waitTime);
       }
 
       try {
@@ -119,30 +188,74 @@ export class FluxAIService {
           {
             params: { id: taskId },
             headers: {
-              'X-Key': this.apiKey
-            }
+              'x-key': this.apiKey
+            },
+            timeout: 15000, // 15 second timeout for status checks
+            validateStatus: (status) => status === 200 || status === 404
           }
         );
 
+        // Handle 404 - task not found
+        if (response.status === 404) {
+          throw new Error(`Task ${taskId} not found. It may have expired.`);
+        }
+
         const data = response.data;
 
+        // Success - image is ready
         if (data.status === 'Ready' && data.result?.sample) {
           console.log(`✅ Image ready! (attempt ${attempt + 1}/${maxAttempts})`);
+          console.log('🖼️  Image URL:', data.result.sample);
           return data.result.sample;
-        } else if (data.status === 'Error' || data.status === 'Request Moderated' || data.status === 'Content Moderated') {
-          throw new Error(`Flux AI error: ${data.status} - ${data.error || 'Unknown error'}`);
+        } 
+        
+        // Error states - don't retry
+        if (data.status === 'Error') {
+          throw new Error(`Flux AI generation failed: ${data.error || 'Unknown error'}`);
+        }
+        
+        if (data.status === 'Request Moderated') {
+          throw new Error('Request was moderated by Flux AI. Please try a different prompt.');
+        }
+        
+        if (data.status === 'Content Moderated') {
+          throw new Error('Generated content was moderated by Flux AI. Please try a different prompt.');
+        }
+        
+        // Still pending - continue polling
+        if (data.status === 'Pending') {
+          const elapsed = Math.round((attempt + 1) * 4); // rough estimate
+          console.log(`⏳ Status: Pending (attempt ${attempt + 1}/${maxAttempts}, ~${elapsed}s elapsed)`);
         } else {
           console.log(`⏳ Status: ${data.status} (attempt ${attempt + 1}/${maxAttempts})`);
         }
+        
       } catch (error: any) {
-        if (error.message.includes('Flux AI error:')) {
+        // Re-throw business logic errors
+        if (error.message.includes('not found') || 
+            error.message.includes('moderated') ||
+            error.message.includes('generation failed')) {
           throw error;
         }
-        console.error(`❌ Error checking result (attempt ${attempt + 1}):`, error.message);
+        
+        // Handle timeout on status check
+        if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+          console.warn(`⚠️ Timeout checking result (attempt ${attempt + 1}/${maxAttempts})`);
+          continue; // Retry on timeout
+        }
+        
+        // Log other errors but continue trying
+        console.error(`⚠️ Error checking result (attempt ${attempt + 1}):`, error.message);
+        
+        // If we're close to max attempts, be more aggressive about failing
+        if (attempt >= maxAttempts - 3) {
+          throw new Error(`Failed to check generation status: ${error.message}`);
+        }
       }
     }
 
-    throw new Error('Timeout waiting for image generation. Please try again.');
+    // Exhausted all attempts
+    throw new Error(`Image generation timeout after ${maxAttempts} attempts (~${Math.round(maxAttempts * 4 / 60)} minutes). The task may still be processing. Please try again later.`);
   }
 
   /**
