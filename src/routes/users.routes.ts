@@ -35,6 +35,9 @@ router.get('/status', validateApiAccess, async (req, res) => {
     // Get user credit balances
     const credits = await getUserCreditBalances(user.id);
     
+    // Get user subscription/plan details
+    const subscription = await getUserSubscription(user.id);
+    
     res.json({
       success: true,
       user: user.name || user.email,
@@ -44,6 +47,7 @@ router.get('/status', validateApiAccess, async (req, res) => {
         content: credits.find(c => c.credit_type === 'content')?.amount || 0,
         keywords: credits.find(c => c.credit_type === 'keywords')?.amount || 0
       },
+      subscription: subscription || null,
       server_status: 'connected',
       timestamp: new Date().toISOString()
     });
