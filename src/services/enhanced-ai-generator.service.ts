@@ -1,17 +1,20 @@
 import { PromptManagementService } from './prompt-management.service.js';
 import { GeneratePostParams, GeneratePostResult, ChatMessage, generateAiHtmlPost2 } from './ai_content_admin_tuneable.js';
+import { OriginalPromptsHelper, BasicPromptParams } from './original-prompts.helper.js';
 
 interface DynamicPromptData {
   audience_generation?: string;
   lsi_keywords?: string;
   facts_generation?: string;
-  format_small?: string;
-  format_medium?: string;
-  format_large?: string;
-  section_content?: string;
-  conclusion?: string;
-  faqs?: string;
-  whats_next?: string;
+  // Master comprehensive prompts that contain ALL instructions (like PHP $basic_prompt)
+  basic_prompt_small?: string;
+  basic_prompt_medium?: string;
+  basic_prompt_large?: string;
+  // Continuation prompts that reference the master context (SHORT prompts)
+  section_continuation?: string;
+  conclusion_continuation?: string;
+  faqs_continuation?: string;
+  whats_next_continuation?: string;
   meta_title?: string;
   meta_description?: string;
 }
@@ -127,114 +130,84 @@ export class EnhancedAIContentGenerator {
 
     const model = 'gpt-4o';
     const wordCountVariant = this.getWordCountVariant(nos_of_words);
+    console.log(`🔄 Generating content with wordCountVariant: ${wordCountVariant}`);
 
     // 1) Ensure audience data (replicates getAudienceData() if not provided)
     const audience = audienceData || await this.generateAudienceData(apiKey, model, seed_keyword, content_lang);
+    console.log(`✅ Audience data generated/retrieved`);
 
-    // 2) LSI keywords using dynamic prompt  
-    const formatVariant = wordCountVariant === 'small' ? 'format_small' : 
-                         wordCountVariant === 'large' ? 'format_large' : 'format_medium';
-    const lsiPrompt = await this.promptService.getPrompt('lsi_keywords');
-    const lsiPromptProcessed = this.promptService.processPromptVariables(lsiPrompt, {
-      seed_keyword,
-      audience_data: audience
-    });
-    const lsiKeywords = await this.chatOnce(apiKey, model, [
-      { role: 'system', content: 'You are a helpful assistant. Please respond in ' + content_lang },
-      { role: 'user', content: lsiPromptProcessed }
-    ]);
+    // 2) LSI keywords using dynamic prompt
+    const lsiKeywords = await this.generateLSIKeywords(apiKey, model, seed_keyword, audience, content_lang);
+    console.log(`✅ LSI keywords generated`);
 
     // 3) Facts generation using dynamic prompt
-    const factsPrompt = await this.promptService.getPrompt('facts_generation');
-    const factsPromptProcessed = this.promptService.processPromptVariables(factsPrompt, {
-      seed_keyword,
-      audience_data: audience
-    });
-    const facts = await this.chatOnce(apiKey, model, [
-      { role: 'system', content: 'You are a helpful assistant. Please respond in ' + content_lang },
-      { role: 'user', content: factsPromptProcessed }
-    ]);
+    const facts = await this.generateFacts(apiKey, model, seed_keyword, audience, content_lang);
+    console.log(`✅ Facts generated`);
 
-    // 4) Introduction and TOC using dynamic prompt
-    const introPrompt = await this.promptService.getPrompt(formatVariant);
-    const introPromptProcessed = this.promptService.processPromptVariables(introPrompt, {
-      nos_of_words: nos_of_words || '',
+    // 4) Build the MASTER basic_prompt with all comprehensive instructions
+    // This is the key: ONE big prompt with everything, just like the original PHP
+    const basicPrompt = await this.buildBasicPrompt({
+      wordCountVariant,
       seed_keyword,
       title: title || '',
-      lsi_keywords: lsiKeywords,
+      lsiKeywords,
       voice_tone: voice_tone || '',
       point_of_view: point_of_view || '',
-      audience_data: audience,
+      audience,
       details_to_include: details_to_include || '',
       content_lang: content_lang || '',
       call_to_action: call_to_action || '',
-      facts_to_include: facts
+      facts,
+      nos_of_words: nos_of_words || ''
     });
+    console.log(`✅ Master basic_prompt built (${basicPrompt.length} chars)`);
 
+    // 5) Start conversation with master prompt - generates Intro + TOC
     let conversation: ChatMessage[] = [
       { role: 'system', content: 'You are a helpful assistant. Please respond in ' + content_lang },
-      { role: 'user', content: introPromptProcessed }
+      { role: 'user', content: basicPrompt }
     ];
 
     const introResponse = await this.chatOnce(apiKey, model, conversation);
+    console.log(`✅ Introduction and TOC generated`);
     conversation.push({ role: 'assistant', content: introResponse });
 
-    // 5) Generate content sections dynamically
+    // 6) Generate content sections with continuation prompts
+    // These are SHORT prompts because they reference the master context
     const sectionConfig = this.getSectionConfig(wordCountVariant);
     const sectionResponses: string[] = [];
 
     for (let i = 1; i <= sectionConfig.sectionCount; i++) {
-      try {
-        // Use section content prompt for all sections
-        const sectionPrompt = await this.promptService.getPrompt('section_content');
-        const sectionPromptProcessed = this.promptService.processPromptVariables(sectionPrompt, {
-          section_number: i.toString(),
-          min_words: sectionConfig.sectionWordMin.toString(),
-          max_words: sectionConfig.sectionWordMax.toString(),
-          ordinal: this.ordinal(i)
-        });
-        conversation.push({ role: 'user', content: sectionPromptProcessed });
-      } catch (error) {
-        // Fallback to generic section prompt
-        const genericPrompt = `Now generate the ${this.ordinal(i)} subtitle content. IMPORTANT: Output should not be more than ${sectionConfig.sectionWordMin}-${sectionConfig.sectionWordMax} words. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`;
-        conversation.push({ role: 'user', content: genericPrompt });
-      }
+      const sectionPrompt = await this.getSectionContinuationPrompt(i, sectionConfig);
+      conversation.push({ role: 'user', content: sectionPrompt });
 
       const sectionResponse = await this.chatOnce(apiKey, model, conversation);
       sectionResponses.push(this.wrapSection(sectionResponse));
       conversation.push({ role: 'assistant', content: sectionResponse });
+      console.log(`✅ Section ${i}/${sectionConfig.sectionCount} generated`);
     }
 
-    // 6) Generate conclusion using dynamic prompt
-    const conclusionPrompt = await this.getPromptOrFallback(
-      'conclusion',
-      wordCountVariant,
-      `Now generate the conclusion content. IMPORTANT: Output should not be more than ${sectionConfig.conclusionMin}-${sectionConfig.conclusionMax} words. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`
-    );
+    // 7) Generate conclusion using continuation prompt
+    const conclusionPrompt = await this.getConclusionContinuationPrompt(sectionConfig);
     conversation.push({ role: 'user', content: conclusionPrompt });
     const conclusionResp = await this.chatOnce(apiKey, model, conversation);
     conversation.push({ role: 'assistant', content: conclusionResp });
+    console.log(`✅ Conclusion generated`);
 
-    // 7) Generate FAQs using dynamic prompt
-    const faqsPrompt = await this.getPromptOrFallback(
-      'faqs',
-      wordCountVariant,
-      `Now generate the FAQs content. IMPORTANT: Output should not be more than ${sectionConfig.faqsMin}-${sectionConfig.faqsMax} words. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`
-    );
+    // 8) Generate FAQs using continuation prompt
+    const faqsPrompt = await this.getFAQsContinuationPrompt(sectionConfig);
     conversation.push({ role: 'user', content: faqsPrompt });
     const faqsResp = await this.chatOnce(apiKey, model, conversation);
     conversation.push({ role: 'assistant', content: faqsResp });
+    console.log(`✅ FAQs generated`);
 
-    // 8) Generate What's Next using dynamic prompt
-    const whatsNextPrompt = await this.getPromptOrFallback(
-      'whats_next',
-      wordCountVariant,
-      `Now generate What is next? content. IMPORTANT: Output should not be more than ${sectionConfig.whatsMin}-${sectionConfig.whatsMax} words. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`
-    );
+    // 9) Generate What's Next using continuation prompt
+    const whatsNextPrompt = await this.getWhatsNextContinuationPrompt(sectionConfig);
     conversation.push({ role: 'user', content: whatsNextPrompt });
     const whatsNextResp = await this.chatOnce(apiKey, model, conversation);
+    console.log(`✅ What's Next generated`);
 
-    // 9) Assemble HTML content
+    // 10) Assemble HTML content
     let contentFinal = this.assembleContent({
       introResponse,
       sectionResponses,
@@ -242,13 +215,16 @@ export class EnhancedAIContentGenerator {
       faqsResp,
       whatsNextResp
     });
+    console.log(`✅ Content assembled`);
 
-    // 10) Post-process content
+    // 11) Post-process content
     contentFinal = this.postProcessContent(contentFinal);
+    console.log(`✅ Content post-processed`);
 
-    // 11) Generate meta data using dynamic prompts
+    // 12) Generate meta data using dynamic prompts
     const metaTitle = await this.generateMetaTitle(apiKey, model, title || seed_keyword, seed_keyword);
     const metaDescription = await this.generateMetaDescription(apiKey, model, title || seed_keyword, seed_keyword, contentFinal);
+    console.log(`✅ Meta data generated`);
 
     return {
       search_data: title && title.trim() ? title : seed_keyword,
@@ -419,18 +395,18 @@ export class EnhancedAIContentGenerator {
       const versions: Record<string, string> = {};
       const templatesUsed: string[] = [];
 
-      // Fixed template names that map to our 12 templates
+      // Fixed template names that map to our templates
       const templateMap = {
         'audience_generation': 'audience_generation',
         'lsi_keywords': 'lsi_keywords', 
         'facts_generation': 'facts_generation',
-        'format_small': 'format_small',
-        'format_medium': 'format_medium',
-        'format_large': 'format_large',
-        'section_content': 'section_content',
-        'conclusion': 'conclusion',
-        'faqs': 'faqs',
-        'whats_next': 'whats_next',
+        'basic_prompt_small': 'basic_prompt_small',
+        'basic_prompt_medium': 'basic_prompt_medium',
+        'basic_prompt_large': 'basic_prompt_large',
+        'section_continuation': 'section_continuation',
+        'conclusion_continuation': 'conclusion_continuation',
+        'faqs_continuation': 'faqs_continuation',
+        'whats_next_continuation': 'whats_next_continuation',
         'meta_title': 'meta_title',
         'meta_description': 'meta_description'
       };
@@ -690,5 +666,187 @@ export class EnhancedAIContentGenerator {
     id = id.replace(/[\s-]+/g, '-');
     id = id.replace(/^-+|-+$/g, '');
     return id || 'section';
+  }
+
+  /**
+   * Get the original comprehensive basic_prompt (MASTER PROMPT)
+   * This contains ALL the instructions like the PHP implementation
+   */
+  private getOriginalBasicPrompt(params: BasicPromptParams): string {
+    const { wordCountVariant } = params;
+    
+    if (wordCountVariant === 'small') {
+      return OriginalPromptsHelper.getBasicPromptSmall(params);
+    } else if (wordCountVariant === 'large') {
+      return OriginalPromptsHelper.getBasicPromptLarge(params);
+    } else {
+      return OriginalPromptsHelper.getBasicPromptMedium(params);
+    }
+  }
+
+  /**
+   * Build the MASTER basic_prompt that contains ALL comprehensive instructions
+   * Tries database first, falls back to original PHP prompts
+   */
+  private async buildBasicPrompt(params: BasicPromptParams): Promise<string> {
+    const { wordCountVariant } = params;
+    const templateName = `basic_prompt_${wordCountVariant}`;
+    
+    try {
+      // Try to fetch custom prompt from database
+      const customPrompt = await this.promptService.getPrompt(templateName);
+      console.log(`✅ Using custom prompt template: ${templateName}`);
+      
+      // Populate variables in custom prompt
+      return this.promptService.processPromptVariables(customPrompt, {
+        seed_keyword: params.seed_keyword,
+        title: params.title,
+        lsi_keywords: params.lsiKeywords,
+        voice_tone: params.voice_tone,
+        point_of_view: params.point_of_view,
+        audience_data: params.audience,
+        details_to_include: params.details_to_include,
+        content_lang: params.content_lang,
+        call_to_action: params.call_to_action,
+        facts_to_include: params.facts,
+        nos_of_words: params.nos_of_words
+      });
+    } catch (error) {
+      // Fallback to original hardcoded comprehensive prompt
+      console.log(`⚠️  Custom prompt '${templateName}' not found, using original PHP prompt`);
+      return this.getOriginalBasicPrompt(params);
+    }
+  }
+
+  /**
+   * Generate LSI keywords with tunable prompt
+   */
+  private async generateLSIKeywords(
+    apiKey: string,
+    model: string,
+    seed_keyword: string,
+    audience: string,
+    content_lang: string
+  ): Promise<string> {
+    try {
+      const lsiPrompt = await this.promptService.getPrompt('lsi_keywords');
+      const processed = this.promptService.processPromptVariables(lsiPrompt, {
+        seed_keyword,
+        audience_data: audience
+      });
+      return await this.chatOnce(apiKey, model, [
+        { role: 'system', content: 'You are a helpful assistant. Please respond in ' + content_lang },
+        { role: 'user', content: processed }
+      ]);
+    } catch (error) {
+      // Fallback to original LSI prompt
+      const fallbackPrompt = `As an expert SEO manager, you are tasked with generating 50 Latent Semantic Indexing (LSI) keywords. You are provided a word or phrase that is searched by the reader, and the audience data of the reader, including demographic information, tone preferences, reading level preference and emotional needs/pain points. Using this information you should come up with the LSI keywords that will be engaging and interesting for the reader who is described in the audience data and search provided word or phrase. These keywords should be closely related to the provided main keyword, enhancing content relevance and SEO effectiveness. Please compile the keywords in a comma separated text format without any additional explanations or introductions.\n\nMain keyword: ${seed_keyword}\n\nAudience data: {${audience}}`;
+      return await this.chatOnce(apiKey, model, [
+        { role: 'system', content: 'You are a helpful assistant. Please respond in ' + content_lang },
+        { role: 'user', content: fallbackPrompt }
+      ]);
+    }
+  }
+
+  /**
+   * Generate facts with tunable prompt
+   */
+  private async generateFacts(
+    apiKey: string,
+    model: string,
+    seed_keyword: string,
+    audience: string,
+    content_lang: string
+  ): Promise<string> {
+    try {
+      const factsPrompt = await this.promptService.getPrompt('facts_generation');
+      const processed = this.promptService.processPromptVariables(factsPrompt, {
+        seed_keyword,
+        audience_data: audience
+      });
+      return await this.chatOnce(apiKey, model, [
+        { role: 'system', content: 'You are a helpful assistant. Please respond in ' + content_lang },
+        { role: 'user', content: processed }
+      ]);
+    } catch (error) {
+      // Fallback to original facts prompt
+      const fallbackPrompt = `Generate 5 most interesting and fun facts with specific details about the "Main keyword" for the audience described in the audience data provided below. Each fact should be one short sentence. As an output, write just a bullet point list of facts without explanation or introduction.\n\nNow generate facts.\n\nMain Keyword: ${seed_keyword}\n\nAudience data: {${audience}}`;
+      return await this.chatOnce(apiKey, model, [
+        { role: 'system', content: 'You are a helpful assistant. Please respond in ' + content_lang },
+        { role: 'user', content: fallbackPrompt }
+      ]);
+    }
+  }
+
+  /**
+   * Get section continuation prompt - SHORT because it references master context
+   */
+  private async getSectionContinuationPrompt(
+    sectionNumber: number,
+    config: ReturnType<typeof this.getSectionConfig>
+  ): Promise<string> {
+    try {
+      const prompt = await this.promptService.getPrompt('section_continuation');
+      return this.promptService.processPromptVariables(prompt, {
+        section_number: sectionNumber.toString(),
+        ordinal: this.ordinal(sectionNumber),
+        min_words: config.sectionWordMin.toString(),
+        max_words: config.sectionWordMax.toString()
+      });
+    } catch (error) {
+      // Fallback to original continuation format
+      return `Now generate the ${this.ordinal(sectionNumber)} subtitle content. IMPORTANT: Output should not be more than ${config.sectionWordMin}-${config.sectionWordMax} words. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`;
+    }
+  }
+
+  /**
+   * Get conclusion continuation prompt
+   */
+  private async getConclusionContinuationPrompt(
+    config: ReturnType<typeof this.getSectionConfig>
+  ): Promise<string> {
+    try {
+      const prompt = await this.promptService.getPrompt('conclusion_continuation');
+      return this.promptService.processPromptVariables(prompt, {
+        min_words: config.conclusionMin.toString(),
+        max_words: config.conclusionMax.toString()
+      });
+    } catch (error) {
+      return `Now generate the conclusion content. IMPORTANT: Output should not be more than ${config.conclusionMin}-${config.conclusionMax} words. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`;
+    }
+  }
+
+  /**
+   * Get FAQs continuation prompt
+   */
+  private async getFAQsContinuationPrompt(
+    config: ReturnType<typeof this.getSectionConfig>
+  ): Promise<string> {
+    try {
+      const prompt = await this.promptService.getPrompt('faqs_continuation');
+      return this.promptService.processPromptVariables(prompt, {
+        min_words: config.faqsMin.toString(),
+        max_words: config.faqsMax.toString()
+      });
+    } catch (error) {
+      return `Now generate the FAQs content. IMPORTANT: Output should not be more than ${config.faqsMin}-${config.faqsMax} words. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`;
+    }
+  }
+
+  /**
+   * Get What's Next continuation prompt
+   */
+  private async getWhatsNextContinuationPrompt(
+    config: ReturnType<typeof this.getSectionConfig>
+  ): Promise<string> {
+    try {
+      const prompt = await this.promptService.getPrompt('whats_next_continuation');
+      return this.promptService.processPromptVariables(prompt, {
+        min_words: config.whatsMin.toString(),
+        max_words: config.whatsMax.toString()
+      });
+    } catch (error) {
+      return `Now generate What is next? content. IMPORTANT: Output should not be more than ${config.whatsMin}-${config.whatsMax} words. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`;
+    }
   }
 }
