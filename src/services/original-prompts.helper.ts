@@ -279,3 +279,76 @@ Now generate ONLY the Introduction and the Table of Contents based on the follow
 	Facts to include: {${facts}} Do not print "Main Content Sections" text in output.`;
   }
 }
+
+// Standalone helper functions for migration script
+export function getOriginalMasterPrompt(variant: 'small' | 'medium' | 'large'): string {
+  const dummyParams: BasicPromptParams = {
+    wordCountVariant: variant,
+    seed_keyword: '{{seed_keyword}}',
+    title: '{{title}}',
+    lsiKeywords: '{{lsi_keywords}}',
+    voice_tone: '{{voice_tone}}',
+    point_of_view: '{{point_of_view}}',
+    audience: '{{audience_data}}',
+    details_to_include: '{{details_to_include}}',
+    content_lang: '{{content_lang}}',
+    call_to_action: '{{call_to_action}}',
+    facts: '{{facts}}',
+    nos_of_words: variant === 'small' ? '600 to 1200 words' : variant === 'medium' ? '1200 to 2400 words' : '2400+ words'
+  };
+
+  if (variant === 'small') {
+    return OriginalPromptsHelper.getBasicPromptSmall(dummyParams);
+  } else if (variant === 'medium') {
+    return OriginalPromptsHelper.getBasicPromptMedium(dummyParams);
+  } else {
+    return OriginalPromptsHelper.getBasicPromptLarge(dummyParams);
+  }
+}
+
+export function getContinuationPrompt(ordinal: 'first' | 'second' | 'third' | 'fourth' | 'fifth' | 'sixth'): string {
+  const ordinalText = ordinal.charAt(0).toUpperCase() + ordinal.slice(1);
+  return `Now generate the ${ordinal} subtitle content from the Table of Contents you created earlier.
+
+IMPORTANT: 
+- Output should be {{min_words}}-{{max_words}} words
+- After writing an output check the word count and regenerate if it is not in the range
+- Continue the storytelling flow from previous sections
+- Reference the subtitle you defined in the TOC
+- Maintain the emotional tone established in the introduction
+- Do not include the word count in the output`;
+}
+
+export function getFinalizationPrompt(type: 'conclusion' | 'faqs' | 'whats_next', variant: 'small' | 'medium' | 'large'): string {
+  if (type === 'conclusion') {
+    return `Now generate the conclusion content. 
+
+IMPORTANT: 
+- Output should be {{min_words}}-{{max_words}} words
+- After writing an output check the word count and regenerate if it is not in the range
+- Summarize key insights from the article
+- Encourage further exploration or engagement
+- Do not include call to action details in the conclusion
+- Do not include the word count in the output`;
+  } else if (type === 'faqs') {
+    return `Now generate the FAQs content. 
+
+IMPORTANT: 
+- Output should be {{min_words}}-{{max_words}} words
+- After writing an output check the word count and regenerate if it is not in the range
+- Come up with 3 FAQ that the reader may have
+- Provide questions and answers with clear, informative tone
+- Empathize with the reader's concerns
+- Do not include the word count in the output`;
+  } else { // whats_next
+    return `Now generate What is next? content. 
+
+IMPORTANT: 
+- Output should be {{min_words}}-{{max_words}} words
+- After writing an output check the word count and regenerate if it is not in the range
+- Write a short paragraph inviting the reader to take action
+- Incorporate the call to action provided by the user
+- If call to action is blank, write a general paragraph without specific contact details
+- Do not include the word count in the output`;
+  }
+}

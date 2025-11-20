@@ -37,7 +37,21 @@ export class PromptManagementService {
    * Get all templates
    */
   async getAllTemplates(): Promise<IPromptTemplate[]> {
-    return await PromptTemplate.find().sort({ name: 1 });
+    return await PromptTemplate.find().sort({ orderIndex: 1, name: 1 });
+  }
+
+  /**
+   * Get template by name
+   */
+  async getTemplateByName(name: string): Promise<IPromptTemplate | null> {
+    return await PromptTemplate.findOne({ name });
+  }
+
+  /**
+   * Get active version for a template
+   */
+  async getActiveVersion(templateId: string): Promise<IPromptVersion | null> {
+    return await PromptVersion.findOne({ templateId, isActive: true });
   }
 
   /**
@@ -184,15 +198,5 @@ export class PromptManagementService {
     }
 
     await PromptVersion.findByIdAndDelete(versionId);
-  }
-
-  /**
-   * Get active version for a template
-   */
-  async getActiveVersion(templateId: string): Promise<IPromptVersion | null> {
-    return await PromptVersion.findOne({ 
-      templateId, 
-      isActive: true 
-    }).exec();
   }
 }

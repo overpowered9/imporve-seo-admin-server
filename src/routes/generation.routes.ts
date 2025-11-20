@@ -2,7 +2,9 @@ import { Router, Request, Response } from 'express';
 import { contentGenerationService, ContentGenerationRequest } from '../services/contentGenerationService.js';
 import { promptService } from '../services/promptService.js';
 import { EnhancedAIContentGenerator } from '../services/enhanced-ai-generator.service.js';
+import { ConversationalAIContentGenerator } from '../services/conversational-ai-generator.service.js';
 import { PromptManagementService } from '../services/prompt-management.service.js';
+import { PromptTemplate, PromptVersion } from '../models/prompt.models.js';
 import { validateApiAccess, validateCredits, AuthenticatedRequest } from '../middleware/apiAuth.middleware.js';
 import { deductCredits } from '../models/user.models.js';
 import sql from '../data/db.js';
@@ -167,26 +169,27 @@ router.post('/test-prompt', async (req: Request, res: Response) => {
 });
 
 /**
- * Get all system templates
+ * Get all system templates (updated for conversational prompts)
  * GET /api/generate/templates
  */
 router.get('/templates', async (req: Request, res: Response) => {
   try {
-    console.log('📋 Fetching system templates...');
+    console.log('📋 Fetching all prompt templates...');
     
-    const templates = await promptService.getSystemTemplates();
+    const promptMgmt = new PromptManagementService();
+    const templates = await promptMgmt.getAllTemplates();
     
     res.json({
       success: true,
-      templates: templates.map(t => ({
-        id: t._id,
+      data: templates.map(t => ({
+        _id: t._id,
         name: t.name,
-        displayName: t.displayName,
         description: t.description,
-        templateType: t.templateType,
         category: t.category,
+        wordCountVariant: t.wordCountVariant,
+        orderIndex: t.orderIndex,
         variables: t.variables,
-        isSystem: t.isSystem
+        updatedAt: t.updatedAt
       }))
     });
 
@@ -200,7 +203,7 @@ router.get('/templates', async (req: Request, res: Response) => {
 });
 
 /**
- * Get template versions
+ * Get template versions with template info
  * GET /api/generate/templates/:templateId/versions
  */
 router.get('/templates/:templateId/versions', async (req: Request, res: Response) => {
@@ -209,12 +212,38 @@ router.get('/templates/:templateId/versions', async (req: Request, res: Response
     
     console.log(`📚 Fetching versions for template: ${templateId}`);
     
-    const versions = await promptService.getTemplateVersions(templateId);
+    const promptMgmt = new PromptManagementService();
+    const versions = await promptMgmt.getTemplateVersions(templateId);
+    const template = await PromptTemplate.findById(templateId);
+    const activeVersion = await promptMgmt.getActiveVersion(templateId);
+    
+    if (!template) {
+      return res.status(404).json({
+        success: false,
+        error: 'Template not found'
+      });
+    }
     
     res.json({
       success: true,
+      template: {
+        _id: template._id,
+        name: template.name,
+        description: template.description,
+        category: template.category,
+        wordCountVariant: template.wordCountVariant,
+        variables: template.variables
+      },
+      activeVersion: activeVersion ? {
+        _id: activeVersion._id,
+        version: activeVersion.version,
+        prompt: activeVersion.prompt,
+        isActive: activeVersion.isActive,
+        createdBy: activeVersion.createdBy,
+        createdAt: activeVersion.createdAt
+      } : null,
       versions: versions.map(v => ({
-        id: v._id,
+        _id: v._id,
         version: v.version,
         prompt: v.prompt,
         isActive: v.isActive,
@@ -240,7 +269,7 @@ router.get('/templates/:templateId/versions', async (req: Request, res: Response
 router.post('/templates/:templateId/versions', async (req: Request, res: Response) => {
   try {
     const { templateId } = req.params;
-    const { prompt, createdBy = 'api-user', metadata } = req.body;
+    const { prompt, createdBy = 'admin', metadata } = req.body;
 
     if (!prompt) {
       return res.status(400).json({
@@ -251,12 +280,17 @@ router.post('/templates/:templateId/versions', async (req: Request, res: Respons
 
     console.log(`➕ Creating new version for template: ${templateId}`);
 
-    const version = await promptService.createPromptVersion(templateId, prompt, createdBy, metadata);
+    const promptMgmt = new PromptManagementService();
+    const version = await promptMgmt.createTemplateVersion(templateId, {
+      prompt,
+      createdBy,
+      metadata
+    });
     
     res.json({
       success: true,
-      version: {
-        id: version._id,
+      data: {
+        _id: version._id,
         version: version.version,
         prompt: version.prompt,
         isActive: version.isActive,
@@ -285,7 +319,16 @@ router.put('/versions/:versionId/activate', async (req: Request, res: Response) 
     
     console.log(`🔄 Activating version: ${versionId}`);
     
-    await promptService.activatePromptVersion(versionId);
+    const version = await PromptVersion.findById(versionId);
+    if (!version) {
+      return res.status(404).json({
+        success: false,
+        error: 'Version not found'
+      });
+    }
+    
+    const promptMgmt = new PromptManagementService();
+    await promptMgmt.activateTemplateVersion(version.templateId.toString(), versionId);
     
     res.json({
       success: true,
@@ -616,6 +659,167 @@ router.post('/immediateVersionTesting', async (req: Request, res: Response) => {
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to generate content with version testing'
+    });
+  }
+});
+
+/**
+ * Generate content using Conversational Flow (Hybrid Approach)
+ * This maintains the original PHP sequential conversational context
+ * while using database-driven tunable prompts
+ * 
+ * POST /api/v1/generate/conversational
+ */
+router.post('/conversational', validateApiAccess, validateCredits('content', 1), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const {
+      seed_keyword,
+      keyword_selection = '',
+      seed_options = '',
+      nos_of_words = '1200 to 2400 words',
+      content_lang = 'en',
+      voice_tone = '',
+      point_of_view = '',
+      title = '',
+      call_to_action = '',
+      details_to_include = '',
+      for_testing_only = 0,
+      audienceData,
+      // Testing parameters
+      testVersionOverride,
+      enableTracing = false
+    } = req.body;
+
+    // Validate required parameters
+    if (!seed_keyword) {
+      return res.status(400).json({
+        success: false,
+        error: 'seed_keyword is required'
+      });
+    }
+
+    // Validate nos_of_words
+    const validWordCounts = ['600 to 1200 words', '1200 to 2400 words', '2400 to 3600 words'];
+    if (!validWordCounts.includes(nos_of_words)) {
+      return res.status(400).json({
+        success: false,
+        error: `nos_of_words must be one of: ${validWordCounts.join(', ')}`
+      });
+    }
+
+    console.log(`🔄 Starting CONVERSATIONAL generation for: "${seed_keyword}" (${nos_of_words})`);
+    if (testVersionOverride) {
+      console.log(`🧪 Testing version: ${testVersionOverride.promptType} = ${testVersionOverride.versionId}`);
+    }
+
+    // Initialize conversational generator
+    const promptManagementService = new PromptManagementService();
+    const conversationalGenerator = new ConversationalAIContentGenerator(
+      promptManagementService,
+      true // Enable fallback to original prompts
+    );
+
+    const startTime = Date.now();
+
+    // Generate content using conversational flow
+    const result = await conversationalGenerator.generateContent({
+      apiKey: process.env.OPENAI_API_KEY,
+      seed_keyword,
+      keyword_selection,
+      seed_options,
+      nos_of_words: nos_of_words as '600 to 1200 words' | '1200 to 2400 words' | '2400 to 3600 words',
+      content_lang,
+      voice_tone,
+      point_of_view,
+      title,
+      call_to_action,
+      details_to_include,
+      for_testing_only,
+      audienceData,
+      testVersionOverride,
+      enableTracing
+    });
+
+    const processingTime = Date.now() - startTime;
+
+    console.log(`✅ Conversational content generated in ${processingTime}ms`);
+
+    // Save generation to database
+    const userId = req.user.id;
+    const websiteId = req.website?.id || null;
+    
+    const generationRecord = await sql`
+      INSERT INTO user_generations (
+        user_id,
+        website_id,
+        type,
+        status,
+        parameters,
+        result,
+        metadata,
+        processing_time_ms
+      ) VALUES (
+        ${userId},
+        ${websiteId},
+        'content_conversational',
+        'success',
+        ${JSON.stringify({
+          seed_keyword,
+          nos_of_words,
+          content_lang,
+          voice_tone,
+          point_of_view,
+          title,
+          testVersionOverride
+        })},
+        ${JSON.stringify({
+          content: result.content,
+          meta_title: result.meta_title,
+          meta_description: result.meta_descreption
+        })},
+        ${JSON.stringify({
+          method: 'conversational',
+          enableTracing
+        })},
+        ${processingTime}
+      ) RETURNING generation_id
+    `.then(rows => rows[0]);
+
+    const generationId = generationRecord.generation_id;
+    console.log(`💾 Generation saved with ID: ${generationId}`);
+
+    // Deduct credit
+    await deductCredits(
+      userId,
+      'content',
+      1,
+      `Conversational content generation for keyword: ${seed_keyword}`,
+      websiteId,
+      generationId
+    );
+    console.log(`💳 Credit deducted for user ${userId}`);
+
+    res.json({
+      success: true,
+      data: {
+        generation_id: generationId,
+        search_data: result.search_data,
+        content: result.content,
+        meta_title: result.meta_title,
+        meta_description: result.meta_descreption
+      },
+      metadata: {
+        method: 'conversational',
+        processingTime,
+        testVersionUsed: testVersionOverride || null
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Conversational generation error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to generate content using conversational flow'
     });
   }
 });
