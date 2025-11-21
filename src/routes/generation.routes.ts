@@ -562,6 +562,107 @@ router.post('/active', validateApiAccess, validateCredits('content', 1), async (
   }
 });
 
+// POST /api/v1/generate/testWithActiveVersions
+// Admin panel route: Use all active versions without authentication
+router.post('/testWithActiveVersions', async (req: Request, res: Response) => {
+  try {
+    const {
+      seed_keyword,
+      keyword_selection = '',
+      seed_options = '',
+      nos_of_words = '600 to 1200 words',
+      content_lang,
+      voice_tone = '',
+      point_of_view = '',
+      title = '',
+      call_to_action = '',
+      details_to_include = '',
+      for_testing_only = 0,
+      audienceData = '',
+      templateVariables = {}
+    } = req.body;
+
+    // Validate required parameters
+    if (!seed_keyword) {
+      return res.status(400).json({
+        success: false,
+        error: 'seed_keyword is required'
+      });
+    }
+
+    // Validate nos_of_words parameter
+    const validWordCounts = ['600 to 1200 words', '1200 to 2400 words', '2400 to 3600 words'];
+    if (!validWordCounts.includes(nos_of_words)) {
+      return res.status(400).json({
+        success: false,
+        error: `nos_of_words must be one of: ${validWordCounts.join(', ')}`
+      });
+    }
+
+    console.log(`🎯 Admin testing with all active versions: "${seed_keyword}" (${nos_of_words})`);
+
+    // Initialize services
+    const promptManagementService = new PromptManagementService();
+    const enhancedGenerator = new EnhancedAIContentGenerator(promptManagementService);
+
+    // Prepare template variables
+    const enhancedTemplateVariables = {
+      seed_keyword,
+      context: details_to_include || '',
+      audience_data: audienceData || '',
+      lsi_keywords: '',
+      facts_data: '',
+      section_content: '',
+      conclusion_content: '',
+      faqs_content: '',
+      whats_next_content: call_to_action || '',
+      meta_title: title || seed_keyword,
+      meta_description: '',
+      ...templateVariables
+    };
+
+    // Generate content using all active versions
+    const result = await enhancedGenerator.generateAiContentDynamic({
+      seed_keyword,
+      keyword_selection,
+      seed_options,
+      nos_of_words: nos_of_words as '600 to 1200 words' | '1200 to 2400 words' | '2400 to 3600 words',
+      content_lang,
+      voice_tone,
+      point_of_view,
+      title,
+      call_to_action,
+      details_to_include,
+      for_testing_only,
+      audienceData,
+      useActivePrompts: true, // Use all active versions
+      templateVariables: enhancedTemplateVariables
+    });
+
+    console.log(`✅ Admin testing completed: "${seed_keyword}"`);
+    console.log(`📊 Used all active prompt versions`);
+
+    res.json({
+      success: true,
+      data: {
+        search_data: result.search_data,
+        content: result.content,
+        meta_title: result.meta_title,
+        meta_description: result.meta_descreption,
+        promptsUsed: result.promptsUsed,
+        generationMetadata: result.generationMetadata
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Admin testing error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to generate content'
+    });
+  }
+});
+
 // POST /api/v1/generate/immediateVersionTesting
 // Test a specific version of one prompt type while using active versions for others
 router.post('/immediateVersionTesting', async (req: Request, res: Response) => {
