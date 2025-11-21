@@ -345,6 +345,33 @@ router.put('/versions/:versionId/activate', async (req: Request, res: Response) 
 });
 
 /**
+ * Delete prompt version
+ * DELETE /api/generate/templates/:templateId/versions/:versionId
+ */
+router.delete('/templates/:templateId/versions/:versionId', async (req: Request, res: Response) => {
+  try {
+    const { templateId, versionId } = req.params;
+    
+    console.log(`🗑️ Deleting version: ${versionId} from template: ${templateId}`);
+    
+    const promptMgmt = new PromptManagementService();
+    await promptMgmt.deleteTemplateVersion(versionId);
+    
+    res.json({
+      success: true,
+      message: 'Version deleted successfully'
+    });
+
+  } catch (error: any) {
+    console.error('❌ Version deletion error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to delete version'
+    });
+  }
+});
+
+/**
  * Get default prompt set configuration
  * GET /api/generate/default-config
  */
