@@ -226,31 +226,33 @@ router.get('/templates/:templateId/versions', async (req: Request, res: Response
     
     res.json({
       success: true,
-      template: {
-        _id: template._id,
-        name: template.name,
-        description: template.description,
-        category: template.category,
-        wordCountVariant: template.wordCountVariant,
-        variables: template.variables
-      },
-      activeVersion: activeVersion ? {
-        _id: activeVersion._id,
-        version: activeVersion.version,
-        prompt: activeVersion.prompt,
-        isActive: activeVersion.isActive,
-        createdBy: activeVersion.createdBy,
-        createdAt: activeVersion.createdAt
-      } : null,
-      versions: versions.map(v => ({
-        _id: v._id,
-        version: v.version,
-        prompt: v.prompt,
-        isActive: v.isActive,
-        createdBy: v.createdBy,
-        createdAt: v.createdAt,
-        metadata: v.metadata
-      }))
+      data: {
+        template: {
+          _id: template._id,
+          name: template.name,
+          description: template.description,
+          category: template.category,
+          wordCountVariant: template.wordCountVariant,
+          variables: template.variables
+        },
+        activeVersion: activeVersion ? {
+          _id: activeVersion._id,
+          version: activeVersion.version,
+          prompt: activeVersion.prompt,
+          isActive: activeVersion.isActive,
+          createdBy: activeVersion.createdBy,
+          createdAt: activeVersion.createdAt
+        } : null,
+        versions: versions.map(v => ({
+          _id: v._id,
+          version: v.version,
+          prompt: v.prompt,
+          isActive: v.isActive,
+          createdBy: v.createdBy,
+          createdAt: v.createdAt,
+          metadata: v.metadata
+        }))
+      }
     });
 
   } catch (error) {
