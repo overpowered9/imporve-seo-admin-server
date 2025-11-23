@@ -824,32 +824,6 @@ export class ConversationalAIContentGenerator {
     return parts.join('');
   }
 
-  private convertMarkdownToHTML(content: string): string {
-    // Convert Markdown headings to HTML with IDs
-    // ### Heading => <h3 id="heading">Heading</h3>
-    content = content.replace(/^(#{1,6})\s+(.+)$/gm, (match, hashes, text) => {
-      const level = hashes.length;
-      const cleanText = text.trim().replace(/[*_~`]/g, '');
-      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s]+/g, '-').replace(/^-+|-+$/g, '');
-      return `<h${level} id="${id}">${cleanText}</h${level}>`;
-    });
-
-    // Convert **bold** to <strong>
-    content = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    
-    // Convert *italic* to <em>
-    content = content.replace(/\*(.+?)\*/g, '<em>$1</em>');
-    
-    // Convert ---/*** to <hr>
-    content = content.replace(/^(-{3,}|\*{3,})$/gm, '<hr>');
-    
-    // Convert bullet lists
-    content = content.replace(/^[\s]*[-*+]\s+(.+)$/gm, '<li>$1</li>');
-    content = content.replace(/(<li>.*<\/li>\n?)+/g, (match) => `<ul>${match}</ul>`);
-    
-    return content;
-  }
-
   private verifyAndFixTOCLinks(content: string): string {
     const tocLinks: Record<string, string> = {};
     const headings: Record<string, string> = {};
