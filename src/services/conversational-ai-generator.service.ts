@@ -706,6 +706,9 @@ export class ConversationalAIContentGenerator {
   }
 
   private postProcessContent(content: string): string {
+    // Convert Markdown to HTML first (in case AI returns Markdown)
+    content = this.convertMarkdownToHTML(content);
+    
     // Apply all post-processing from original function
     content = this.stripParenthesesWrappingContactTokens(content);
     content = this.convert_emails_to_links(content);
@@ -762,6 +765,46 @@ export class ConversationalAIContentGenerator {
     );
   }
 
+  private convertMarkdownToHTML(content: string): string {
+    // Convert Markdown headings to HTML with IDs
+    // ### Heading -> <h3 id="heading">Heading</h3>
+    content = content.replace(/^#{6}\s+(.+)$/gm, (match, text) => {
+      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      return `<h6 id="${id}">${text.trim()}</h6>`;
+    });
+    content = content.replace(/^#{5}\s+(.+)$/gm, (match, text) => {
+      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      return `<h5 id="${id}">${text.trim()}</h5>`;
+    });
+    content = content.replace(/^#{4}\s+(.+)$/gm, (match, text) => {
+      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      return `<h4 id="${id}">${text.trim()}</h4>`;
+    });
+    content = content.replace(/^#{3}\s+(.+)$/gm, (match, text) => {
+      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      return `<h3 id="${id}">${text.trim()}</h3>`;
+    });
+    content = content.replace(/^#{2}\s+(.+)$/gm, (match, text) => {
+      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      return `<h2 id="${id}">${text.trim()}</h2>`;
+    });
+    content = content.replace(/^#\s+(.+)$/gm, (match, text) => {
+      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      return `<h1 id="${id}">${text.trim()}</h1>`;
+    });
+    
+    // Convert **bold** to <strong>
+    content = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    
+    // Convert *italic* to <em>
+    content = content.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    
+    // Convert --- horizontal rules
+    content = content.replace(/^---+$/gm, '<hr>');
+    
+    return content;
+  }
+
   private stripParenthesesWrappingContactTokens(content: string): string {
     content = content.replace(/\(\s*((?:https?:\/\/|www\.)[^\s)]+)\s*\)/gi, '$1');
     content = content.replace(/\(\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,})\s*\)/g, '$1');
@@ -779,6 +822,32 @@ export class ConversationalAIContentGenerator {
       parts[i] = parts[i].replace(/[^\p{L}\p{N}\s]{2,}/gu, '');
     }
     return parts.join('');
+  }
+
+  private convertMarkdownToHTML(content: string): string {
+    // Convert Markdown headings to HTML with IDs
+    // ### Heading => <h3 id="heading">Heading</h3>
+    content = content.replace(/^(#{1,6})\s+(.+)$/gm, (match, hashes, text) => {
+      const level = hashes.length;
+      const cleanText = text.trim().replace(/[*_~`]/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s]+/g, '-').replace(/^-+|-+$/g, '');
+      return `<h${level} id="${id}">${cleanText}</h${level}>`;
+    });
+
+    // Convert **bold** to <strong>
+    content = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    
+    // Convert *italic* to <em>
+    content = content.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    
+    // Convert ---/*** to <hr>
+    content = content.replace(/^(-{3,}|\*{3,})$/gm, '<hr>');
+    
+    // Convert bullet lists
+    content = content.replace(/^[\s]*[-*+]\s+(.+)$/gm, '<li>$1</li>');
+    content = content.replace(/(<li>.*<\/li>\n?)+/g, (match) => `<ul>${match}</ul>`);
+    
+    return content;
   }
 
   private verifyAndFixTOCLinks(content: string): string {
