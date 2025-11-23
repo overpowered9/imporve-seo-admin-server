@@ -588,38 +588,41 @@ export class EnhancedAIContentGenerator {
   }
 
   private convertMarkdownToHTML(content: string): string {
-    // Convert Markdown headings to HTML with IDs
-    // ### Heading -> <h3 id="heading">Heading</h3>
+    // FIRST: Convert **bold** and *italic* BEFORE heading conversion
+    content = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    content = content.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    
+    // Convert Markdown headings to HTML with IDs (from h6 to h1)
     content = content.replace(/^#{6}\s+(.+)$/gm, (match, text) => {
-      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      const cleanText = text.trim().replace(/<\/?strong>/g, '').replace(/<\/?em>/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
       return `<h6 id="${id}">${text.trim()}</h6>`;
     });
     content = content.replace(/^#{5}\s+(.+)$/gm, (match, text) => {
-      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      const cleanText = text.trim().replace(/<\/?strong>/g, '').replace(/<\/?em>/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
       return `<h5 id="${id}">${text.trim()}</h5>`;
     });
     content = content.replace(/^#{4}\s+(.+)$/gm, (match, text) => {
-      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      const cleanText = text.trim().replace(/<\/?strong>/g, '').replace(/<\/?em>/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
       return `<h4 id="${id}">${text.trim()}</h4>`;
     });
     content = content.replace(/^#{3}\s+(.+)$/gm, (match, text) => {
-      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      const cleanText = text.trim().replace(/<\/?strong>/g, '').replace(/<\/?em>/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
       return `<h3 id="${id}">${text.trim()}</h3>`;
     });
     content = content.replace(/^#{2}\s+(.+)$/gm, (match, text) => {
-      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      const cleanText = text.trim().replace(/<\/?strong>/g, '').replace(/<\/?em>/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
       return `<h2 id="${id}">${text.trim()}</h2>`;
     });
     content = content.replace(/^#\s+(.+)$/gm, (match, text) => {
-      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      const cleanText = text.trim().replace(/<\/?strong>/g, '').replace(/<\/?em>/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
       return `<h1 id="${id}">${text.trim()}</h1>`;
     });
-    
-    // Convert **bold** to <strong>
-    content = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    
-    // Convert *italic* to <em>
-    content = content.replace(/\*(.+?)\*/g, '<em>$1</em>');
     
     // Convert --- horizontal rules
     content = content.replace(/^---+$/gm, '<hr>');

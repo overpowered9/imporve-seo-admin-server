@@ -343,7 +343,7 @@ export class ConversationalAIContentGenerator {
 
     // What's Next
     const whatsNextStartTime = Date.now();
-    const whatsNextPrompt = await this.getWhatsNextContinuationPrompt(sectionConfig, params.testVersionOverride);
+    const whatsNextPrompt = await this.getWhatsNextContinuationPrompt(sectionConfig, params.testVersionOverride, params.call_to_action);
     conversation.push({ role: 'user', content: whatsNextPrompt });
     const whatsNext = await this.chatOnce(apiKey, model, conversation);
     this.recordStage('whats_next', whatsNextPrompt, whatsNext, Date.now() - whatsNextStartTime);
@@ -610,17 +610,19 @@ export class ConversationalAIContentGenerator {
 
   private async getWhatsNextContinuationPrompt(
     config: SectionConfig,
-    testVersionOverride?: VersionTestOverride
+    testVersionOverride?: VersionTestOverride,
+    callToAction?: string
   ): Promise<string> {
     const prompt = await this.getPromptWithFallback(
       'whats_next_continuation',
       testVersionOverride,
-      `Now generate What is next? content. IMPORTANT: Output should not be more than {{min_words}}-{{max_words}} words. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`
+      `Now generate What is next? content. IMPORTANT: Output should not be more than {{min_words}}-{{max_words}} words. Write a short paragraph inviting the reader to take action. Incorporate the call to action: {{call_to_action}}. If call to action is blank, write a general paragraph without specific contact details. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`
     );
 
     return this.populateVariables(prompt, {
       min_words: config.whatsMin.toString(),
-      max_words: config.whatsMax.toString()
+      max_words: config.whatsMax.toString(),
+      call_to_action: callToAction || ''
     });
   }
 
@@ -766,38 +768,42 @@ export class ConversationalAIContentGenerator {
   }
 
   private convertMarkdownToHTML(content: string): string {
-    // Convert Markdown headings to HTML with IDs
-    // ### Heading -> <h3 id="heading">Heading</h3>
+    // FIRST: Convert **bold** and *italic* BEFORE heading conversion
+    // This ensures markers inside headings are also converted
+    content = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    content = content.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    
+    // Convert Markdown headings to HTML with IDs (from h6 to h1 to avoid conflicts)
     content = content.replace(/^#{6}\s+(.+)$/gm, (match, text) => {
-      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      const cleanText = text.trim().replace(/<\/?strong>/g, '').replace(/<\/?em>/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
       return `<h6 id="${id}">${text.trim()}</h6>`;
     });
     content = content.replace(/^#{5}\s+(.+)$/gm, (match, text) => {
-      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      const cleanText = text.trim().replace(/<\/?strong>/g, '').replace(/<\/?em>/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
       return `<h5 id="${id}">${text.trim()}</h5>`;
     });
     content = content.replace(/^#{4}\s+(.+)$/gm, (match, text) => {
-      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      const cleanText = text.trim().replace(/<\/?strong>/g, '').replace(/<\/?em>/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
       return `<h4 id="${id}">${text.trim()}</h4>`;
     });
     content = content.replace(/^#{3}\s+(.+)$/gm, (match, text) => {
-      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      const cleanText = text.trim().replace(/<\/?strong>/g, '').replace(/<\/?em>/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
       return `<h3 id="${id}">${text.trim()}</h3>`;
     });
     content = content.replace(/^#{2}\s+(.+)$/gm, (match, text) => {
-      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      const cleanText = text.trim().replace(/<\/?strong>/g, '').replace(/<\/?em>/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
       return `<h2 id="${id}">${text.trim()}</h2>`;
     });
     content = content.replace(/^#\s+(.+)$/gm, (match, text) => {
-      const id = text.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+      const cleanText = text.trim().replace(/<\/?strong>/g, '').replace(/<\/?em>/g, '');
+      const id = cleanText.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
       return `<h1 id="${id}">${text.trim()}</h1>`;
     });
-    
-    // Convert **bold** to <strong>
-    content = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    
-    // Convert *italic* to <em>
-    content = content.replace(/\*(.+?)\*/g, '<em>$1</em>');
     
     // Convert --- horizontal rules
     content = content.replace(/^---+$/gm, '<hr>');
