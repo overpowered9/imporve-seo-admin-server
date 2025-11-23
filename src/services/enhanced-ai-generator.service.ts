@@ -574,17 +574,28 @@ export class EnhancedAIContentGenerator {
   }
 
   private convert_urls_to_links(content: string): string {
-    // Match URLs but skip those already inside anchor tags
-    return content.replace(/(<a\b[^>]*>.*?<\/a>)|((https?:\/\/|www\.)[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}([\/\w.~:?#[\]@!$&'()*+,;=%-]*)?)/g, (match, anchorTag, url) => {
-      // If this is already an anchor tag, return it unchanged
-      if (anchorTag) return anchorTag;
-      
-      // Determine the href (add http:// if missing)
-      const href = /^https?:\/\//.test(url) ? url : `http://${url}`;
-      
-      // For display text, keep the original format (with https:// or www.)
-      return `<a href="${href}" target="_blank" rel="noopener">${url}</a>`;
+    // First, protect existing anchor tags by temporarily replacing them
+    const anchors: string[] = [];
+    content = content.replace(/(<a\b[^>]*>.*?<\/a>)/gi, (match) => {
+      anchors.push(match);
+      return `__ANCHOR_${anchors.length - 1}__`;
     });
+
+    // Now convert standalone URLs (not inside href attributes)
+    content = content.replace(
+      /(?<!href="|href='|src="|src=')\b(https?:\/\/[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[\/\w.~:?#[\]@!$&'()*+,;=%-]*|www\.[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[\/\w.~:?#[\]@!$&'()*+,;=%-]*)\b/g,
+      (match) => {
+        const href = /^https?:\/\//.test(match) ? match : `http://${match}`;
+        return `<a href="${href}" target="_blank" rel="noopener">${match}</a>`;
+      }
+    );
+
+    // Restore the protected anchors
+    content = content.replace(/__ANCHOR_(\d+)__/g, (match, index) => {
+      return anchors[parseInt(index)];
+    });
+
+    return content;
   }
 
   private convertMarkdownToHTML(content: string): string {
