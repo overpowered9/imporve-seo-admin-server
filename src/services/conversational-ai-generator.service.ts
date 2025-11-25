@@ -784,8 +784,9 @@ export class ConversationalAIContentGenerator {
   private convertMarkdownToHTML(content: string): string {
     // FIRST: Convert **bold** and *italic* BEFORE heading conversion
     // This ensures markers inside headings are also converted
-    content = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    content = content.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    // Use global multiline flag and handle edge cases
+    content = content.replace(/\*\*([^*]+?)\*\*/gs, '<strong>$1</strong>');
+    content = content.replace(/\*([^*\s][^*]*?)\*/g, '<em>$1</em>');
     
     // Convert Markdown headings to HTML with IDs (from h6 to h1 to avoid conflicts)
     content = content.replace(/^#{6}\s+(.+)$/gm, (match, text) => {

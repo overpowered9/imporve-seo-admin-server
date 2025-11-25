@@ -600,8 +600,9 @@ export class EnhancedAIContentGenerator {
 
   private convertMarkdownToHTML(content: string): string {
     // FIRST: Convert **bold** and *italic* BEFORE heading conversion
-    content = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    content = content.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    // Use [^*]+ to avoid nested asterisks and gs flag for multiline
+    content = content.replace(/\*\*([^*]+?)\*\*/gs, '<strong>$1</strong>');
+    content = content.replace(/\*([^*\s][^*]*?)\*/g, '<em>$1</em>');
     
     // Convert Markdown headings to HTML with IDs (from h6 to h1)
     content = content.replace(/^#{6}\s+(.+)$/gm, (match, text) => {
