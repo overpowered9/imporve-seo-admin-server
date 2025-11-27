@@ -128,6 +128,31 @@ export class FluxAIService {
       console.log('✅ Flux AI task created successfully');
       console.log('🆔 Task ID:', taskId);
 
+      // ✅ Verify task was created by doing immediate check
+      try {
+        console.log('🔍 Verifying task creation...');
+        await this.sleep(2000); // Wait 2 seconds
+        
+        const verifyResponse = await axios.get(
+          `${this.baseUrl}/get_result`,
+          {
+            params: { id: taskId },
+            headers: { 'x-key': this.apiKey },
+            timeout: 10000
+          }
+        );
+        
+        console.log('✅ Task verified in Flux AI system');
+        console.log('📊 Initial status:', verifyResponse.data.status);
+      } catch (verifyError: any) {
+        // 404 is expected if task hasn't propagated yet
+        if (verifyError.response?.status === 404) {
+          console.log('⏳ Task not yet visible (expected), will wait during polling');
+        } else {
+          console.warn('⚠️  Could not verify task creation:', verifyError.message);
+        }
+      }
+
       return taskId;
       
     } catch (error: any) {
@@ -165,14 +190,19 @@ export class FluxAIService {
     console.log('🆔 Task ID:', taskId);
     console.log('⏱️  Max wait time: ~3 minutes');
 
+    // ✅ Longer initial delay to let task register properly
+    console.log('⏳ Waiting 5 seconds for task to register in Flux AI system...');
+    await this.sleep(5000);
+
+    let consecutiveErrors = 0;
+    const maxConsecutiveErrors = 5;
+
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      // Wait before checking (except first attempt)
+      // Progressive backoff: start at 3s, increase gradually
       if (attempt > 0) {
-        const waitTime = Math.min(3000 + (attempt * 200), 8000); // 3s to 8s
+        const waitTime = Math.min(3000 + (attempt * 300), 10000); // 3s to 10s
+        console.log(`⏳ Waiting ${waitTime}ms before next check...`);
         await this.sleep(waitTime);
-      } else {
-        // Small initial delay to let task register
-        await this.sleep(1000);
       }
 
       try {
@@ -185,9 +215,12 @@ export class FluxAIService {
             headers: {
               'x-key': this.apiKey
             },
-            timeout: 10000
+            timeout: 15000 // ✅ Increased timeout to 15s
           }
         );
+
+        // ✅ Reset consecutive error counter on successful response
+        consecutiveErrors = 0;
 
         console.log('📥 Status response:', JSON.stringify(response.data));
         const data = response.data;
@@ -201,7 +234,9 @@ export class FluxAIService {
         
         // Error states
         if (data.status === 'Error') {
-          throw new Error(`Generation failed: ${data.error || 'Unknown error'}`);
+          const errorMsg = data.error || 'Unknown error';
+          console.error('❌ Flux AI generation error:', errorMsg);
+          throw new Error(`Generation failed: ${errorMsg}`);
         }
         
         if (data.status === 'Request Moderated') {
@@ -213,40 +248,67 @@ export class FluxAIService {
         }
         
         // Still pending
-        console.log(`⏳ Status: ${data.status}`);
+        console.log(`⏳ Status: ${data.status} - Image is being generated...`);
         
       } catch (error: any) {
-        console.error(`⚠️  Error on attempt ${attempt + 1}:`, error.message);
+        consecutiveErrors++;
         
-        // Don't retry on these errors
+        console.error(`⚠️  Error on attempt ${attempt + 1}:`, error.message);
+        console.error(`⚠️  Consecutive errors: ${consecutiveErrors}/${maxConsecutiveErrors}`);
+        
+        console.error(`⚠️  Error on attempt ${attempt + 1}:`, error.message);
+        console.error(`⚠️  Consecutive errors: ${consecutiveErrors}/${maxConsecutiveErrors}`);
+        
+        // Don't retry on permanent errors
         if (error.message.includes('moderated') || 
             error.message.includes('Generation failed')) {
           throw error;
         }
         
-        // 404 might mean task is still registering on first few attempts
+        // Handle 404 - task not found
         if (error.response?.status === 404) {
-          if (attempt < 3) {
-            console.log('⏳ Task not found yet, waiting for it to register...');
+          // ✅ Be more lenient with 404s - they're common during task registration
+          if (attempt < 10) { // Allow 10 attempts for 404
+            console.log('⏳ Task not found yet (this is normal), waiting for it to register...');
             continue;
+          } else if (attempt < 20) {
+            console.log('⚠️  Task still not found after 10 attempts. Continuing to retry...');
+            continue;
+          } else {
+            // After 20 attempts, it's likely a real issue
+            throw new Error('Task not found after extended polling. The task ID may be invalid or expired.');
           }
-          throw new Error('Task not found. It may have expired or the task ID is invalid.');
         }
         
-        // Timeout - retry
-        if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
-          console.log('⏳ Timeout checking status, will retry...');
+        // Handle rate limiting (429)
+        if (error.response?.status === 429) {
+          console.log('⚠️  Rate limited by Flux AI. Increasing wait time...');
+          await this.sleep(10000); // Wait 10 seconds extra
           continue;
         }
         
-        // On last few attempts, fail fast
-        if (attempt >= maxAttempts - 2) {
-          throw new Error(`Status check failed: ${error.message}`);
+        // Timeout - retry with backoff
+        if (error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+          console.log('⏳ Timeout checking status, will retry with longer timeout...');
+          continue;
         }
+        
+        // ✅ If too many consecutive errors, fail
+        if (consecutiveErrors >= maxConsecutiveErrors) {
+          throw new Error(`Too many consecutive errors (${consecutiveErrors}). Last error: ${error.message}`);
+        }
+        
+        // On last few attempts, fail fast
+        if (attempt >= maxAttempts - 3) {
+          throw new Error(`Status check failed after ${attempt + 1} attempts: ${error.message}`);
+        }
+        
+        // Otherwise continue retrying
+        console.log('⏳ Retrying...');
       }
     }
 
-    throw new Error(`Generation timeout after ${maxAttempts} attempts. Please try again later.`);
+    throw new Error(`Generation timeout after ${maxAttempts} attempts (~${Math.round(maxAttempts * 4 / 60)} minutes). The task may still be processing.`);
   }
 
   /**
