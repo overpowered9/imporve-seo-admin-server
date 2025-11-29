@@ -310,7 +310,8 @@ export class ConversationalAIContentGenerator {
   private async generateFinalizationSections(
     params: ConversationalGenerateParams,
     conversation: ChatMessage[],
-    sectionConfig: SectionConfig
+    sectionConfig: SectionConfig,
+    wordCountVariant: 'small' | 'medium' | 'large'
   ): Promise<{
     conclusion: string;
     faqs: string;
@@ -325,7 +326,7 @@ export class ConversationalAIContentGenerator {
 
     // Conclusion
     const conclusionStartTime = Date.now();
-    const conclusionPrompt = await this.getConclusionContinuationPrompt(sectionConfig, params.testVersionOverride);
+    const conclusionPrompt = await this.getConclusionContinuationPrompt(sectionConfig, wordCountVariant, params.testVersionOverride);
     conversation.push({ role: 'user', content: conclusionPrompt });
     const conclusion = await this.chatOnce(apiKey, model, conversation);
     conversation.push({ role: 'assistant', content: conclusion });
@@ -334,7 +335,7 @@ export class ConversationalAIContentGenerator {
 
     // FAQs
     const faqsStartTime = Date.now();
-    const faqsPrompt = await this.getFAQsContinuationPrompt(sectionConfig, params.testVersionOverride);
+    const faqsPrompt = await this.getFAQsContinuationPrompt(sectionConfig, wordCountVariant, params.testVersionOverride);
     conversation.push({ role: 'user', content: faqsPrompt });
     const faqs = await this.chatOnce(apiKey, model, conversation);
     conversation.push({ role: 'assistant', content: faqs });
@@ -343,7 +344,7 @@ export class ConversationalAIContentGenerator {
 
     // What's Next
     const whatsNextStartTime = Date.now();
-    const whatsNextPrompt = await this.getWhatsNextContinuationPrompt(sectionConfig, params.testVersionOverride, params.call_to_action);
+    const whatsNextPrompt = await this.getWhatsNextContinuationPrompt(sectionConfig, wordCountVariant, params.testVersionOverride, params.call_to_action);
     conversation.push({ role: 'user', content: whatsNextPrompt });
     const whatsNext = await this.chatOnce(apiKey, model, conversation);
     this.recordStage('whats_next', whatsNextPrompt, whatsNext, Date.now() - whatsNextStartTime);
@@ -441,7 +442,8 @@ export class ConversationalAIContentGenerator {
     const { conclusion, faqs, whatsNext } = await this.generateFinalizationSections(
       params,
       updatedConversation,
-      sectionConfig
+      sectionConfig,
+      variant
     );
 
     // Assemble content
@@ -578,12 +580,24 @@ export class ConversationalAIContentGenerator {
 
   private async getConclusionContinuationPrompt(
     config: SectionConfig,
+    wordCountVariant: 'small' | 'medium' | 'large',
     testVersionOverride?: VersionTestOverride
   ): Promise<string> {
+    // Use word-count-specific template name
+    const templateName = `conclusion_${wordCountVariant}`;
+    
     const prompt = await this.getPromptWithFallback(
-      'conclusion_continuation',
+      templateName,
       testVersionOverride,
-      `Now generate the conclusion content. IMPORTANT: Output should not be more than {{min_words}}-{{max_words}} words. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`
+      `Now generate the conclusion content. 
+
+IMPORTANT: 
+- Output should be {{min_words}}-{{max_words}} words
+- After writing an output check the word count and regenerate if it is not in the range
+- Summarize key insights from the article
+- Encourage further exploration or engagement
+- Do not include call to action details in the conclusion
+- Do not include the word count in the output`
     );
 
     return this.populateVariables(prompt, {
@@ -594,12 +608,33 @@ export class ConversationalAIContentGenerator {
 
   private async getFAQsContinuationPrompt(
     config: SectionConfig,
+    wordCountVariant: 'small' | 'medium' | 'large',
     testVersionOverride?: VersionTestOverride
   ): Promise<string> {
+    // Use word-count-specific template name
+    const templateName = `faqs_${wordCountVariant}`;
+    
     const prompt = await this.getPromptWithFallback(
-      'faqs_continuation',
+      templateName,
       testVersionOverride,
-      `Now generate the FAQs content. IMPORTANT: Output should not be more than {{min_words}}-{{max_words}} words. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`
+      `Now generate the FAQs content. 
+
+IMPORTANT: 
+- Output should be {{min_words}}-{{max_words}} words
+- After writing an output check the word count and regenerate if it is not in the range
+- Come up with 3 FAQ that the reader may have
+- Format each question in BOLD using HTML: <strong>Q: Question here?</strong>
+- Format answers as: A: Answer text here.
+- Use clear, informative tone
+- Empathize with the reader's concerns
+- Do not include the word count in the output
+
+Example format:
+<strong>Q: What is the main topic?</strong>
+A: The answer goes here with detailed information.
+
+<strong>Q: How does this work?</strong>
+A: Another detailed answer here.`
     );
 
     return this.populateVariables(prompt, {
@@ -610,13 +645,27 @@ export class ConversationalAIContentGenerator {
 
   private async getWhatsNextContinuationPrompt(
     config: SectionConfig,
+    wordCountVariant: 'small' | 'medium' | 'large',
     testVersionOverride?: VersionTestOverride,
     callToAction?: string
   ): Promise<string> {
+    // Use word-count-specific template name
+    const templateName = `whats_next_${wordCountVariant}`;
+    
     const prompt = await this.getPromptWithFallback(
-      'whats_next_continuation',
+      templateName,
       testVersionOverride,
-      `Now generate What is next? content. IMPORTANT: Output should not be more than {{min_words}}-{{max_words}} words. Write a short paragraph inviting the reader to take action. Incorporate the call to action: {{call_to_action}}. If call to action is blank, write a general paragraph without specific contact details. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`
+      `Now generate What is next? content. 
+
+IMPORTANT: 
+- Output should be {{min_words}}-{{max_words}} words
+- After writing an output check the word count and regenerate if it is not in the range
+- Write a short paragraph inviting the reader to take action
+- MUST incorporate the call to action: {{call_to_action}}
+- If call to action contains URLs, links, or contact info, include them as clickable links
+- If call to action is blank, write a general paragraph encouraging further exploration
+- Do not include the word count in the output
+- Use natural, engaging language that flows from the article content`
     );
 
     return this.populateVariables(prompt, {
@@ -637,7 +686,7 @@ export class ConversationalAIContentGenerator {
     return populated;
   }
 
-  private getWordCountVariant(nos_of_words: string): string {
+  private getWordCountVariant(nos_of_words: string): 'small' | 'medium' | 'large' {
     if (nos_of_words === '600 to 1200 words') return 'small';
     if (nos_of_words === '2400 to 3600 words') return 'large';
     return 'medium';
