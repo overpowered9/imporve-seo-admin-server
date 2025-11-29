@@ -378,7 +378,15 @@ export class ConversationalAIContentGenerator {
     const metaTitlePrompt = await this.getPromptWithFallback(
       'meta_title',
       params.testVersionOverride,
-      `Create an SEO optimized meta title based on the blog post title \`{{title}}\` and the keyword \`{{seed_keyword}}\`. max length of title should be 50-60 characters including spaces.`
+      `Create an SEO optimized meta title for this blog post. 
+
+REQUIREMENTS:
+- Based on the title: {{title}}
+- Focus on keyword: {{seed_keyword}}
+- Maximum length: 50-60 characters including spaces
+- Output ONLY the meta title text, nothing else
+- Do NOT include phrases like "Approve the AI Title Choice" or similar instructions
+- Make it compelling and click-worthy`
     );
 
     const populatedMetaTitlePrompt = this.populateVariables(metaTitlePrompt, {
@@ -390,7 +398,15 @@ export class ConversationalAIContentGenerator {
       { role: 'system', content: `You are a helpful assistant. Please respond in ${content_lang}` },
       { role: 'user', content: populatedMetaTitlePrompt }
     ]);
-    this.recordStage('meta_title', metaTitlePrompt, metaTitle, Date.now() - metaTitleStartTime);
+    
+    // Clean up meta title - remove unwanted phrases
+    let cleanedMetaTitle = metaTitle.trim();
+    cleanedMetaTitle = cleanedMetaTitle.replace(/:\s*Approve the AI Title Choice/gi, '');
+    cleanedMetaTitle = cleanedMetaTitle.replace(/:\s*AI Title Choice/gi, '');
+    cleanedMetaTitle = cleanedMetaTitle.replace(/^["']|["']$/g, ''); // Remove quotes
+    cleanedMetaTitle = cleanedMetaTitle.trim();
+    
+    this.recordStage('meta_title', metaTitlePrompt, cleanedMetaTitle, Date.now() - metaTitleStartTime);
     console.log('✅ Meta title generated');
 
     // Meta Description
@@ -414,7 +430,7 @@ export class ConversationalAIContentGenerator {
     this.recordStage('meta_description', metaDescPrompt, metaDescription, Date.now() - metaDescStartTime);
     console.log('✅ Meta description generated');
 
-    return { metaTitle, metaDescription };
+    return { metaTitle: cleanedMetaTitle, metaDescription };
   }
 
   /**
