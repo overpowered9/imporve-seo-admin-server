@@ -333,22 +333,27 @@ IMPORTANT:
   } else if (type === 'faqs') {
     return `Now generate the FAQs content. 
 
-IMPORTANT: 
+CRITICAL FORMATTING REQUIREMENTS:
 - Output should be {{min_words}}-{{max_words}} words
-- After writing an output check the word count and regenerate if it is not in the range
 - Come up with 3 FAQ that the reader may have
-- Format each question in BOLD using HTML: <strong>Q: Question here?</strong>
-- Format answers as: A: Answer text here.
+- **EVERY question MUST be wrapped in <strong> tags**
+- Questions MUST start with: <strong>Q: 
+- Questions MUST end with: ?</strong>
+- Answers start with: A: (no tags)
 - Use clear, informative tone
-- Empathize with the reader's concerns
 - Do not include the word count in the output
 
-Example format:
-<strong>Q: What is the main topic?</strong>
-A: The answer goes here with detailed information.
+EXACT FORMAT TO FOLLOW (copy this structure):
+<strong>Q: What is the main benefit of this product?</strong>
+A: The answer provides detailed information about the benefits and features that users will find valuable.
 
-<strong>Q: How does this work?</strong>
-A: Another detailed answer here.`;
+<strong>Q: How does this technology work?</strong>
+A: A comprehensive explanation of the technology, breaking down complex concepts into understandable terms.
+
+<strong>Q: Is this suitable for beginners?</strong>
+A: An answer addressing the skill level requirements and providing reassurance to newcomers.
+
+IMPORTANT: DO NOT output questions without <strong> tags. DO NOT use ** for bold. Use HTML <strong> tags ONLY.`;
   } else { // whats_next
     return `Now generate What is next? content. 
 
