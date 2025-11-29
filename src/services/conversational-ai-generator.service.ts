@@ -891,12 +891,36 @@ IMPORTANT:
   }
 
   private removeConsecutiveSpecialCharacters(content: string): string {
-    const parts = content.split(/(<[^>]+>)/g);
+    // First, protect anchor tag content (including the display text)
+    const anchors: string[] = [];
+    content = content.replace(/(<a\b[^>]*>.*?<\/a>)/gi, (match) => {
+      anchors.push(match);
+      return `__PROTECTED_ANCHOR_${anchors.length - 1}__`;
+    });
+
+    // Split by HTML tags to avoid breaking tag attributes
+    const parts = content.split(/(<[^>]+>)/);
+    
     for (let i = 0; i < parts.length; i++) {
+      // Skip HTML tags (they start with '<')
       if (parts[i] && parts[i][0] === '<') continue;
+      
+      // Skip protected anchors
+      if (parts[i].includes('__PROTECTED_ANCHOR_')) continue;
+      
+      // Only process text content, not inside tags
+      // Remove consecutive special characters (2 or more) but preserve single ones
       parts[i] = parts[i].replace(/[^\p{L}\p{N}\s]{2,}/gu, '');
     }
-    return parts.join('');
+    
+    content = parts.join('');
+
+    // Restore protected anchors
+    content = content.replace(/__PROTECTED_ANCHOR_(\d+)__/g, (match, index) => {
+      return anchors[parseInt(index)];
+    });
+
+    return content;
   }
 
   private verifyAndFixTOCLinks(content: string): string {

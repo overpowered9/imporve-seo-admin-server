@@ -438,31 +438,20 @@ router.post('/active', validateApiAccess, validateCredits('content', 1), async (
       });
     }
 
-    console.log(`🚀 Starting dynamic content generation for: "${seed_keyword}" (${nos_of_words})`);
+    console.log(`🚀 Starting content generation with database prompts for: "${seed_keyword}" (${nos_of_words})`);
 
-    // Initialize services
+    // Initialize conversational generator (uses database prompts)
     const promptManagementService = new PromptManagementService();
-    const enhancedGenerator = new EnhancedAIContentGenerator(promptManagementService);
+    const conversationalGenerator = new ConversationalAIContentGenerator(
+      promptManagementService,
+      true // Enable fallback to original prompts
+    );
 
-    // Prepare template variables with request parameters
-    const enhancedTemplateVariables = {
-      seed_keyword,
-      context: details_to_include || '',
-      audience_data: audienceData || '',
-      lsi_keywords: '', // Will be generated dynamically
-      facts_data: '', // Will be generated dynamically
-      section_content: '', // Will be used in sections
-      conclusion_content: '', // Will be used in conclusion
-      faqs_content: '', // Will be used in FAQs
-      whats_next_content: call_to_action || '',
-      meta_title: title || seed_keyword,
-      meta_description: '',
-      ...templateVariables // Allow override of any variables
-    };
+    const startTime = Date.now();
 
-    // Generate content using dynamic prompts
-    const result = await enhancedGenerator.generateAiContentDynamic({
-      // Core parameters from generateAiHtmlPost2
+    // Generate content using conversational flow with database prompts
+    const result = await conversationalGenerator.generateContent({
+      apiKey: process.env.OPENAI_API_KEY,
       seed_keyword,
       keyword_selection,
       seed_options,
@@ -475,14 +464,13 @@ router.post('/active', validateApiAccess, validateCredits('content', 1), async (
       details_to_include,
       for_testing_only,
       audienceData,
-      // Dynamic prompt parameters
-      useActivePrompts,
-      customPrompts,
-      templateVariables: enhancedTemplateVariables
+      enableTracing: false
     });
 
-    console.log(`✅ Dynamic content generated successfully for: "${seed_keyword}"`);
-    console.log(`📊 Generation metadata:`, result.generationMetadata);
+    const processingTime = Date.now() - startTime;
+
+    console.log(`✅ Content generated successfully for: "${seed_keyword}" in ${processingTime}ms`);
+    console.log(`📊 Using database-driven conversational prompts`);
 
     // � SAVE GENERATION TO DATABASE FIRST (to get generation_id)
     const userId = req.user.id;
@@ -517,10 +505,10 @@ router.post('/active', validateApiAccess, validateCredits('content', 1), async (
           meta_description: result.meta_descreption
         })},
         ${JSON.stringify({
-          promptsUsed: result.promptsUsed,
-          generationMetadata: result.generationMetadata
+          method: 'conversational',
+          generator: 'database-prompts'
         })},
-        ${result.generationMetadata?.processingTime || 0}
+        ${processingTime}
       )
       RETURNING id
     `;
@@ -546,10 +534,12 @@ router.post('/active', validateApiAccess, validateCredits('content', 1), async (
         search_data: result.search_data,
         content: result.content,
         meta_title: result.meta_title,
-        meta_description: result.meta_descreption,
-        // Additional metadata from dynamic generation
-        promptsUsed: result.promptsUsed,
-        generationMetadata: result.generationMetadata
+        meta_description: result.meta_descreption
+      },
+      metadata: {
+        method: 'conversational',
+        generator: 'database-prompts',
+        processingTime
       }
     });
 
