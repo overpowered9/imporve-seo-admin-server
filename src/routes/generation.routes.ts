@@ -563,7 +563,7 @@ router.post('/active', validateApiAccess, validateCredits('content', 1), async (
 });
 
 // POST /api/v1/generate/testWithActiveVersions
-// Admin panel route: Use all active versions without authentication
+// Admin panel route: Use ConversationalAIContentGenerator with all active database prompts
 router.post('/testWithActiveVersions', async (req: Request, res: Response) => {
   try {
     const {
@@ -578,8 +578,7 @@ router.post('/testWithActiveVersions', async (req: Request, res: Response) => {
       call_to_action = '',
       details_to_include = '',
       for_testing_only = 0,
-      audienceData = '',
-      templateVariables = {}
+      audienceData = ''
     } = req.body;
 
     // Validate required parameters
@@ -601,28 +600,18 @@ router.post('/testWithActiveVersions', async (req: Request, res: Response) => {
 
     console.log(`🎯 Admin testing with all active versions: "${seed_keyword}" (${nos_of_words})`);
 
-    // Initialize services
+    // Initialize conversational generator (uses database prompts)
     const promptManagementService = new PromptManagementService();
-    const enhancedGenerator = new EnhancedAIContentGenerator(promptManagementService);
+    const conversationalGenerator = new ConversationalAIContentGenerator(
+      promptManagementService,
+      true // Enable fallback to original prompts
+    );
 
-    // Prepare template variables
-    const enhancedTemplateVariables = {
-      seed_keyword,
-      context: details_to_include || '',
-      audience_data: audienceData || '',
-      lsi_keywords: '',
-      facts_data: '',
-      section_content: '',
-      conclusion_content: '',
-      faqs_content: '',
-      whats_next_content: call_to_action || '',
-      meta_title: title || seed_keyword,
-      meta_description: '',
-      ...templateVariables
-    };
+    const startTime = Date.now();
 
-    // Generate content using all active versions
-    const result = await enhancedGenerator.generateAiContentDynamic({
+    // Generate content using conversational flow with database prompts
+    const result = await conversationalGenerator.generateContent({
+      apiKey: process.env.OPENAI_API_KEY,
       seed_keyword,
       keyword_selection,
       seed_options,
@@ -635,9 +624,10 @@ router.post('/testWithActiveVersions', async (req: Request, res: Response) => {
       details_to_include,
       for_testing_only,
       audienceData,
-      useActivePrompts: true, // Use all active versions
-      templateVariables: enhancedTemplateVariables
+      enableTracing: false
     });
+
+    const processingTime = Date.now() - startTime;
 
     console.log(`✅ Admin testing completed: "${seed_keyword}"`);
     console.log(`📊 Used all active prompt versions`);
@@ -649,8 +639,12 @@ router.post('/testWithActiveVersions', async (req: Request, res: Response) => {
         content: result.content,
         meta_title: result.meta_title,
         meta_description: result.meta_descreption,
-        promptsUsed: result.promptsUsed,
-        generationMetadata: result.generationMetadata
+        promptsUsed: {},
+        generationMetadata: {
+          templatesUsed: [],
+          promptVersions: {},
+          processingTime
+        }
       }
     });
 
