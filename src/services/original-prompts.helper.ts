@@ -337,9 +337,18 @@ IMPORTANT:
 - Output should be {{min_words}}-{{max_words}} words
 - After writing an output check the word count and regenerate if it is not in the range
 - Come up with 3 FAQ that the reader may have
-- Provide questions and answers with clear, informative tone
+- Format each question in BOLD using HTML: <strong>Q: Question here?</strong>
+- Format answers as: A: Answer text here.
+- Use clear, informative tone
 - Empathize with the reader's concerns
-- Do not include the word count in the output`;
+- Do not include the word count in the output
+
+Example format:
+<strong>Q: What is the main topic?</strong>
+A: The answer goes here with detailed information.
+
+<strong>Q: How does this work?</strong>
+A: Another detailed answer here.`;
   } else { // whats_next
     return `Now generate What is next? content. 
 
@@ -347,8 +356,10 @@ IMPORTANT:
 - Output should be {{min_words}}-{{max_words}} words
 - After writing an output check the word count and regenerate if it is not in the range
 - Write a short paragraph inviting the reader to take action
-- Incorporate the call to action provided by the user
-- If call to action is blank, write a general paragraph without specific contact details
-- Do not include the word count in the output`;
+- MUST incorporate the call to action: {{call_to_action}}
+- If call to action contains URLs, links, or contact info, include them as clickable links
+- If call to action is blank, write a general paragraph encouraging further exploration
+- Do not include the word count in the output
+- Use natural, engaging language that flows from the article content`;
   }
 }
