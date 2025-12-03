@@ -74,3 +74,4 @@ DATABASE_MIGRATIONS.sql
 add_stripe_price_id.sql
 *.sql
 /extra
+/src/scripts

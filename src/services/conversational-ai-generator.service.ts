@@ -530,7 +530,7 @@ REQUIREMENTS:
     testVersionOverride?: VersionTestOverride
   ): Promise<string> {
     const { wordCountVariant } = params;
-    const templateName = `basic_prompt_${wordCountVariant}`;
+    const templateName = `master_instruction_set_${wordCountVariant}`;
 
     try {
       // Try to fetch from database
@@ -580,8 +580,12 @@ REQUIREMENTS:
     config: SectionConfig,
     testVersionOverride?: VersionTestOverride
   ): Promise<string> {
+    // Map section number to ordinal template name (continuation_section_first, etc.)
+    const ordinalName = this.getOrdinalName(sectionNumber);
+    const templateName = `continuation_section_${ordinalName}`;
+    
     const prompt = await this.getPromptWithFallback(
-      'section_continuation',
+      templateName,
       testVersionOverride,
       `Now generate the {{ordinal}} subtitle content from the Table of Contents you created earlier. IMPORTANT: Output should not be more than {{min_words}}-{{max_words}} words. After writing an output check the word count and regenerate if it is not in the range. Do not include the word count in the output.`
     );
