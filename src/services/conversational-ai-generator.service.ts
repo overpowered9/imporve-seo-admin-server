@@ -785,6 +785,9 @@ IMPORTANT:
     // Convert Markdown to HTML first (in case AI returns Markdown)
     content = this.convertMarkdownToHTML(content);
     
+    // Fix malformed anchor tags BEFORE other processing
+    content = this.fixMalformedAnchors(content);
+    
     // Apply all post-processing from original function
     content = this.stripParenthesesWrappingContactTokens(content);
     content = this.convert_emails_to_links(content);
@@ -896,6 +899,45 @@ IMPORTANT:
     
     // Convert --- horizontal rules
     content = content.replace(/^---+$/gm, '<hr>');
+    
+    return content;
+  }
+
+  private fixMalformedAnchors(content: string): string {
+    // Fix common GPT anchor tag issues:
+    // 1. Unclosed anchor tags: <a href="url" target="blank" rel="noopener">text (missing </a>)
+    // 2. Duplicate/mangled URLs: <a href="url">text]url or <a href="url">url</a>url
+    // 3. Broken attributes: target="blank" should be target="_blank"
+    
+    // Fix target="blank" -> target="_blank"
+    content = content.replace(/target="blank"/gi, 'target="_blank"');
+    content = content.replace(/target='blank'/gi, "target='_blank'");
+    
+    // Fix unclosed anchor tags followed by URLs
+    // Pattern: <a href="http://url" ...>text (no closing tag) followed by more text with URL fragments
+    // Example: <a href="http://www.abc.com" target="_blank" rel="noopener">www.abc.com (missing </a>)
+    content = content.replace(
+      /<a\s+([^>]*href=["']([^"']+)["'][^>]*)>([^<]*?)(?:\]|\s*http)/gi,
+      (match, attributes, hrefUrl, linkText) => {
+        // Close the anchor tag properly
+        const cleanLinkText = linkText.trim();
+        return `<a ${attributes}>${cleanLinkText}</a>`;
+      }
+    );
+    
+    // Remove duplicate URLs after anchor tags
+    // Pattern: <a href="url">text</a>url or <a href="url">text</a>]url
+    content = content.replace(
+      /(<a\s+[^>]*href=["']([^"']+)["'][^>]*>[^<]*<\/a>)[\]\s]*(https?:\/\/[^\s<]+)/gi,
+      '$1'
+    );
+    
+    // Fix broken anchor tags with ] character
+    // Pattern: <a ...>text]extra -> <a ...>text</a>
+    content = content.replace(
+      /(<a\s+[^>]*>)([^\]<]+)\]([^<]*?)(?=\s|<|$)/gi,
+      '$1$2</a>'
+    );
     
     return content;
   }
