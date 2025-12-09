@@ -100,7 +100,7 @@ export class FluxAIService {
       console.log('🔧 Request params:', { ...requestBody, prompt: '[truncated]' });
 
       const response = await axios.post(
-        `${this.baseUrl}/flux-dev`,
+        `${this.baseUrl}/flux-pro-1.1`,
         requestBody,
         {
           headers: {
