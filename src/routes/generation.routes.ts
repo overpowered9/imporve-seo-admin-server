@@ -516,11 +516,13 @@ router.post('/active', validateApiAccess, validateCredits('content', 1), async (
     const generationId = generationRecord[0].id;
 
     // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION (with website_id and generation_id)
+    // Truncate reason to avoid varchar(255) limit
+    const truncatedKeyword = seed_keyword.substring(0, 200);
     await deductCredits(
       userId,
       'content',
       1,
-      `Content generation for keyword: ${seed_keyword}`,
+      `Content generation: ${truncatedKeyword}`,
       websiteId,
       generationId
     );
@@ -902,12 +904,13 @@ router.post('/conversational', validateApiAccess, validateCredits('content', 1),
     const generationId = generationRecord.generation_id;
     console.log(`💾 Generation saved with ID: ${generationId}`);
 
-    // Deduct credit
+    // Deduct credit (truncate reason to avoid varchar limit)
+    const truncatedKeyword = seed_keyword.substring(0, 200);
     await deductCredits(
       userId,
       'content',
       1,
-      `Conversational content generation for keyword: ${seed_keyword}`,
+      `Conversational content: ${truncatedKeyword}`,
       websiteId,
       generationId
     );
@@ -1049,11 +1052,13 @@ router.post('/generateimage', validateApiAccess, validateCredits('images', 1), a
     const generationId = generationRecord[0].id;
 
     // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION (with website_id and generation_id)
+    // Truncate reason to avoid varchar(255) limit in credit_transactions table
+    const truncatedTitle = (title || prompt || '').substring(0, 200);
     await deductCredits(
       userId,
       'images',
       1,
-      `AI image generation for: ${title || prompt}`,
+      `AI image generation: ${truncatedTitle}`,
       websiteId,
       generationId
     );
@@ -1153,11 +1158,12 @@ router.post('/generatekeyword', validateApiAccess, validateCredits('keywords', 1
     const generationId = generationRecord[0].id;
 
     // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION (with website_id and generation_id)
+    const truncatedKeyword = seed_keyword.substring(0, 200);
     await deductCredits(
       userId,
       'keywords',
       1,
-      `Keyword research for: ${seed_keyword}`,
+      `Keyword research: ${truncatedKeyword}`,
       websiteId,
       generationId
     );
@@ -1240,11 +1246,14 @@ router.post('/generatekeywordded', validateApiAccess, validateCredits('keywords'
     const generationId = generationRecord[0].id;
 
     // 🔥 DEDUCT CREDITS (with website_id and generation_id)
+    // Truncate reason to avoid varchar(255) limit
+    const truncatedKeyword = (seed_keyword || 'N/A').substring(0, 200);
+    const truncatedReason = (reason || `Plugin keyword: ${truncatedKeyword}`).substring(0, 240);
     await deductCredits(
       userId,
       'keywords',
       count,
-      reason || `Plugin keyword generation: ${seed_keyword || 'N/A'}`,
+      truncatedReason,
       websiteId,
       generationId
     );
