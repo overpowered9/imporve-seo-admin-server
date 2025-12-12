@@ -773,10 +773,10 @@ IMPORTANT:
     return (
       '<div class="main-content-section-improveseo">' +
       introResponse +
-      sectionResponses.map(s => `<div style="margin-bottom: 15px;margin-top: 50px;">${s}</div>`).join('') +
-      `<div style="margin-bottom: 15px;margin-top: 50px;">${conclusionResp}</div>` +
-      `<div style="margin-bottom: 15px;margin-top: 50px;">${faqsResp}</div>` +
-      `<div style="margin-bottom: 15px;margin-top: 50px;">${whatsNextResp}</div>` +
+      sectionResponses.map(s => `<div style="margin-bottom: 5px;margin-top: 50px;">${s}</div>`).join('') +
+      `<div style="margin-bottom: 5px;margin-top: 50px;">${conclusionResp}</div>` +
+      `<div style="margin-bottom: 5px;margin-top: 50px;">${faqsResp}</div>` +
+      `<div style="margin-bottom: 5px;margin-top: 50px;">${whatsNextResp}</div>` +
       '</div>'
     );
   }
@@ -819,9 +819,21 @@ IMPORTANT:
   }
 
   private removePTags(html: string): string {
+    // Remove empty paragraphs
     html = html.replace(/<p>(\s|&nbsp;)*<\/p>/g, '');
-    html = html.replace(/\n/g, '<br>');
-    html = html.replace(/<h2>Table of Contents<\/h2>/g, '<h2 style="margin-top: 35px;">Table of Contents</h2>');
+    
+    // Add margin-top to Table of Contents heading (handles with or without id/class attributes)
+    html = html.replace(/<h2([^>]*)>Table of Contents<\/h2>/gi, (match, attributes) => {
+      // If it already has style attribute, append margin-top to it
+      if (attributes.includes('style="')) {
+        return match.replace(/style="([^"]*)"/, 'style="$1; margin-top: 35px;"');
+      } else {
+        // Add style attribute
+        return `<h2${attributes} style="margin-top: 35px;">Table of Contents</h2>`;
+      }
+    });
+    
+    // Remove bracket artifacts
     html = html.replace(/\[[^\]]*\]/g, '');
     return html;
   }
