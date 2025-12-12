@@ -773,10 +773,10 @@ IMPORTANT:
     return (
       '<div class="main-content-section-improveseo">' +
       introResponse +
-      sectionResponses.map(s => `<div style="margin-bottom: 15px;margin-top: 50px;">${s}</div>`).join('') +
-      `<div style="margin-bottom: 15px;margin-top: 50px;">${conclusionResp}</div>` +
-      `<div style="margin-bottom: 15px;margin-top: 50px;">${faqsResp}</div>` +
-      `<div style="margin-bottom: 15px;margin-top: 50px;">${whatsNextResp}</div>` +
+      sectionResponses.map(s => `<div style="margin-bottom: 5px;margin-top: 50px;">${s}</div>`).join('') +
+      `<div style="margin-bottom: 5px;margin-top: 50px;">${conclusionResp}</div>` +
+      `<div style="margin-bottom: 5px;margin-top: 50px;">${faqsResp}</div>` +
+      `<div style="margin-bottom: 5px;margin-top: 50px;">${whatsNextResp}</div>` +
       '</div>'
     );
   }
@@ -819,9 +819,30 @@ IMPORTANT:
   }
 
   private removePTags(html: string): string {
+    // Remove empty paragraphs
     html = html.replace(/<p>(\s|&nbsp;)*<\/p>/g, '');
-    html = html.replace(/\n/g, '<br>');
-    html = html.replace(/<h2>Table of Contents<\/h2>/g, '<h2 style="margin-top: 35px;">Table of Contents</h2>');
+    
+    // Add margin-top to Table of Contents heading (handles with or without id attribute)
+    html = html.replace(/<h2[^>]*>Table of Contents<\/h2>/g, (match) => {
+      // If it already has style attribute, append to it; otherwise add new style
+      if (match.includes('style="')) {
+        return match.replace(/style="([^"]*)"/, 'style="$1 margin-top: 35px;"');
+      } else {
+        return match.replace(/<h2/, '<h2 style="margin-top: 35px;"');
+      }
+    });
+    
+    // Replace newlines with <br> ONLY when not between HTML tags
+    // This prevents adding <br> between block-level elements like <h2>, <ul>, <li>, <div>
+    html = html.replace(/([^>])\n([^<])/g, '$1<br>$2');
+    
+    // Remove <br> tags immediately after any heading tags (h1-h6)
+    html = html.replace(/<\/(h[1-6])>(\s*<br\s*\/?>)+/gi, '</$1>');
+    
+    // Remove <br> tags immediately before any heading tags (h1-h6)
+    html = html.replace(/(<br\s*\/?>)+(\s*<h[1-6][^>]*>)/gi, '$2');
+    
+    // Remove bracket artifacts
     html = html.replace(/\[[^\]]*\]/g, '');
     return html;
   }
