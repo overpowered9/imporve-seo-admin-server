@@ -479,8 +479,7 @@ export const getUserWebsites = async (user_id: number): Promise<Website[]> => {
 
 export const deleteWebsite = async (website_id: number): Promise<void> => {
   await sql`
-    UPDATE websites 
-    SET active = false, updated_at = NOW()
+    DELETE FROM websites 
     WHERE id = ${website_id}
   `;
 };
