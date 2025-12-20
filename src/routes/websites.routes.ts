@@ -77,16 +77,20 @@ router.post('/', async (req, res) => {
 router.delete('/:website_id', async (req, res) => {
   try {
     const website_id = parseInt(req.params.website_id);
+    console.log('Deleting website:', website_id);
     await deleteWebsite(website_id);
+    console.log('Website deleted successfully:', website_id);
     
     res.json({
       success: true,
       message: 'Website deleted successfully'
     });
   } catch (error) {
+    console.error('Delete website error:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to delete website'
+      error: 'Failed to delete website',
+      details: error instanceof Error ? error.message : 'Unknown error'
     });
   }
 });
