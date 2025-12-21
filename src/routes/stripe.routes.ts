@@ -556,11 +556,9 @@ router.get('/plans', async (req: Request, res: Response) => {
  */
 router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
   try {
-    const { user_id, plan_id, success_url, cancel_url } = z.object({
+    const { user_id, plan_id } = z.object({
       user_id: z.number(),
-      plan_id: z.number(),
-      success_url: z.string().url(),
-      cancel_url: z.string().url()
+      plan_id: z.number()
     }).parse(req.body);
 
     // Get user and plan
@@ -607,8 +605,8 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
         quantity: 1,
       }],
       mode: 'subscription',
-      success_url: success_url,
-      cancel_url: cancel_url,
+      success_url: `${process.env.FRONTEND_URL || 'http://localhost:3001'}/dashboard?subscription=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:3001'}/dashboard?subscription=cancelled`,
       metadata: {
         user_id: user_id.toString(),
         plan_id: plan_id.toString(),
