@@ -563,7 +563,7 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
 
     // Get user and plan
     const [userResult, planResult] = await Promise.all([
-      sql`SELECT email, id FROM users WHERE id = ${user_id}`,
+      sql`SELECT email, id, stripe_customer_id FROM users WHERE id = ${user_id}`,
       sql`SELECT * FROM subscription_plans WHERE id = ${plan_id}`
     ]);
 
@@ -594,35 +594,75 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
       });
     }
 
-    console.log(`🎫 Creating checkout session for user ${user_id} to subscribe to ${plan.name}`);
+    // Check if user has stripe customer ID and payment method
+    if (!user.stripe_customer_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please add a payment method in Settings first',
+        requires_payment_method: true
+      });
+    }
 
-    // Create Stripe Checkout Session
-    const session = await stripe.checkout.sessions.create({
-      customer_email: user.email,
-      payment_method_types: ['card'],
-      line_items: [{
-        price: plan.stripe_price_id,
-        quantity: 1,
-      }],
-      mode: 'subscription',
-      success_url: `${process.env.FRONTEND_URL || 'http://localhost:3001'}/dashboard?subscription=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:3001'}/dashboard?subscription=cancelled`,
-      metadata: {
-        user_id: user_id.toString(),
-        plan_id: plan_id.toString(),
-        upgrade_from_free: 'true'
-      }
+    // Get customer's payment methods
+    const paymentMethods = await stripe.paymentMethods.list({
+      customer: user.stripe_customer_id,
+      type: 'card'
     });
 
-    console.log(`✅ Checkout session created: ${session.id}`);
+    if (paymentMethods.data.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please add a payment method in Settings first',
+        requires_payment_method: true
+      });
+    }
 
-    res.json({
-      success: true,
-      data: {
-        session_id: session.id,
-        url: session.url
+    console.log(`🎫 Creating subscription for user ${user_id} to ${plan.name}`);
+
+    try {
+      // Create subscription directly using saved payment method
+      const subscription = await stripe.subscriptions.create({
+        customer: user.stripe_customer_id,
+        items: [{
+          price: plan.stripe_price_id,
+        }],
+        payment_behavior: 'default_incomplete',
+        payment_settings: {
+          save_default_payment_method: 'on_subscription'
+        },
+        expand: ['latest_invoice.payment_intent'],
+        metadata: {
+          user_id: user_id.toString(),
+          plan_id: plan_id.toString(),
+          upgrade_from_free: 'true'
+        }
+      });
+
+      console.log(`✅ Subscription created: ${subscription.id}`);
+
+      res.json({
+        success: true,
+        message: 'Subscription created successfully! Credits have been added.',
+        data: {
+          subscription_id: subscription.id,
+          status: subscription.status
+        }
+      });
+
+    } catch (stripeError: any) {
+      console.error('Stripe subscription error:', stripeError);
+      
+      if (stripeError.type === 'StripeCardError') {
+        return res.status(402).json({
+          success: false,
+          error: 'Payment failed. Please update your payment method in Settings.',
+          requires_payment_method: true,
+          stripe_error: stripeError.message
+        });
       }
-    });
+
+      throw stripeError;
+    }
 
   } catch (error) {
     console.error('Subscribe to plan error:', error);
@@ -877,6 +917,195 @@ router.post('/cancel-subscription', async (req: Request, res: Response) => {
     res.status(400).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to cancel subscription'
+    });
+  }
+});
+
+/**
+ * Get user's payment methods
+ * GET /api/v1/stripe/payment-methods/:user_id
+ */
+router.get('/payment-methods/:user_id', async (req: Request, res: Response) => {
+  try {
+    const userId = parseInt(req.params.user_id);
+
+    // Get user's Stripe customer ID
+    const userResult = await sql`SELECT stripe_customer_id FROM users WHERE id = ${userId}`;
+    if (userResult.length === 0 || !userResult[0].stripe_customer_id) {
+      return res.json({
+        success: true,
+        payment_methods: []
+      });
+    }
+
+    const customerId = userResult[0].stripe_customer_id;
+
+    // Get payment methods from Stripe
+    const paymentMethods = await stripe.paymentMethods.list({
+      customer: customerId,
+      type: 'card'
+    });
+
+    // Get default payment method
+    const customer = await stripe.customers.retrieve(customerId) as Stripe.Customer;
+    const defaultPaymentMethodId = customer.invoice_settings?.default_payment_method;
+
+    res.json({
+      success: true,
+      payment_methods: paymentMethods.data.map(pm => ({
+        id: pm.id,
+        brand: pm.card?.brand,
+        last4: pm.card?.last4,
+        exp_month: pm.card?.exp_month,
+        exp_year: pm.card?.exp_year,
+        is_default: pm.id === defaultPaymentMethodId
+      }))
+    });
+
+  } catch (error) {
+    console.error('Get payment methods error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to fetch payment methods'
+    });
+  }
+});
+
+/**
+ * Create setup session for adding payment method
+ * POST /api/v1/stripe/create-setup-session
+ */
+router.post('/create-setup-session', async (req: Request, res: Response) => {
+  try {
+    const { user_id, success_url, cancel_url } = z.object({
+      user_id: z.number(),
+      success_url: z.string().url(),
+      cancel_url: z.string().url()
+    }).parse(req.body);
+
+    // Get or create Stripe customer
+    const userResult = await sql`SELECT email, stripe_customer_id FROM users WHERE id = ${user_id}`;
+    if (userResult.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    const user = userResult[0];
+    let customerId = user.stripe_customer_id;
+
+    // Create customer if doesn't exist
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        metadata: {
+          user_id: user_id.toString()
+        }
+      });
+      customerId = customer.id;
+
+      // Save customer ID
+      await sql`UPDATE users SET stripe_customer_id = ${customerId} WHERE id = ${user_id}`;
+    }
+
+    // Create setup session
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      payment_method_types: ['card'],
+      mode: 'setup',
+      success_url: success_url,
+      cancel_url: cancel_url
+    });
+
+    res.json({
+      success: true,
+      url: session.url
+    });
+
+  } catch (error) {
+    console.error('Create setup session error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to create setup session'
+    });
+  }
+});
+
+/**
+ * Remove payment method
+ * DELETE /api/v1/stripe/payment-method/:user_id/:payment_method_id
+ */
+router.delete('/payment-method/:user_id/:payment_method_id', async (req: Request, res: Response) => {
+  try {
+    const userId = parseInt(req.params.user_id);
+    const paymentMethodId = req.params.payment_method_id;
+
+    // Verify user owns this payment method
+    const userResult = await sql`SELECT stripe_customer_id FROM users WHERE id = ${userId}`;
+    if (userResult.length === 0 || !userResult[0].stripe_customer_id) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    // Detach payment method from customer
+    await stripe.paymentMethods.detach(paymentMethodId);
+
+    res.json({
+      success: true,
+      message: 'Payment method removed successfully'
+    });
+
+  } catch (error) {
+    console.error('Remove payment method error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to remove payment method'
+    });
+  }
+});
+
+/**
+ * Set default payment method
+ * POST /api/v1/stripe/set-default-payment-method
+ */
+router.post('/set-default-payment-method', async (req: Request, res: Response) => {
+  try {
+    const { user_id, payment_method_id } = z.object({
+      user_id: z.number(),
+      payment_method_id: z.string()
+    }).parse(req.body);
+
+    // Get user's Stripe customer ID
+    const userResult = await sql`SELECT stripe_customer_id FROM users WHERE id = ${user_id}`;
+    if (userResult.length === 0 || !userResult[0].stripe_customer_id) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    const customerId = userResult[0].stripe_customer_id;
+
+    // Update customer's default payment method
+    await stripe.customers.update(customerId, {
+      invoice_settings: {
+        default_payment_method: payment_method_id
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Default payment method updated'
+    });
+
+  } catch (error) {
+    console.error('Set default payment method error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to set default payment method'
     });
   }
 });
