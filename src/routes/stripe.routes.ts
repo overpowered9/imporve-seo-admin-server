@@ -503,6 +503,34 @@ router.post('/webhook', async (req: Request, res: Response) => {
         break;
       }
 
+      case 'setup_intent.succeeded': {
+        const setupIntent = event.data.object as Stripe.SetupIntent;
+        
+        // When a setup intent succeeds, it means a payment method was added
+        if (setupIntent.customer && setupIntent.payment_method) {
+          const customerId = setupIntent.customer as string;
+          const paymentMethodId = setupIntent.payment_method as string;
+
+          // Check if this is the first payment method for the customer
+          const paymentMethods = await stripe.paymentMethods.list({
+            customer: customerId,
+            type: 'card'
+          });
+
+          // If this is the first (or only) payment method, set it as default
+          if (paymentMethods.data.length === 1) {
+            await stripe.customers.update(customerId, {
+              invoice_settings: {
+                default_payment_method: paymentMethodId
+              }
+            });
+
+            console.log(`✅ Set payment method ${paymentMethodId} as default for customer ${customerId} (first card)`);
+          }
+        }
+        break;
+      }
+
       default:
         console.log(`ℹ️ Unhandled event type: ${event.type}`);
     }
@@ -617,6 +645,18 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
       });
     }
 
+    // Check if customer has a default payment method set
+    const customer = await stripe.customers.retrieve(user.stripe_customer_id) as Stripe.Customer;
+    const defaultPaymentMethod = customer.invoice_settings?.default_payment_method;
+
+    if (!defaultPaymentMethod) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please set a default payment method in Settings first',
+        requires_default_payment_method: true
+      });
+    }
+
     console.log(`🎫 Creating subscription for user ${user_id} to ${plan.name}`);
 
     try {
@@ -626,7 +666,7 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
         items: [{
           price: plan.stripe_price_id,
         }],
-        payment_behavior: 'default_incomplete',
+        payment_behavior: 'error_if_incomplete', // Changed: Fail if payment fails
         payment_settings: {
           save_default_payment_method: 'on_subscription'
         },
@@ -638,21 +678,32 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
         }
       });
 
-      console.log(`✅ Subscription created: ${subscription.id}`);
+      console.log(`✅ Subscription created: ${subscription.id}, status: ${subscription.status}`);
 
-      res.json({
-        success: true,
-        message: 'Subscription created successfully! Credits have been added.',
-        data: {
-          subscription_id: subscription.id,
-          status: subscription.status
-        }
-      });
+      // Only respond success if subscription is active or trialing
+      if (subscription.status === 'active' || subscription.status === 'trialing') {
+        res.json({
+          success: true,
+          message: 'Subscription created successfully! Credits have been added.',
+          data: {
+            subscription_id: subscription.id,
+            status: subscription.status
+          }
+        });
+      } else {
+        // Subscription created but payment incomplete
+        return res.status(402).json({
+          success: false,
+          error: 'Payment is required to activate subscription. Please update your payment method in Settings.',
+          requires_payment_method: true,
+          subscription_status: subscription.status
+        });
+      }
 
     } catch (stripeError: any) {
       console.error('Stripe subscription error:', stripeError);
       
-      if (stripeError.type === 'StripeCardError') {
+      if (stripeError.type === 'StripeCardError' || stripeError.code === 'resource_missing') {
         return res.status(402).json({
           success: false,
           error: 'Payment failed. Please update your payment method in Settings.',
