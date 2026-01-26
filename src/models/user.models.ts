@@ -247,6 +247,13 @@ export const changePlan = async (
         WHERE user_id = ${user_id}
       `;
 
+      // Also update user's plan_id for consistency
+      await sql`
+        UPDATE users
+        SET plan_id = ${new_plan_id}
+        WHERE id = ${user_id}
+      `;
+
       // ADD credits (not replace)
       const newPlan = await sql`SELECT * FROM subscription_plans WHERE id = ${new_plan_id}`;
       if (newPlan.length > 0) {

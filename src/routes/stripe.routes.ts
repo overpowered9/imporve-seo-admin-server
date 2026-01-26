@@ -273,6 +273,31 @@ router.post('/webhook', async (req: Request, res: Response) => {
     return res.status(400).send(`Webhook Error: ${err instanceof Error ? err.message : 'Unknown error'}`);
   }
 
+  // ✅ IDEMPOTENCY CHECK: Prevent duplicate processing on Stripe retries
+  try {
+    // Check if this event was already processed
+    const existingEvent = await sql`
+      SELECT event_id, processed FROM stripe_webhook_events 
+      WHERE event_id = ${event.id}
+      LIMIT 1
+    `;
+
+    if (existingEvent.length > 0) {
+      console.log(`ℹ️ Webhook event ${event.id} already processed - skipping (idempotency)`);
+      return res.json({ received: true, skipped: true, reason: 'already_processed' });
+    }
+
+    // Log event as being processed (insert early to claim it)
+    await sql`
+      INSERT INTO stripe_webhook_events (event_id, event_type, processed)
+      VALUES (${event.id}, ${event.type}, false)
+      ON CONFLICT (event_id) DO NOTHING
+    `;
+  } catch (idempotencyError) {
+    console.error('Idempotency check error:', idempotencyError);
+    // Continue processing if idempotency check fails (don't block webhooks)
+  }
+
   // Handle the event
   try {
     switch (event.type) {
@@ -317,6 +342,12 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
       case 'customer.subscription.created': {
         const subscription = event.data.object as Stripe.Subscription;
+        
+        // ✅ CRITICAL: Only process if payment succeeded
+        if (subscription.status !== 'active' && subscription.status !== 'trialing') {
+          console.warn(`⚠️ Subscription ${subscription.id} status: ${subscription.status} - skipping activation (payment not confirmed)`);
+          return res.json({ received: true, skipped: true, reason: 'payment_not_confirmed' });
+        }
         
         // Get user_id from subscription metadata or find by customer
         const metadata = subscription.metadata;
@@ -372,6 +403,12 @@ router.post('/webhook', async (req: Request, res: Response) => {
               next_billing_date = TO_TIMESTAMP(${nextBillingTimestamp})
           `;
 
+          // Also update user's plan_id for consistency with account info display
+          await sql`
+            UPDATE users SET plan_id = ${planId}, updated_at = NOW()
+            WHERE id = ${userId}
+          `;
+
           // Refill credits based on new plan
           const planResult = await sql`SELECT * FROM subscription_plans WHERE id = ${planId}`;
           if (planResult.length > 0) {
@@ -408,6 +445,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
           const userId = subResult[0].user_id;
           const nextBillingTimestamp = (subscription as any).current_period_end || Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
 
+          // ✅ Update subscription status from Stripe
           await sql`
             UPDATE subscriptions 
             SET 
@@ -415,6 +453,17 @@ router.post('/webhook', async (req: Request, res: Response) => {
               next_billing_date = TO_TIMESTAMP(${nextBillingTimestamp})
             WHERE stripe_subscription_id = ${subscription.id}
           `;
+
+          // ✅ CRITICAL: Revoke credits if subscription becomes unpayable
+          const badStatuses = ['incomplete', 'incomplete_expired', 'past_due', 'unpaid', 'canceled'];
+          if (badStatuses.includes(subscription.status)) {
+            await sql`
+              UPDATE credit_balances
+              SET amount = 0, updated_at = NOW()
+              WHERE user_id = ${userId}
+            `;
+            console.warn(`⚠️ Credits revoked for user ${userId} - subscription status: ${subscription.status}`);
+          }
 
           console.log(`✅ Subscription updated for user ${userId}, status: ${subscription.status}`);
         }
@@ -468,6 +517,10 @@ router.post('/webhook', async (req: Request, res: Response) => {
             if (planResult.length > 0) {
               const plan = planResult[0];
 
+              // ⚠️ BUSINESS LOGIC: Use-it-or-lose-it credit model
+              // Credits are REPLACED (not added) each billing cycle
+              // This prevents credit hoarding and encourages consistent usage
+              // Alternative: Change EXCLUDED.amount to (credit_balances.amount + EXCLUDED.amount) to accumulate
               await sql`
                 INSERT INTO credit_balances (user_id, credit_type, amount)
                 VALUES 
@@ -496,8 +549,23 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
           if (subResult.length > 0) {
             const userId = subResult[0].user_id;
-            console.warn(`⚠️ Payment failed for user ${userId}, subscription may be at risk`);
-            // You could send an email notification here
+            
+            // ✅ CRITICAL: Suspend subscription in database
+            await sql`
+              UPDATE subscriptions
+              SET status = 'past_due', updated_at = NOW()
+              WHERE user_id = ${userId}
+            `;
+            
+            // ✅ CRITICAL: Revoke credits immediately on payment failure
+            await sql`
+              UPDATE credit_balances
+              SET amount = 0, updated_at = NOW()
+              WHERE user_id = ${userId}
+            `;
+            
+            console.warn(`⚠️ Payment failed for user ${userId} - subscription suspended, credits revoked`);
+            // TODO: Send email notification to user
           }
         }
         break;
@@ -535,9 +603,36 @@ router.post('/webhook', async (req: Request, res: Response) => {
         console.log(`ℹ️ Unhandled event type: ${event.type}`);
     }
 
+    // ✅ Mark event as successfully processed
+    try {
+      await sql`
+        UPDATE stripe_webhook_events 
+        SET processed = true, processed_at = NOW()
+        WHERE event_id = ${event.id}
+      `;
+    } catch (updateError) {
+      console.error('Failed to update webhook log:', updateError);
+      // Don't fail the webhook if logging fails
+    }
+
     res.json({ received: true });
   } catch (error) {
     console.error('Webhook processing error:', error);
+    
+    // ✅ Log the error in webhook events table
+    try {
+      await sql`
+        UPDATE stripe_webhook_events 
+        SET 
+          processed = false, 
+          error_message = ${error instanceof Error ? error.message : 'Unknown error'},
+          processed_at = NOW()
+        WHERE event_id = ${event.id}
+      `;
+    } catch (logError) {
+      console.error('Failed to log webhook error:', logError);
+    }
+
     res.status(500).json({
       success: false,
       error: 'Webhook processing failed'
@@ -703,10 +798,50 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
     } catch (stripeError: any) {
       console.error('Stripe subscription error:', stripeError);
       
-      if (stripeError.type === 'StripeCardError' || stripeError.code === 'resource_missing') {
+      // ✅ Handle specific card errors with detailed messages
+      if (stripeError.type === 'StripeCardError') {
+        const cardErrorCode = stripeError.code;
+        let userMessage = 'Payment failed. Please update your payment method in Settings.';
+        let errorCategory = 'card_error';
+        
+        switch (cardErrorCode) {
+          case 'card_declined':
+            userMessage = 'Your card was declined. This usually happens due to insufficient funds or bank restrictions. Please try a different card or contact your bank.';
+            errorCategory = 'card_declined';
+            break;
+          case 'expired_card':
+            userMessage = 'Your card has expired. Please add a new card in Settings to continue.';
+            errorCategory = 'expired_card';
+            break;
+          case 'incorrect_cvc':
+            userMessage = 'The CVC code is incorrect. Please verify your card details and try again.';
+            errorCategory = 'incorrect_cvc';
+            break;
+          case 'processing_error':
+            userMessage = 'An error occurred while processing your card. Please try again or use a different card.';
+            errorCategory = 'processing_error';
+            break;
+          case 'insufficient_funds':
+            userMessage = 'Your card has insufficient funds. Please use a different payment method.';
+            errorCategory = 'insufficient_funds';
+            break;
+          default:
+            userMessage = stripeError.message || 'Payment failed. Please check your card details and try again.';
+        }
+        
         return res.status(402).json({
           success: false,
-          error: 'Payment failed. Please update your payment method in Settings.',
+          error: userMessage,
+          error_category: errorCategory,
+          requires_payment_method: true,
+          stripe_error_code: cardErrorCode
+        });
+      }
+      
+      if (stripeError.code === 'resource_missing') {
+        return res.status(402).json({
+          success: false,
+          error: 'Payment method not found. Please add a payment method in Settings.',
           requires_payment_method: true,
           stripe_error: stripeError.message
         });
