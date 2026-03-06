@@ -273,12 +273,14 @@ router.get('/admin/all', async (req, res) => {
     
     res.json({
       success: true,
-      data: result.tickets,
-      total: result.total,
-      pagination: {
-        limit: limit ? parseInt(limit as string) : 50,
-        offset: offset ? parseInt(offset as string) : 0,
-        total: result.total
+      data: {
+        data: result.tickets,
+        total: result.total,
+        pagination: {
+          limit: limit ? parseInt(limit as string) : 50,
+          offset: offset ? parseInt(offset as string) : 0,
+          total: result.total
+        }
       }
     });
   } catch (error) {
