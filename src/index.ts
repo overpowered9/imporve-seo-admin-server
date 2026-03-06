@@ -15,7 +15,7 @@ const app = express();
 // CORS configuration - Allow all origins for API access
 const corsOptions = {
   origin: true, // Allow all origins
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization', 'x-api-key', 'x-site-code'],
   credentials: true
 };
