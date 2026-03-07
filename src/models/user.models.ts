@@ -155,6 +155,26 @@ export const getUserWithPlan = async (user_id: number) => {
   return result[0] || null;
 };
 
+// Update user name
+export const updateUserName = async (user_id: number, name: string): Promise<User | null> => {
+  const result = await sql`
+    UPDATE users SET name = ${name}, updated_at = NOW()
+    WHERE id = ${user_id}
+    RETURNING id, email, name, api_key, plan_id, created_at, updated_at
+  `;
+  return (result[0] as User) || null;
+};
+
+// Regenerate API key
+export const regenerateApiKey = async (user_id: number): Promise<string> => {
+  const newKey = generateApiKey();
+  await sql`
+    UPDATE users SET api_key = ${newKey}, updated_at = NOW()
+    WHERE id = ${user_id}
+  `;
+  return newKey;
+};
+
 // User operations
 export const findUserByApiKey = async (api_key: string): Promise<User | null> => {
   const result = await sql`

@@ -12,7 +12,9 @@ import {
   getUserWebsiteStats,
   addUserWebsite,
   deleteUserWebsite,
-  getUserSubscription
+  getUserSubscription,
+  updateUserName,
+  regenerateApiKey
 } from '../models/user.models.js';
 
 const router = express.Router();
@@ -320,6 +322,60 @@ router.get('/website-stats/:user_id', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to get website stats'
+    });
+  }
+});
+
+// Update user profile (name)
+router.patch('/profile/:user_id', async (req, res) => {
+  try {
+    const user_id = parseInt(req.params.user_id);
+    const { name } = z.object({
+      name: z.string().min(2).max(100)
+    }).parse(req.body);
+
+    const updated = await updateUserName(user_id, name);
+    if (!updated) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Profile updated successfully',
+      user: {
+        id: updated.id,
+        email: updated.email,
+        name: updated.name
+      }
+    });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to update profile'
+    });
+  }
+});
+
+// Regenerate API key
+router.post('/regenerate-api-key/:user_id', async (req, res) => {
+  try {
+    const user_id = parseInt(req.params.user_id);
+    const newKey = await regenerateApiKey(user_id);
+
+    res.json({
+      success: true,
+      message: 'API key regenerated successfully',
+      api_key: newKey
+    });
+  } catch (error) {
+    console.error('Regenerate API key error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to regenerate API key'
     });
   }
 });
