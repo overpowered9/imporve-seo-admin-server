@@ -10,6 +10,7 @@ import websitesRoutes from './websites.routes.js';
 import usersRoutes from './users.routes.js';
 import stripeRoutes from './stripe.routes.js';
 import ticketsRoutes from './tickets.routes.js';
+import adminUsersRoutes from './admin-users.routes.js';
 
 export const router = Router();
 
@@ -138,3 +139,4 @@ router.use('/websites', websitesRoutes);
 router.use('/users', usersRoutes);
 router.use('/stripe', stripeRoutes);
 router.use('/tickets', ticketsRoutes);
+router.use('/admin/users', adminUsersRoutes);
