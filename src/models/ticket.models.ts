@@ -4,11 +4,14 @@ import sql from '../data/db.js';
 export interface SupportTicket {
   id: number;
   user_id: number;
+  ticket_display_id: string;
   subject: string;
   description: string;
   category: 'general' | 'billing' | 'technical' | 'feature_request';
   priority: 'low' | 'medium' | 'high' | 'urgent';
   status: 'open' | 'in_progress' | 'waiting_on_user' | 'resolved' | 'closed';
+  tags: string[];
+  system_info?: Record<string, string>;
   assigned_admin_id?: string;
   created_at: Date;
   updated_at: Date;
@@ -23,6 +26,20 @@ export interface TicketMessage {
   sender_id: string;
   message: string;
   attachments?: string[];
+  is_internal_note: boolean;
+  created_at: Date;
+}
+
+export interface TicketAttachment {
+  id: number;
+  ticket_id: number;
+  message_id?: number;
+  original_name: string;
+  stored_name: string;
+  mime_type: string;
+  size_bytes: number;
+  uploaded_by_type: 'user' | 'admin';
+  uploaded_by_id: string;
   created_at: Date;
 }
 
@@ -52,15 +69,19 @@ export const createTicket = async (data: {
   description: string;
   category?: string;
   priority?: string;
+  tags?: string[];
+  system_info?: Record<string, string>;
 }): Promise<SupportTicket> => {
   const result = await sql`
-    INSERT INTO support_tickets (user_id, subject, description, category, priority)
+    INSERT INTO support_tickets (user_id, subject, description, category, priority, tags, system_info)
     VALUES (
       ${data.user_id}, 
       ${data.subject}, 
       ${data.description}, 
       ${data.category || 'general'},
-      ${data.priority || 'medium'}
+      ${data.priority || 'medium'},
+      ${data.tags || []},
+      ${data.system_info ? JSON.stringify(data.system_info) : null}
     )
     RETURNING *
   `;
@@ -102,9 +123,10 @@ export const getUserTickets = async (
 /**
  * Get a single ticket by ID
  */
-export const getTicketById = async (ticket_id: number): Promise<{
+export const getTicketById = async (ticket_id: number, includeInternalNotes: boolean = false): Promise<{
   ticket: TicketWithUser;
   messages: TicketMessage[];
+  attachments: TicketAttachment[];
 } | null> => {
   const ticketResult = await sql`
     SELECT t.*, u.email as user_email, u.name as user_name
@@ -115,15 +137,28 @@ export const getTicketById = async (ticket_id: number): Promise<{
   
   if (!ticketResult[0]) return null;
   
-  const messages = await sql`
-    SELECT * FROM ticket_messages 
+  const messages = includeInternalNotes 
+    ? await sql`
+        SELECT * FROM ticket_messages 
+        WHERE ticket_id = ${ticket_id}
+        ORDER BY created_at ASC
+      `
+    : await sql`
+        SELECT * FROM ticket_messages 
+        WHERE ticket_id = ${ticket_id} AND is_internal_note = false
+        ORDER BY created_at ASC
+      `;
+
+  const attachments = await sql`
+    SELECT * FROM ticket_attachments
     WHERE ticket_id = ${ticket_id}
     ORDER BY created_at ASC
   `;
   
   return {
     ticket: ticketResult[0] as TicketWithUser,
-    messages: messages as unknown as TicketMessage[]
+    messages: messages as unknown as TicketMessage[],
+    attachments: attachments as unknown as TicketAttachment[]
   };
 };
 
@@ -150,15 +185,17 @@ export const addTicketMessage = async (data: {
   sender_id: string;
   message: string;
   attachments?: string[];
+  is_internal_note?: boolean;
 }): Promise<TicketMessage> => {
   const result = await sql`
-    INSERT INTO ticket_messages (ticket_id, sender_type, sender_id, message, attachments)
+    INSERT INTO ticket_messages (ticket_id, sender_type, sender_id, message, attachments, is_internal_note)
     VALUES (
       ${data.ticket_id},
       ${data.sender_type},
       ${data.sender_id},
       ${data.message},
-      ${JSON.stringify(data.attachments || [])}
+      ${JSON.stringify(data.attachments || [])},
+      ${data.is_internal_note || false}
     )
     RETURNING *
   `;
@@ -212,11 +249,12 @@ export const getAllTickets = async (options: {
   status?: string;
   priority?: string;
   category?: string;
+  tag?: string;
   search?: string;
   limit?: number;
   offset?: number;
 } = {}): Promise<{ tickets: TicketWithUser[]; total: number }> => {
-  const { status, priority, category, search, limit = 50, offset = 0 } = options;
+  const { status, priority, category, tag, search, limit = 50, offset = 0 } = options;
   
   // Build dynamic query conditions
   let conditions = sql`1=1`;
@@ -230,8 +268,11 @@ export const getAllTickets = async (options: {
   if (category) {
     conditions = sql`${conditions} AND t.category = ${category}`;
   }
+  if (tag) {
+    conditions = sql`${conditions} AND ${tag} = ANY(t.tags)`;
+  }
   if (search) {
-    conditions = sql`${conditions} AND (t.subject ILIKE ${'%' + search + '%'} OR t.description ILIKE ${'%' + search + '%'} OR u.email ILIKE ${'%' + search + '%'})`;
+    conditions = sql`${conditions} AND (t.subject ILIKE ${'%' + search + '%'} OR t.description ILIKE ${'%' + search + '%'} OR u.email ILIKE ${'%' + search + '%'} OR t.ticket_display_id ILIKE ${'%' + search + '%'})`;
   }
   
   const ticketsResult = await sql`
@@ -352,4 +393,54 @@ export const getRecentTickets = async (limit: number = 10): Promise<TicketWithUs
     LIMIT ${limit}
   `;
   return result as unknown as TicketWithUser[];
+};
+
+// ==================== TAG OPERATIONS ====================
+
+export const updateTicketTags = async (ticket_id: number, tags: string[]): Promise<SupportTicket> => {
+  const result = await sql`
+    UPDATE support_tickets
+    SET tags = ${tags}, updated_at = NOW()
+    WHERE id = ${ticket_id}
+    RETURNING *
+  `;
+  return result[0] as SupportTicket;
+};
+
+// ==================== ATTACHMENT OPERATIONS ====================
+
+export const createAttachment = async (data: {
+  ticket_id: number;
+  message_id?: number;
+  original_name: string;
+  stored_name: string;
+  mime_type: string;
+  size_bytes: number;
+  uploaded_by_type: 'user' | 'admin';
+  uploaded_by_id: string;
+}): Promise<TicketAttachment> => {
+  const result = await sql`
+    INSERT INTO ticket_attachments (ticket_id, message_id, original_name, stored_name, mime_type, size_bytes, uploaded_by_type, uploaded_by_id)
+    VALUES (
+      ${data.ticket_id},
+      ${data.message_id || null},
+      ${data.original_name},
+      ${data.stored_name},
+      ${data.mime_type},
+      ${data.size_bytes},
+      ${data.uploaded_by_type},
+      ${data.uploaded_by_id}
+    )
+    RETURNING *
+  `;
+  return result[0] as TicketAttachment;
+};
+
+export const getTicketAttachments = async (ticket_id: number): Promise<TicketAttachment[]> => {
+  const result = await sql`
+    SELECT * FROM ticket_attachments
+    WHERE ticket_id = ${ticket_id}
+    ORDER BY created_at ASC
+  `;
+  return result as unknown as TicketAttachment[];
 };

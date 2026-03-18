@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import path from 'path';
 import { router as v1 } from './routes/v1.js';
 import { errorHandler } from './utils/error-handler.js';
 import { connectToDatabase } from './config/database.js';
@@ -27,8 +28,11 @@ app.use(cors(corsOptions));
 app.use('/api/v1/stripe/webhook', express.raw({ type: 'application/json' }));
 
 // Body parsing middleware - MUST come before routes (but after webhook raw body)
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// Serve uploaded files
+app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
 // Debug middleware to log requests
 app.use((req, res, next) => {
