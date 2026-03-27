@@ -71,7 +71,7 @@ export const createTicket = async (data: {
   priority?: string;
   tags?: string[];
   system_info?: Record<string, string>;
-}): Promise<SupportTicket> => {
+}): Promise<TicketWithUser> => {
   const result = await sql`
     INSERT INTO support_tickets (user_id, subject, description, category, priority, tags, system_info)
     VALUES (
@@ -85,7 +85,26 @@ export const createTicket = async (data: {
     )
     RETURNING *
   `;
-  return result[0] as SupportTicket;
+  
+  // Fetch user info
+  const ticket = result[0] as SupportTicket;
+  const userResult = await sql`
+    SELECT email as user_email, name as user_name FROM users WHERE id = ${ticket.user_id}
+  `;
+  
+  if (!userResult[0]) {
+    return {
+      ...ticket,
+      user_email: '',
+      user_name: ''
+    } as TicketWithUser;
+  }
+  
+  return {
+    ...ticket,
+    user_email: userResult[0].user_email as string,
+    user_name: userResult[0].user_name as string
+  } as TicketWithUser;
 };
 
 /**
@@ -311,7 +330,7 @@ export const updateTicketStatus = async (
   ticket_id: number, 
   status: string,
   admin_id?: string
-): Promise<SupportTicket> => {
+): Promise<TicketWithUser | null> => {
   // Build update fields based on status
   let updateFields: any = { status };
   
@@ -336,7 +355,26 @@ export const updateTicketStatus = async (
     RETURNING *
   `;
   
-  return result[0] as SupportTicket;
+  if (!result[0]) return null;
+  
+  const ticket = result[0] as SupportTicket;
+  const userResult = await sql`
+    SELECT email as user_email, name as user_name FROM users WHERE id = ${ticket.user_id}
+  `;
+  
+  if (!userResult[0]) {
+    return {
+      ...ticket,
+      user_email: '',
+      user_name: ''
+    } as TicketWithUser;
+  }
+  
+  return {
+    ...ticket,
+    user_email: userResult[0].user_email as string,
+    user_name: userResult[0].user_name as string
+  } as TicketWithUser;
 };
 
 /**

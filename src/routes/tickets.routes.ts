@@ -20,6 +20,7 @@ import {
   createAttachment,
   getTicketAttachments
 } from '../models/ticket.models.js';
+import { sendEmail, emailTemplates } from '../services/email.service.js';
 
 const router = express.Router();
 
@@ -124,6 +125,25 @@ router.post('/', async (req, res) => {
       tags: data.tags,
       system_info: data.system_info
     });
+    
+    // Send email notification to user
+    const cmsUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
+    const emailTemplate = emailTemplates.ticketCreated(
+      ticket.id.toString(),
+      ticket.ticket_display_id,
+      ticket.subject,
+      ticket.user_name || 'User',
+      cmsUrl
+    );
+    
+    if (ticket.user_email) {
+      await sendEmail({
+        to: ticket.user_email,
+        subject: emailTemplate.subject,
+        html: emailTemplate.html,
+        text: emailTemplate.text
+      });
+    }
     
     res.status(201).json({
       success: true,
@@ -264,6 +284,25 @@ router.post('/:ticket_id/messages', async (req, res) => {
     
     const message = await addTicketMessage({ ticket_id, ...data, is_internal_note: data.is_internal_note || false });
     
+    // Send email notification only if admin replied (not for internal notes)
+    if (data.sender_type === 'admin' && !data.is_internal_note && ticketData.ticket.user_email) {
+      const cmsUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
+      const emailTemplate = emailTemplates.ticketReplied(
+        ticket_id.toString(),
+        ticketData.ticket.ticket_display_id,
+        data.message,
+        'Support Team',
+        cmsUrl
+      );
+      
+      await sendEmail({
+        to: ticketData.ticket.user_email,
+        subject: emailTemplate.subject,
+        html: emailTemplate.html,
+        text: emailTemplate.text
+      });
+    }
+    
     res.status(201).json({
       success: true,
       data: message,
@@ -388,6 +427,24 @@ router.patch('/:ticket_id/status', async (req, res) => {
       return res.status(404).json({
         success: false,
         error: 'Ticket not found'
+      });
+    }
+    
+    // Send email notification if ticket is closed
+    if (data.status === 'closed' && ticket.user_email) {
+      const cmsUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
+      const emailTemplate = emailTemplates.ticketClosed(
+        ticket_id.toString(),
+        ticket.ticket_display_id,
+        'Your issue has been resolved.',
+        cmsUrl
+      );
+      
+      await sendEmail({
+        to: ticket.user_email,
+        subject: emailTemplate.subject,
+        html: emailTemplate.html,
+        text: emailTemplate.text
       });
     }
     
