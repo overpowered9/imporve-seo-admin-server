@@ -9,7 +9,7 @@ const signupSchema = z.object({
   email: z.string().email(),
   name: z.string().min(2),
   password: z.string().min(8),
-  plan_id: z.number().optional().default(1)
+  plan_id: z.number().optional()
 });
 
 const loginSchema = z.object({
