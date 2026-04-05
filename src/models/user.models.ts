@@ -9,7 +9,10 @@ export interface User {
   plan_id?: number;
   created_at: Date;
   updated_at: Date;
-  password_hash:string;
+  password_hash?: string;
+  oauth_provider?: string;
+  oauth_id?: string;
+  avatar_url?: string;
 }
 
 export interface Website {
@@ -513,6 +516,50 @@ export const deleteWebsite = async (website_id: number): Promise<void> => {
 export const findUserByAuthId = async (auth_user_id: string): Promise<User | null> => {
   const result = await sql`
     SELECT * FROM users WHERE auth_user_id = ${auth_user_id} LIMIT 1
+  `;
+  return (result[0] as User) || null;
+};
+
+// OAuth user functions
+export const findUserByOAuth = async (provider: string, oauth_id: string): Promise<User | null> => {
+  const result = await sql`
+    SELECT * FROM users WHERE oauth_provider = ${provider} AND oauth_id = ${oauth_id} LIMIT 1
+  `;
+  return (result[0] as User) || null;
+};
+
+export const createOAuthUser = async (userData: {
+  email: string;
+  name: string;
+  oauth_provider: string;
+  oauth_id: string;
+  avatar_url?: string;
+  plan_id?: number;
+}): Promise<User> => {
+  const api_key = generateApiKey();
+  const plan_id = userData.plan_id || 1; // Default to FREE plan
+  
+  const result = await sql`
+    INSERT INTO users (email, name, api_key, plan_id, oauth_provider, oauth_id, avatar_url)
+    VALUES (${userData.email}, ${userData.name}, ${api_key}, ${plan_id}, ${userData.oauth_provider}, ${userData.oauth_id}, ${userData.avatar_url || null})
+    RETURNING id, email, name, api_key, plan_id, oauth_provider, oauth_id, avatar_url, created_at, updated_at
+  `;
+  
+  return result[0] as User;
+};
+
+export const updateUserOAuthData = async (user_id: number, data: {
+  avatar_url?: string;
+  name?: string;
+}): Promise<User | null> => {
+  const result = await sql`
+    UPDATE users 
+    SET 
+      avatar_url = COALESCE(${data.avatar_url || null}, avatar_url),
+      name = COALESCE(${data.name || null}, name),
+      updated_at = NOW()
+    WHERE id = ${user_id}
+    RETURNING id, email, name, api_key, plan_id, oauth_provider, oauth_id, avatar_url, created_at, updated_at
   `;
   return (result[0] as User) || null;
 };

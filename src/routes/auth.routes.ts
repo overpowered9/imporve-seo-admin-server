@@ -1,7 +1,7 @@
 import express from 'express';
 import { z } from 'zod';
 import { supabaseAdmin } from '../services/supabase.service.js';
-import { findUserByEmail } from '../models/user.models.js';
+import { findUserByEmail, findUserByOAuth, createOAuthUser, updateUserOAuthData, initializeUserCredits } from '../models/user.models.js';
 
 const router = express.Router();
 
@@ -175,6 +175,122 @@ router.post('/resend-confirmation', async (req, res) => {
     res.status(400).json({
       success: false,
       error: 'Failed to send confirmation email'
+    });
+  }
+});
+
+// OAuth user sync/creation - called when user authenticates with OAuth provider
+// This endpoint is typically called from the frontend after successful OAuth authentication
+router.post('/oauth-callback', async (req, res) => {
+  try {
+    const { provider, user } = z.object({
+      provider: z.string(), // 'google', 'github', etc.
+      user: z.object({
+        id: z.string(), // OAuth provider user ID
+        email: z.string().email(),
+        name: z.string().optional().default(''),
+        image: z.string().optional() // Avatar URL from provider
+      })
+    }).parse(req.body);
+
+    // Check if user already exists with this OAuth provider
+    let existingUser = await findUserByOAuth(provider, user.id);
+    
+    if (existingUser) {
+      // Update profile data if needed
+      await updateUserOAuthData(existingUser.id, {
+        name: user.name,
+        avatar_url: user.image
+      });
+      
+      // Return existing user
+      const updated = await findUserByOAuth(provider, user.id);
+      return res.json({
+        success: true,
+        message: 'User authenticated successfully',
+        data: {
+          user: {
+            id: updated?.id,
+            email: updated?.email,
+            name: updated?.name,
+            api_key: updated?.api_key,
+            plan_id: updated?.plan_id,
+            avatar_url: updated?.avatar_url
+          }
+        }
+      });
+    }
+
+    // Check if email already exists (from previous email/password signup)
+    let emailUser = await findUserByEmail(user.email);
+    
+    if (emailUser) {
+      // Link OAuth account to existing email account
+      await updateUserOAuthData(emailUser.id, {
+        avatar_url: user.image,
+        name: user.name || emailUser.name
+      });
+      
+      // Also update oauth fields directly
+      await supabaseAdmin
+        .from('users')
+        .update({
+          oauth_provider: provider,
+          oauth_id: user.id,
+          avatar_url: user.image,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', emailUser.id);
+      
+      return res.json({
+        success: true,
+        message: 'OAuth account linked to existing user',
+        data: {
+          user: {
+            id: emailUser.id,
+            email: emailUser.email,
+            name: user.name || emailUser.name,
+            api_key: emailUser.api_key,
+            plan_id: emailUser.plan_id,
+            avatar_url: user.image
+          }
+        }
+      });
+    }
+
+    // Create new user from OAuth
+    const newUser = await createOAuthUser({
+      email: user.email,
+      name: user.name,
+      oauth_provider: provider,
+      oauth_id: user.id,
+      avatar_url: user.image,
+      plan_id: 1 // DEFAULT/FREE plan
+    });
+
+    // Initialize user credits
+    await initializeUserCredits(newUser.id, 1);
+
+    res.status(201).json({
+      success: true,
+      message: 'User created successfully via OAuth',
+      data: {
+        user: {
+          id: newUser.id,
+          email: newUser.email,
+          name: newUser.name,
+          api_key: newUser.api_key,
+          plan_id: newUser.plan_id,
+          avatar_url: newUser.avatar_url
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('OAuth callback error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'OAuth callback failed'
     });
   }
 });
