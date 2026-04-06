@@ -12,7 +12,11 @@ export const sendEmail = async (options: EmailOptions): Promise<boolean> => {
   try {
     const mailgunDomain = process.env.MAILGUN_DOMAIN;
     const mailgunApiKey = process.env.MAILGUN_API_KEY;
+    const mailgunFromName = process.env.MAILGUN_FROM_NAME || 'ImproveSEO Support';
     const mailgunFromEmail = process.env.MAILGUN_FROM_EMAIL || 'noreply@improveseo.app';
+    const mailgunFromHeader = mailgunFromEmail.includes('<')
+      ? mailgunFromEmail
+      : `${mailgunFromName} <${mailgunFromEmail}>`;
 
     if (!mailgunDomain || !mailgunApiKey) {
       console.warn('Mailgun configuration missing. Skipping email send.');
@@ -20,7 +24,7 @@ export const sendEmail = async (options: EmailOptions): Promise<boolean> => {
     }
 
     const form = new FormData();
-    form.append('from', mailgunFromEmail);
+    form.append('from', mailgunFromHeader);
     form.append('to', options.to);
     form.append('subject', options.subject);
     form.append('html', options.html);
