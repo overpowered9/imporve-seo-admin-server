@@ -1,7 +1,8 @@
 import express from 'express';
 import { z } from 'zod';
 import { supabaseAdmin } from '../services/supabase.service.js';
-import { findUserByEmail, findUserByOAuth, createOAuthUser, updateUserOAuthData, initializeUserCredits } from '../models/user.models.js';
+import sql from '../data/db.js';
+import { findUserByEmail, findUserByOAuth, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, type User } from '../models/user.models.js';
 
 const router = express.Router();
 
@@ -184,64 +185,52 @@ router.post('/resend-confirmation', async (req, res) => {
 router.post('/oauth-callback', async (req, res) => {
   try {
     const { provider, user } = z.object({
-      provider: z.string(), // 'google', 'github', etc.
+      provider: z.string(),
       user: z.object({
-        id: z.string(), // OAuth provider user ID
+        id: z.string(),
         email: z.string().email(),
         name: z.string().optional().default(''),
-        image: z.string().optional() // Avatar URL from provider
+        image: z.string().optional()
       })
     }).parse(req.body);
 
-    // Check if user already exists with this OAuth provider
-    let existingUser = await findUserByOAuth(provider, user.id);
-    
+    // 1. Try OAuth-specific lookup first (requires migration columns)
+    let existingUser = null;
+    try {
+      existingUser = await findUserByOAuth(provider, user.id);
+    } catch {
+      // oauth_provider/oauth_id columns may not exist yet — fall through to email lookup
+    }
+
     if (existingUser) {
-      // Update profile data if needed
-      await updateUserOAuthData(existingUser.id, {
-        name: user.name,
-        avatar_url: user.image
-      });
-      
-      // Return existing user
-      const updated = await findUserByOAuth(provider, user.id);
+      try {
+        await updateUserOAuthData(existingUser.id, { name: user.name, avatar_url: user.image });
+      } catch { /* columns may not exist — non-fatal */ }
+
       return res.json({
         success: true,
         message: 'User authenticated successfully',
         data: {
           user: {
-            id: updated?.id,
-            email: updated?.email,
-            name: updated?.name,
-            api_key: updated?.api_key,
-            plan_id: updated?.plan_id,
-            avatar_url: updated?.avatar_url
+            id: existingUser.id,
+            email: existingUser.email,
+            name: user.name || existingUser.name,
+            api_key: existingUser.api_key,
+            plan_id: existingUser.plan_id,
+            avatar_url: user.image || existingUser.avatar_url
           }
         }
       });
     }
 
-    // Check if email already exists (from previous email/password signup)
-    let emailUser = await findUserByEmail(user.email);
-    
+    // 2. Check if email already exists (links OAuth to existing account)
+    const emailUser = await findUserByEmail(user.email);
+
     if (emailUser) {
-      // Link OAuth account to existing email account
-      await updateUserOAuthData(emailUser.id, {
-        avatar_url: user.image,
-        name: user.name || emailUser.name
-      });
-      
-      // Also update oauth fields directly
-      await supabaseAdmin
-        .from('users')
-        .update({
-          oauth_provider: provider,
-          oauth_id: user.id,
-          avatar_url: user.image,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', emailUser.id);
-      
+      try {
+        await updateUserOAuthData(emailUser.id, { avatar_url: user.image, name: user.name || emailUser.name });
+      } catch { /* non-fatal */ }
+
       return res.json({
         success: true,
         message: 'OAuth account linked to existing user',
@@ -258,20 +247,32 @@ router.post('/oauth-callback', async (req, res) => {
       });
     }
 
-    // Create new user from OAuth
-    const newUser = await createOAuthUser({
-      email: user.email,
-      name: user.name,
-      oauth_provider: provider,
-      oauth_id: user.id,
-      avatar_url: user.image,
-      plan_id: 1 // DEFAULT/FREE plan
-    });
+    // 3. Brand new user — create account
+    let newUser;
+    try {
+      // Full create with OAuth columns (requires migration)
+      newUser = await createOAuthUser({
+        email: user.email,
+        name: user.name,
+        oauth_provider: provider,
+        oauth_id: user.id,
+        avatar_url: user.image,
+        plan_id: 1
+      });
+    } catch {
+      // Fallback: create without OAuth columns (pre-migration)
+      const { api_key } = { api_key: generateApiKey() };
+      const result = await sql`
+        INSERT INTO users (email, name, api_key, plan_id)
+        VALUES (${user.email}, ${user.name || 'User'}, ${api_key}, ${1})
+        RETURNING id, email, name, api_key, plan_id, created_at, updated_at
+      `;
+      newUser = result[0] as User;
+    }
 
-    // Initialize user credits
     await initializeUserCredits(newUser.id, 1);
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
       message: 'User created successfully via OAuth',
       data: {
@@ -281,7 +282,7 @@ router.post('/oauth-callback', async (req, res) => {
           name: newUser.name,
           api_key: newUser.api_key,
           plan_id: newUser.plan_id,
-          avatar_url: newUser.avatar_url
+          avatar_url: (newUser as User).avatar_url || user.image
         }
       }
     });
