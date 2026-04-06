@@ -528,6 +528,14 @@ export const findUserByOAuth = async (provider: string, oauth_id: string): Promi
   return (result[0] as User) || null;
 };
 
+export const getFreePlanId = async (): Promise<number> => {
+  const result = await sql`
+    SELECT id FROM subscription_plans WHERE slug = 'free' LIMIT 1
+  `;
+  if (!result[0]) throw new Error('FREE plan not configured in database');
+  return result[0].id as number;
+};
+
 export const createOAuthUser = async (userData: {
   email: string;
   name: string;
@@ -537,7 +545,7 @@ export const createOAuthUser = async (userData: {
   plan_id?: number;
 }): Promise<User> => {
   const api_key = generateApiKey();
-  const plan_id = userData.plan_id || 1; // Default to FREE plan
+  const plan_id = userData.plan_id || await getFreePlanId();
   
   const result = await sql`
     INSERT INTO users (email, name, api_key, plan_id, oauth_provider, oauth_id, avatar_url)

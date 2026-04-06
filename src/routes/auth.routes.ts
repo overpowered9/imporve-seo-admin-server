@@ -2,7 +2,7 @@ import express from 'express';
 import { z } from 'zod';
 import { supabaseAdmin } from '../services/supabase.service.js';
 import sql from '../data/db.js';
-import { findUserByEmail, findUserByOAuth, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, type User } from '../models/user.models.js';
+import { findUserByEmail, findUserByOAuth, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, type User } from '../models/user.models.js';
 
 const router = express.Router();
 
@@ -248,6 +248,7 @@ router.post('/oauth-callback', async (req, res) => {
     }
 
     // 3. Brand new user — create account
+    const freePlanId = await getFreePlanId();
     let newUser;
     try {
       // Full create with OAuth columns (requires migration)
@@ -257,20 +258,20 @@ router.post('/oauth-callback', async (req, res) => {
         oauth_provider: provider,
         oauth_id: user.id,
         avatar_url: user.image,
-        plan_id: 1
+        plan_id: freePlanId
       });
     } catch {
       // Fallback: create without OAuth columns (pre-migration)
       const { api_key } = { api_key: generateApiKey() };
       const result = await sql`
         INSERT INTO users (email, name, api_key, plan_id)
-        VALUES (${user.email}, ${user.name || 'User'}, ${api_key}, ${1})
+        VALUES (${user.email}, ${user.name || 'User'}, ${api_key}, ${freePlanId})
         RETURNING id, email, name, api_key, plan_id, created_at, updated_at
       `;
       newUser = result[0] as User;
     }
 
-    await initializeUserCredits(newUser.id, 1);
+    await initializeUserCredits(newUser.id, freePlanId);
 
     return res.status(201).json({
       success: true,
