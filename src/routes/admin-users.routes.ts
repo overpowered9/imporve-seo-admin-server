@@ -447,11 +447,15 @@ router.get('/:userId', async (req, res) => {
   }
 });
 
-// POST /admin/users/:userId/gift-credits - Gift credits to a user
+// POST /admin/users/:userId/gift-credits - Manage credits for a user (add, remove, set)
 const giftCreditsSchema = z.object({
+  operation: z.enum(['add', 'remove', 'set']),
   credit_type: z.enum(['images', 'content', 'keywords']),
-  amount: z.number().int().min(1).max(10000),
+  amount: z.number().int().min(0).max(10000),
   reason: z.string().min(1).max(500)
+}).refine(data => data.operation === 'set' || data.amount >= 1, {
+  message: 'Amount must be at least 1 for add/remove operations',
+  path: ['amount']
 });
 
 router.post('/:userId/gift-credits', async (req, res) => {
@@ -461,7 +465,7 @@ router.post('/:userId/gift-credits', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid user ID' });
     }
 
-    const { credit_type, amount, reason } = giftCreditsSchema.parse(req.body);
+    const { operation, credit_type, amount, reason } = giftCreditsSchema.parse(req.body);
 
     // Verify user exists
     const user = await sql`SELECT id, email, name FROM users WHERE id = ${userId} LIMIT 1`;
@@ -469,7 +473,7 @@ router.post('/:userId/gift-credits', async (req, res) => {
       return res.status(404).json({ success: false, error: 'User not found' });
     }
 
-    // Add credits in a transaction
+    // Update/create credits in a transaction
     await sql.begin(async (tx) => {
       // Check if credit balance row exists
       const existing = await tx`
@@ -477,22 +481,41 @@ router.post('/:userId/gift-credits', async (req, res) => {
       `;
 
       if (existing.length > 0) {
-        await tx`
-          UPDATE credit_balances
-          SET amount = amount + ${amount}, updated_at = NOW()
-          WHERE user_id = ${userId} AND credit_type = ${credit_type}
-        `;
+        if (operation === 'add') {
+          await tx`
+            UPDATE credit_balances
+            SET amount = amount + ${amount}, updated_at = NOW()
+            WHERE user_id = ${userId} AND credit_type = ${credit_type}
+          `;
+        } else if (operation === 'remove') {
+          await tx`
+            UPDATE credit_balances
+            SET amount = GREATEST(0, amount - ${amount}), updated_at = NOW()
+            WHERE user_id = ${userId} AND credit_type = ${credit_type}
+          `;
+        } else {
+          await tx`
+            UPDATE credit_balances
+            SET amount = ${amount}, updated_at = NOW()
+            WHERE user_id = ${userId} AND credit_type = ${credit_type}
+          `;
+        }
       } else {
+        const insertAmount = operation === 'remove' ? 0 : amount;
         await tx`
           INSERT INTO credit_balances (user_id, credit_type, amount)
-          VALUES (${userId}, ${credit_type}, ${amount})
+          VALUES (${userId}, ${credit_type}, ${insertAmount})
         `;
       }
 
-      // Log transaction
+      // Log transaction (delta: positive for add/set, negative for remove)
+      const delta = operation === 'remove' ? -amount : amount;
+      const logReason = operation === 'add' ? `Admin add: ${reason}` :
+                        operation === 'remove' ? `Admin remove: ${reason}` :
+                        `Admin correction: ${reason}`;
       await tx`
         INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
-        VALUES (${userId}, ${credit_type}, ${amount}, ${'Admin gift: ' + reason})
+        VALUES (${userId}, ${credit_type}, ${delta}, ${logReason})
       `;
     });
 
@@ -501,9 +524,10 @@ router.post('/:userId/gift-credits', async (req, res) => {
       SELECT credit_type, amount FROM credit_balances WHERE user_id = ${userId}
     `;
 
+    const opLabel = operation === 'add' ? `Added ${amount}` : operation === 'remove' ? `Removed ${amount}` : `Set to ${amount}`;
     res.json({
       success: true,
-      message: `Gifted ${amount} ${credit_type} credits to ${user[0].email}`,
+      message: `${opLabel} ${credit_type} credits for ${user[0].email}`,
       data: { credits: updatedCredits }
     });
   } catch (error) {
