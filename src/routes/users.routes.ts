@@ -97,6 +97,8 @@ router.post('/by-email', async (req, res) => {
         website_limit: userWithPlan?.website_limit,
         scheduled_publishing: userWithPlan?.scheduled_publishing,
         course_access: userWithPlan?.course_access,
+        oauth_provider: user.oauth_provider || null,
+        has_password: !!user.password_hash,
         credits,
         websites_count: websites.length,
         created_at: user.created_at

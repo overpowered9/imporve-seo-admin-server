@@ -2,7 +2,7 @@ import express from 'express';
 import { z } from 'zod';
 import { supabaseAdmin } from '../services/supabase.service.js';
 import sql from '../data/db.js';
-import { findUserByEmail, findUserByOAuth, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, type User } from '../models/user.models.js';
+import { findUserByEmail, findUserByOAuth, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, setPasswordHash, type User } from '../models/user.models.js';
 
 const router = express.Router();
 
@@ -146,6 +146,68 @@ router.post('/forgot-password', async (req, res) => {
     res.status(400).json({
       success: false,
       error: 'Failed to send reset email'
+    });
+  }
+});
+
+// Verify whether a user can reset their password
+router.post('/verify-reset-eligibility', async (req, res) => {
+  try {
+    const { email } = z.object({ email: z.string().email() }).parse(req.body);
+
+    const user = await findUserByEmail(email);
+
+    if (!user) {
+      return res.json({
+        success: true,
+        eligible: false,
+        reason: 'no_account',
+        message: 'No account found with this email address.',
+      });
+    }
+
+    if (user.oauth_provider && !user.password_hash) {
+      return res.json({
+        success: true,
+        eligible: false,
+        reason: 'oauth_only',
+        provider: user.oauth_provider,
+        message: `This account uses ${user.oauth_provider.charAt(0).toUpperCase() + user.oauth_provider.slice(1)} sign-in. Please sign in with ${user.oauth_provider.charAt(0).toUpperCase() + user.oauth_provider.slice(1)} and set a password in your account settings.`,
+      });
+    }
+
+    return res.json({
+      success: true,
+      eligible: true,
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: 'Unable to verify account.',
+    });
+  }
+});
+
+// Mark that an OAuth user has set a password (called from Settings after supabase.auth.updateUser)
+router.post('/set-password', async (req, res) => {
+  try {
+    const { email, password } = z.object({
+      email: z.string().email(),
+      password: z.string().min(8),
+    }).parse(req.body);
+
+    const user = await findUserByEmail(email);
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found.' });
+    }
+
+    await setPasswordHash(user.id, password);
+
+    return res.json({ success: true, message: 'Password set successfully.' });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to set password.',
     });
   }
 });

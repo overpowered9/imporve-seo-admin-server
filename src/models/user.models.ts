@@ -90,6 +90,11 @@ export const validatePassword = async (password: string, hash: string): Promise<
   return await bcrypt.compare(password, hash);
 };
 
+export const setPasswordHash = async (userId: number, password: string): Promise<void> => {
+  const hash = await bcrypt.hash(password, 10);
+  await sql`UPDATE users SET password_hash = ${hash}, updated_at = NOW() WHERE id = ${userId}`;
+};
+
 export const initializeUserCredits = async (user_id: number, plan_id?: number): Promise<void> => {
   // If no plan_id provided, use FREE plan
   let resolvedPlanId: number;
