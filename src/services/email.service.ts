@@ -353,5 +353,233 @@ Thank you for choosing ImproveSEO!
 © 2026 ImproveSEO
       `
     };
+  },
+
+  bulkTaskCreated: (userName: string, taskName: string, totalKeywords: number, websiteDomain: string, cmsUrl: string) => {
+    return {
+      subject: `Bulk Project Created - ${taskName}`,
+      html: `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2c3e50; margin: 0; padding: 0; background: #f5f7fa; }
+            .wrapper { background: #f5f7fa; padding: 20px; }
+            .container { max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+            .header { background: linear-gradient(135deg, #1c7293 0%, #2ec5b6 100%); padding: 50px 30px; text-align: center; position: relative; overflow: hidden; }
+            .header::before { content: ''; position: absolute; top: -50%; right: -10%; width: 300px; height: 300px; background: rgba(255, 122, 89, 0.1); border-radius: 50%; }
+            .header::after { content: ''; position: absolute; top: 50%; left: -5%; width: 200px; height: 200px; background: rgba(255, 255, 255, 0.05); border-radius: 50%; }
+            .header-content { position: relative; z-index: 1; }
+            .logo { max-width: 100px; height: auto; margin-bottom: 15px; }
+            .header h1 { margin: 10px 0 0 0; color: white; font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
+            .header-subtext { color: rgba(255,255,255,0.9); font-size: 14px; margin-top: 8px; }
+            .content { padding: 45px 30px; }
+            .content p { margin: 12px 0; color: #555; font-size: 15px; line-height: 1.7; }
+            .content p:first-child { font-size: 16px; font-weight: 500; color: #1c7293; }
+            .task-info { background: linear-gradient(135deg, rgba(44, 185, 255, 0.05) 0%, rgba(46, 197, 182, 0.05) 100%); padding: 25px; border-radius: 8px; margin: 30px 0; border-left: 5px solid #ff7a59; }
+            .task-info p { margin: 10px 0; font-size: 14px; }
+            .task-info strong { color: #1c7293; font-weight: 600; }
+            .task-name { color: #ff7a59; font-weight: 700; font-size: 18px; }
+            .cta-button { display: inline-block; background: #ff7a59; color: white; padding: 16px 40px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; margin: 25px 0; box-shadow: 0 4px 12px rgba(255, 122, 89, 0.3); }
+            .cta-container { text-align: center; margin: 35px 0; }
+            .footer { background: linear-gradient(135deg, #f8f9fa 0%, #f0f2f5 100%); padding: 30px; text-align: center; border-top: 1px solid #eee; }
+            .footer p { margin: 5px 0; font-size: 12px; color: #888; }
+            .footer-brand { font-weight: 600; color: #1c7293; }
+          </style>
+        </head>
+        <body>
+          <div class="wrapper">
+            <div class="container">
+              <div class="header">
+                <div class="header-content">
+                  <img src="https://improveseoplugin.com/wp-content/uploads/2025/10/logo.svg" alt="ImproveSEO Logo" class="logo">
+                  <h1>Bulk Project Created 🚀</h1>
+                  <p class="header-subtext">Your content is queued for generation</p>
+                </div>
+              </div>
+
+              <div class="content">
+                <p>Hi ${userName},</p>
+
+                <p>Your bulk content project has been successfully created and is now queued for processing on <strong>${websiteDomain}</strong>.</p>
+
+                <div class="task-info">
+                  <p><strong>Project Name:</strong> <span class="task-name">${taskName}</span></p>
+                  <p><strong>Total Keywords:</strong> ${totalKeywords}</p>
+                  <p><strong>Website:</strong> ${websiteDomain}</p>
+                  <p style="font-size: 13px; color: #888; margin-top: 12px; font-style: italic;">💡 Posts will be generated automatically by the cron scheduler</p>
+                </div>
+
+                <p>You'll receive another email when all posts have been generated.</p>
+
+                <div class="cta-container">
+                  <a href="${cmsUrl}" class="cta-button">Go to Dashboard</a>
+                </div>
+              </div>
+
+              <div class="footer">
+                <p><span class="footer-brand">ImproveSEO</span></p>
+                <p>© 2026 ImproveSEO. All rights reserved.</p>
+                <p style="margin-top: 10px; color: #999; font-size: 11px;">This is an automated notification from your ImproveSEO plugin.</p>
+              </div>
+            </div>
+          </div>
+        </body>
+        </html>
+      `,
+      text: `Bulk Project Created
+
+Hi ${userName},
+
+Your bulk content project has been created and queued for processing.
+
+Project Name: ${taskName}
+Total Keywords: ${totalKeywords}
+Website: ${websiteDomain}
+
+Posts will be generated automatically by the cron scheduler. You'll receive another email when all posts have been generated.
+
+Dashboard: ${cmsUrl}
+
+© 2026 ImproveSEO
+      `
+    };
+  },
+
+  bulkTaskCompleted: (userName: string, taskName: string, totalGenerated: number, totalFailed: number, websiteDomain: string, cmsUrl: string) => {
+    const totalTasks = totalGenerated + totalFailed;
+    const allFailed = totalGenerated === 0 && totalFailed > 0;
+    const statusEmoji = allFailed ? '⚠️' : '✅';
+    const statusText = allFailed ? 'Bulk Project Finished (with issues)' : 'Bulk Project Complete';
+
+    return {
+      subject: `${statusText} - ${taskName}`,
+      html: `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2c3e50; margin: 0; padding: 0; background: #f5f7fa; }
+            .wrapper { background: #f5f7fa; padding: 20px; }
+            .container { max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+            .header { background: linear-gradient(135deg, #1c7293 0%, #2ec5b6 100%); padding: 50px 30px; text-align: center; position: relative; overflow: hidden; }
+            .header::before { content: ''; position: absolute; top: -50%; right: -10%; width: 300px; height: 300px; background: rgba(255, 122, 89, 0.1); border-radius: 50%; }
+            .header::after { content: ''; position: absolute; top: 50%; left: -5%; width: 200px; height: 200px; background: rgba(255, 255, 255, 0.05); border-radius: 50%; }
+            .header-content { position: relative; z-index: 1; }
+            .logo { max-width: 100px; height: auto; margin-bottom: 15px; }
+            .header h1 { margin: 10px 0 0 0; color: white; font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
+            .header-subtext { color: rgba(255,255,255,0.9); font-size: 14px; margin-top: 8px; }
+            .content { padding: 45px 30px; }
+            .content p { margin: 12px 0; color: #555; font-size: 15px; line-height: 1.7; }
+            .content p:first-child { font-size: 16px; font-weight: 500; color: #1c7293; }
+            .stats-grid { display: flex; gap: 15px; margin: 30px 0; }
+            .stat-card { flex: 1; background: #f8f9fa; border-radius: 8px; padding: 20px; text-align: center; }
+            .stat-number { font-size: 28px; font-weight: 700; color: #1c7293; display: block; }
+            .stat-label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 5px; display: block; }
+            .stat-card.success .stat-number { color: #2ec5b6; }
+            .stat-card.failed .stat-number { color: #e74c3c; }
+            .task-info { background: linear-gradient(135deg, rgba(44, 185, 255, 0.05) 0%, rgba(46, 197, 182, 0.05) 100%); padding: 25px; border-radius: 8px; margin: 30px 0; border-left: 5px solid #2ec5b6; }
+            .task-info p { margin: 10px 0; font-size: 14px; }
+            .task-info strong { color: #1c7293; font-weight: 600; }
+            .task-name { color: #ff7a59; font-weight: 700; font-size: 18px; }
+            .cta-button { display: inline-block; background: #ff7a59; color: white; padding: 16px 40px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; margin: 25px 0; box-shadow: 0 4px 12px rgba(255, 122, 89, 0.3); }
+            .cta-container { text-align: center; margin: 35px 0; }
+            .footer { background: linear-gradient(135deg, #f8f9fa 0%, #f0f2f5 100%); padding: 30px; text-align: center; border-top: 1px solid #eee; }
+            .footer p { margin: 5px 0; font-size: 12px; color: #888; }
+            .footer-brand { font-weight: 600; color: #1c7293; }
+          </style>
+        </head>
+        <body>
+          <div class="wrapper">
+            <div class="container">
+              <div class="header">
+                <div class="header-content">
+                  <img src="https://improveseoplugin.com/wp-content/uploads/2025/10/logo.svg" alt="ImproveSEO Logo" class="logo">
+                  <h1>${statusText} ${statusEmoji}</h1>
+                  <p class="header-subtext">All tasks have been processed</p>
+                </div>
+              </div>
+
+              <div class="content">
+                <p>Hi ${userName},</p>
+
+                <p>Your bulk content project on <strong>${websiteDomain}</strong> has finished processing.</p>
+
+                <div class="task-info">
+                  <p><strong>Project Name:</strong> <span class="task-name">${taskName}</span></p>
+                  <p><strong>Website:</strong> ${websiteDomain}</p>
+                </div>
+
+                <!--[if mso]>
+                <table role="presentation" width="100%"><tr>
+                <td width="33%" align="center" style="background:#f8f9fa;border-radius:8px;padding:20px;">
+                  <span style="font-size:28px;font-weight:700;color:#1c7293;">${totalTasks}</span><br>
+                  <span style="font-size:12px;color:#888;">TOTAL</span>
+                </td>
+                <td width="33%" align="center" style="background:#f8f9fa;border-radius:8px;padding:20px;">
+                  <span style="font-size:28px;font-weight:700;color:#2ec5b6;">${totalGenerated}</span><br>
+                  <span style="font-size:12px;color:#888;">GENERATED</span>
+                </td>
+                <td width="33%" align="center" style="background:#f8f9fa;border-radius:8px;padding:20px;">
+                  <span style="font-size:28px;font-weight:700;color:#e74c3c;">${totalFailed}</span><br>
+                  <span style="font-size:12px;color:#888;">FAILED</span>
+                </td>
+                </tr></table>
+                <![endif]-->
+                <!--[if !mso]><!-->
+                <div class="stats-grid">
+                  <div class="stat-card">
+                    <span class="stat-number">${totalTasks}</span>
+                    <span class="stat-label">Total</span>
+                  </div>
+                  <div class="stat-card success">
+                    <span class="stat-number">${totalGenerated}</span>
+                    <span class="stat-label">Generated</span>
+                  </div>
+                  <div class="stat-card failed">
+                    <span class="stat-number">${totalFailed}</span>
+                    <span class="stat-label">Failed</span>
+                  </div>
+                </div>
+                <!--<![endif]-->
+
+                <div class="cta-container">
+                  <a href="${cmsUrl}" class="cta-button">View Your Projects</a>
+                </div>
+              </div>
+
+              <div class="footer">
+                <p><span class="footer-brand">ImproveSEO</span></p>
+                <p>© 2026 ImproveSEO. All rights reserved.</p>
+                <p style="margin-top: 10px; color: #999; font-size: 11px;">This is an automated notification from your ImproveSEO plugin.</p>
+              </div>
+            </div>
+          </div>
+        </body>
+        </html>
+      `,
+      text: `${statusText}
+
+Hi ${userName},
+
+Your bulk content project has finished processing.
+
+Project Name: ${taskName}
+Website: ${websiteDomain}
+
+Results:
+- Total Tasks: ${totalTasks}
+- Generated: ${totalGenerated}
+- Failed: ${totalFailed}
+
+Dashboard: ${cmsUrl}
+
+© 2026 ImproveSEO
+      `
+    };
   }
 };
