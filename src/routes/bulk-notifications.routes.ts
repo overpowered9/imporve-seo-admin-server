@@ -4,7 +4,32 @@ import { sendEmail, emailTemplates } from '../services/email.service.js';
 
 const router = Router();
 
-const CMS_URL = process.env.CMS_URL || 'https://app.improveseo.ai';
+/**
+ * Normalize a website domain into a proper base URL.
+ * Handles: missing protocol, trailing slashes, whitespace.
+ * e.g. "example.com/" → "https://example.com"
+ *      "http://example.com" → "http://example.com"
+ */
+function normalizeBaseUrl(domain: string): string {
+  let url = domain.trim();
+  if (!url) return '';
+  // Add protocol if missing
+  if (!/^https?:\/\//i.test(url)) {
+    url = 'https://' + url;
+  }
+  // Strip trailing slash(es)
+  url = url.replace(/\/+$/, '');
+  return url;
+}
+
+/**
+ * Build the WP-admin project URL for a bulk task.
+ */
+function buildProjectUrl(domain: string, projectId: string | number): string {
+  const base = normalizeBaseUrl(domain);
+  if (!base || !projectId) return base;
+  return `${base}/wp-admin/admin.php?page=improveseo_bulkprojects&action=viewAllTasks&id=${projectId}`;
+}
 
 /**
  * POST /api/v1/bulk-notifications/status
@@ -13,7 +38,7 @@ const CMS_URL = process.env.CMS_URL || 'https://app.improveseo.ai';
  */
 router.post('/status', validateApiAccess, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { event, task_name, total_tasks, completed_tasks, failed_tasks } = req.body;
+    const { event, task_name, total_tasks, completed_tasks, failed_tasks, project_id } = req.body;
 
     if (!event || !task_name) {
       return res.status(400).json({ success: false, error: 'event and task_name are required' });
@@ -22,6 +47,7 @@ router.post('/status', validateApiAccess, async (req: AuthenticatedRequest, res:
     const userName = req.user?.name || 'there';
     const userEmail = req.user?.email;
     const websiteDomain = req.website?.domain || '';
+    const projectUrl = buildProjectUrl(websiteDomain, project_id);
 
     if (!userEmail) {
       return res.status(400).json({ success: false, error: 'User email not found' });
@@ -36,7 +62,7 @@ router.post('/status', validateApiAccess, async (req: AuthenticatedRequest, res:
           task_name,
           Number(total_tasks) || 0,
           websiteDomain,
-          CMS_URL
+          projectUrl
         );
         break;
 
@@ -47,7 +73,7 @@ router.post('/status', validateApiAccess, async (req: AuthenticatedRequest, res:
           Number(completed_tasks) || 0,
           Number(failed_tasks) || 0,
           websiteDomain,
-          CMS_URL
+          projectUrl
         );
         break;
 

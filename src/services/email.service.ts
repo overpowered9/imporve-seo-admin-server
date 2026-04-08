@@ -355,7 +355,7 @@ Thank you for choosing ImproveSEO!
     };
   },
 
-  bulkTaskCreated: (userName: string, taskName: string, totalKeywords: number, websiteDomain: string, cmsUrl: string) => {
+  bulkTaskCreated: (userName: string, taskName: string, totalKeywords: number, websiteDomain: string, projectUrl: string) => {
     return {
       subject: `Bulk Project Created - ${taskName}`,
       html: `
@@ -382,7 +382,7 @@ Thank you for choosing ImproveSEO!
             .task-info p { margin: 10px 0; font-size: 14px; }
             .task-info strong { color: #1c7293; font-weight: 600; }
             .task-name { color: #ff7a59; font-weight: 700; font-size: 18px; }
-            .cta-button { display: inline-block; background: #ff7a59; color: white; padding: 16px 40px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; margin: 25px 0; box-shadow: 0 4px 12px rgba(255, 122, 89, 0.3); }
+            .cta-button { display: inline-block; background: #1c7293; color: white; padding: 16px 40px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; margin: 25px 0; box-shadow: 0 4px 12px rgba(28, 114, 147, 0.3); }
             .cta-container { text-align: center; margin: 35px 0; }
             .footer { background: linear-gradient(135deg, #f8f9fa 0%, #f0f2f5 100%); padding: 30px; text-align: center; border-top: 1px solid #eee; }
             .footer p { margin: 5px 0; font-size: 12px; color: #888; }
@@ -395,7 +395,7 @@ Thank you for choosing ImproveSEO!
               <div class="header">
                 <div class="header-content">
                   <img src="https://improveseoplugin.com/wp-content/uploads/2025/10/logo.svg" alt="ImproveSEO Logo" class="logo">
-                  <h1>Bulk Project Created 🚀</h1>
+                  <h1>Bulk Project Created</h1>
                   <p class="header-subtext">Your content is queued for generation</p>
                 </div>
               </div>
@@ -409,13 +409,13 @@ Thank you for choosing ImproveSEO!
                   <p><strong>Project Name:</strong> <span class="task-name">${taskName}</span></p>
                   <p><strong>Total Keywords:</strong> ${totalKeywords}</p>
                   <p><strong>Website:</strong> ${websiteDomain}</p>
-                  <p style="font-size: 13px; color: #888; margin-top: 12px; font-style: italic;">💡 Posts will be generated automatically by the cron scheduler</p>
+                  <p style="font-size: 13px; color: #888; margin-top: 12px; font-style: italic;">Posts will be generated automatically by the cron scheduler</p>
                 </div>
 
                 <p>You'll receive another email when all posts have been generated.</p>
 
                 <div class="cta-container">
-                  <a href="${cmsUrl}" class="cta-button">Go to Dashboard</a>
+                  <a href="${projectUrl}" class="cta-button">View Your Project</a>
                 </div>
               </div>
 
@@ -441,17 +441,16 @@ Website: ${websiteDomain}
 
 Posts will be generated automatically by the cron scheduler. You'll receive another email when all posts have been generated.
 
-Dashboard: ${cmsUrl}
+View Your Project: ${projectUrl}
 
 © 2026 ImproveSEO
       `
     };
   },
 
-  bulkTaskCompleted: (userName: string, taskName: string, totalGenerated: number, totalFailed: number, websiteDomain: string, cmsUrl: string) => {
+  bulkTaskCompleted: (userName: string, taskName: string, totalGenerated: number, totalFailed: number, websiteDomain: string, projectUrl: string) => {
     const totalTasks = totalGenerated + totalFailed;
     const allFailed = totalGenerated === 0 && totalFailed > 0;
-    const statusEmoji = allFailed ? '⚠️' : '✅';
     const statusText = allFailed ? 'Bulk Project Finished (with issues)' : 'Bulk Project Complete';
 
     return {
@@ -486,7 +485,7 @@ Dashboard: ${cmsUrl}
             .task-info p { margin: 10px 0; font-size: 14px; }
             .task-info strong { color: #1c7293; font-weight: 600; }
             .task-name { color: #ff7a59; font-weight: 700; font-size: 18px; }
-            .cta-button { display: inline-block; background: #ff7a59; color: white; padding: 16px 40px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; margin: 25px 0; box-shadow: 0 4px 12px rgba(255, 122, 89, 0.3); }
+            .cta-button { display: inline-block; background: #1c7293; color: white; padding: 16px 40px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; margin: 25px 0; box-shadow: 0 4px 12px rgba(28, 114, 147, 0.3); }
             .cta-container { text-align: center; margin: 35px 0; }
             .footer { background: linear-gradient(135deg, #f8f9fa 0%, #f0f2f5 100%); padding: 30px; text-align: center; border-top: 1px solid #eee; }
             .footer p { margin: 5px 0; font-size: 12px; color: #888; }
@@ -499,7 +498,7 @@ Dashboard: ${cmsUrl}
               <div class="header">
                 <div class="header-content">
                   <img src="https://improveseoplugin.com/wp-content/uploads/2025/10/logo.svg" alt="ImproveSEO Logo" class="logo">
-                  <h1>${statusText} ${statusEmoji}</h1>
+                  <h1>${statusText}</h1>
                   <p class="header-subtext">All tasks have been processed</p>
                 </div>
               </div>
@@ -548,7 +547,7 @@ Dashboard: ${cmsUrl}
                 <!--<![endif]-->
 
                 <div class="cta-container">
-                  <a href="${cmsUrl}" class="cta-button">View Your Projects</a>
+                  <a href="${projectUrl}" class="cta-button">View Your Project</a>
                 </div>
               </div>
 
@@ -576,7 +575,7 @@ Results:
 - Generated: ${totalGenerated}
 - Failed: ${totalFailed}
 
-Dashboard: ${cmsUrl}
+View Your Project: ${projectUrl}
 
 © 2026 ImproveSEO
       `
