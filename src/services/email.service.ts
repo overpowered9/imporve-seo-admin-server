@@ -84,8 +84,8 @@ export const emailTemplates = {
             .ticket-subject { color: #2c3e50; font-weight: 500; }
             .info-text { font-size: 13px; color: #888; margin-top: 12px !important; font-style: italic; }
             .section-title { font-size: 16px; font-weight: 600; color: #1c7293; margin: 25px 0 15px 0; }
-            .cta-button { display: inline-block; background: #ff7a59; color: white; padding: 16px 40px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; margin: 25px 0; transition: all 0.3s ease; box-shadow: 0 4px 12px rgba(255, 122, 89, 0.3); }
-            .cta-button:hover { background: #ff5f3f; transform: translateY(-2px); box-shadow: 0 6px 16px rgba(255, 122, 89, 0.4); }
+            .cta-button { display: inline-block; background: #1c7293; color: white; padding: 16px 40px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; margin: 25px 0; transition: all 0.3s ease; box-shadow: 0 4px 12px rgba(28, 114, 147, 0.3); }
+            .cta-button:hover { background: #165d78; transform: translateY(-2px); box-shadow: 0 6px 16px rgba(28, 114, 147, 0.4); }
             .cta-container { text-align: center; margin: 35px 0; }
             .divider { border-top: 2px solid #f0f0f0; margin: 35px 0; }
             .footer { background: linear-gradient(135deg, #f8f9fa 0%, #f0f2f5 100%); padding: 30px; text-align: center; border-top: 1px solid #eee; }
@@ -100,7 +100,7 @@ export const emailTemplates = {
               <div class="header">
                 <div class="header-content">
                   <img src="https://improveseoplugin.com/wp-content/uploads/2025/10/logo.svg" alt="ImproveSEO Logo" class="logo">
-                  <h1>Ticket Received ✓</h1>
+                  <h1>Ticket Received</h1>
                   <p class="header-subtext">We're on it!</p>
                 </div>
               </div>
@@ -113,11 +113,11 @@ export const emailTemplates = {
                 <div class="ticket-info">
                   <p><strong>Ticket ID:</strong> <span class="ticket-id">${ticketDisplayId}</span></p>
                   <p><strong>Subject:</strong> <span class="ticket-subject">${subject}</span></p>
-                  <p class="info-text">💡 Save your ticket ID for future reference</p>
+                  <p class="info-text">Save your ticket ID for future reference</p>
                 </div>
                 
                 <p class="section-title">What happens next?</p>
-                <p>✓ Your ticket is queued for review<br>✓ Our team will respond within 24 hours<br>✓ You'll receive email updates on progress<br>✓ Track everything in your support dashboard</p>
+                <p>- Your ticket is queued for review<br>- Our team will respond within 24 hours<br>- You'll receive email updates on progress<br>- Track everything in your support dashboard</p>
                 
                 <div class="cta-container">
                   <a href="${cmsUrl}/support/tickets/${ticketId}" class="cta-button">View Your Ticket</a>
@@ -149,9 +149,9 @@ Subject: ${subject}
 View your ticket: ${cmsUrl}/support/tickets/${ticketId}
 
 What happens next?
-✓ Your ticket is queued for review
-✓ Our team will respond within 24 hours
-✓ You'll receive email updates on progress
+- Your ticket is queued for review
+- Our team will respond within 24 hours
+- You'll receive email updates on progress
 
 © 2026 ImproveSEO
       `
@@ -185,8 +185,8 @@ What happens next?
             .message-box p { margin: 0; color: #333; white-space: pre-wrap; word-wrap: break-word; line-height: 1.7; }
             .sender-label { font-size: 12px; color: #ff7a59; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
             .ticket-ref { display: inline-block; background: #f0f2f5; padding: 10px 15px; border-radius: 6px; font-family: 'Courier New', monospace; color: #1c7293; font-weight: 700; font-size: 12px; margin-top: 20px; }
-            .cta-button { display: inline-block; background: #ff7a59; color: white; padding: 16px 40px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; margin: 25px 0; transition: all 0.3s ease; box-shadow: 0 4px 12px rgba(255, 122, 89, 0.3); }
-            .cta-button:hover { background: #ff5f3f; transform: translateY(-2px); box-shadow: 0 6px 16px rgba(255, 122, 89, 0.4); }
+            .cta-button { display: inline-block; background: #1c7293; color: white; padding: 16px 40px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; margin: 25px 0; transition: all 0.3s ease; box-shadow: 0 4px 12px rgba(28, 114, 147, 0.3); }
+            .cta-button:hover { background: #165d78; transform: translateY(-2px); box-shadow: 0 6px 16px rgba(28, 114, 147, 0.4); }
             .cta-container { text-align: center; margin: 35px 0; }
             .badge { display: inline-block; background: #2ec5b6; color: white; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; margin-right: 8px; }
             .footer { background: linear-gradient(135deg, #f8f9fa 0%, #f0f2f5 100%); padding: 30px; text-align: center; border-top: 1px solid #eee; }
@@ -200,7 +200,7 @@ What happens next?
               <div class="header">
                 <div class="header-content">
                   <img src="https://improveseoplugin.com/wp-content/uploads/2025/10/logo.svg" alt="ImproveSEO Logo" class="logo">
-                  <h1>You've Got a Reply 💬</h1>
+                  <h1>You've Got a Reply</h1>
                   <p class="header-subtext">Check your support ticket</p>
                 </div>
               </div>
@@ -211,7 +211,7 @@ What happens next?
                 <p><span class="badge">NEW REPLY</span><span class="sender-highlight">${senderName}</span> has responded to your support ticket:</p>
                 
                 <div class="message-box">
-                  <div class="sender-label">📨 Support Team Response</div>
+                  <div class="sender-label">Support Team Response</div>
                   <p>${message.substring(0, 500)}${message.length > 500 ? '...' : ''}</p>
                 </div>
                 
@@ -279,8 +279,8 @@ View the full conversation at: ${cmsUrl}/support/tickets/${ticketId}
             .status-box h3 { margin: 0 0 15px 0; color: #1c7293; font-size: 16px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
             .status-box p { margin: 0; color: #333; font-size: 14px; line-height: 1.7; white-space: pre-wrap; word-wrap: break-word; }
             .ticket-ref { display: inline-block; background: #f0f2f5; padding: 10px 15px; border-radius: 6px; font-family: 'Courier New', monospace; color: #1c7293; font-weight: 700; font-size: 12px; margin-top: 20px; }
-            .cta-button { display: inline-block; background: #ff7a59; color: white; padding: 16px 40px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; margin: 25px auto; transition: all 0.3s ease; box-shadow: 0 4px 12px rgba(255, 122, 89, 0.3); }
-            .cta-button:hover { background: #ff5f3f; transform: translateY(-2px); box-shadow: 0 6px 16px rgba(255, 122, 89, 0.4); }
+            .cta-button { display: inline-block; background: #1c7293; color: white; padding: 16px 40px; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 15px; margin: 25px auto; transition: all 0.3s ease; box-shadow: 0 4px 12px rgba(28, 114, 147, 0.3); }
+            .cta-button:hover { background: #165d78; transform: translateY(-2px); box-shadow: 0 6px 16px rgba(28, 114, 147, 0.4); }
             .cta-container { text-align: center; margin: 35px 0; }
             .checkmark { font-size: 48px; margin-bottom: 15px; }
             .footer { background: linear-gradient(135deg, #f8f9fa 0%, #f0f2f5 100%); padding: 30px; text-align: center; border-top: 1px solid #eee; }
@@ -294,7 +294,7 @@ View the full conversation at: ${cmsUrl}/support/tickets/${ticketId}
               <div class="header">
                 <div class="header-content">
                   <img src="https://improveseoplugin.com/wp-content/uploads/2025/10/logo.svg" alt="ImproveSEO Logo" class="logo">
-                  <h1>Ticket Resolved ✅</h1>
+                  <h1>Ticket Resolved</h1>
                   <p class="header-subtext">Your issue has been resolved</p>
                 </div>
               </div>
