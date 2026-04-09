@@ -120,7 +120,7 @@ export const emailTemplates = {
                 <p>- Your ticket is queued for review<br>- Our team will respond within 24 hours<br>- You'll receive email updates on progress<br>- Track everything in your support dashboard</p>
                 
                 <div class="cta-container">
-                  <a href="${cmsUrl}/support/tickets/${ticketId}" class="cta-button">View Your Ticket</a>
+                  <a href="${cmsUrl}/support/tickets/${ticketId}" class="cta-button" style="color: #ffffff !important; text-decoration: none;">View Your Ticket</a>
                 </div>
                 
                 <p style="font-size: 13px; color: #888; text-align: center; margin-top: 20px;">Click the button above to view your ticket, add files, or provide additional details.</p>
@@ -218,7 +218,7 @@ What happens next?
                 <p style="font-size: 14px; color: #666;">To see the full conversation and add your reply, click the button below:</p>
                 
                 <div class="cta-container">
-                  <a href="${cmsUrl}/support/tickets/${ticketId}" class="cta-button">View Conversation</a>
+                  <a href="${cmsUrl}/support/tickets/${ticketId}" class="cta-button" style="color: #ffffff !important; text-decoration: none;">View Conversation</a>
                 </div>
                 
                 <div class="ticket-ref">Ticket: ${ticketDisplayId}</div>
@@ -315,7 +315,7 @@ View the full conversation at: ${cmsUrl}/support/tickets/${ticketId}
                 <p style="font-size: 14px; color: #666; margin-top: 25px;">If you have any additional questions or concerns related to this ticket, feel free to reopen it in your support dashboard:</p>
                 
                 <div class="cta-container">
-                  <a href="${cmsUrl}/support/tickets/${ticketId}" class="cta-button">View Ticket Details</a>
+                  <a href="${cmsUrl}/support/tickets/${ticketId}" class="cta-button" style="color: #ffffff !important; text-decoration: none;">View Ticket Details</a>
                 </div>
                 
                 <div class="ticket-ref">Ticket: ${ticketDisplayId}</div>
@@ -415,7 +415,7 @@ Thank you for choosing ImproveSEO!
                 <p>You'll receive another email when all posts have been generated.</p>
 
                 <div class="cta-container">
-                  <a href="${projectUrl}" class="cta-button">View Your Project</a>
+                  <a href="${projectUrl}" class="cta-button" style="color: #ffffff !important; text-decoration: none;">View Your Project</a>
                 </div>
               </div>
 
@@ -547,7 +547,7 @@ View Your Project: ${projectUrl}
                 <!--<![endif]-->
 
                 <div class="cta-container">
-                  <a href="${projectUrl}" class="cta-button">View Your Project</a>
+                  <a href="${projectUrl}" class="cta-button" style="color: #ffffff !important; text-decoration: none;">View Your Project</a>
                 </div>
               </div>
 
