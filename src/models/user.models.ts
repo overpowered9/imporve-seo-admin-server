@@ -13,6 +13,8 @@ export interface User {
   oauth_provider?: string;
   oauth_id?: string;
   avatar_url?: string;
+  trial_started_at?: Date | null;
+  trial_ends_at?: Date | null;
 }
 
 export interface Website {
