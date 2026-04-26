@@ -21,6 +21,8 @@ export interface Website {
   domain: string;
   site_code: string;
   active: boolean;
+  trial_used: boolean;
+  deleted_at: Date | null;
   created_at: Date;
 }
 
@@ -468,7 +470,7 @@ export const deductCredits = async (
     `;
   });
 };
-export const createWebsite = async (user_id: number, domain: string): Promise<Website> => {
+export const createWebsite = async (user_id: number, domain: string, trial_used: boolean = false): Promise<Website> => {
   let site_code = generateSiteCode();
   
   // Ensure unique site code
@@ -476,13 +478,13 @@ export const createWebsite = async (user_id: number, domain: string): Promise<We
   while (attempts < 10) {
     try {
       const result = await sql`
-        INSERT INTO websites (user_id, domain, site_code)
-        VALUES (${user_id}, ${domain}, ${site_code})
+        INSERT INTO websites (user_id, domain, site_code, trial_used)
+        VALUES (${user_id}, ${domain}, ${site_code}, ${trial_used})
         RETURNING *
       `;
       return result[0] as Website;
     } catch (error: any) {
-      if (error.code === '23505') { // Unique constraint violation
+      if (error.code === '23505') { // Unique constraint violation on site_code
         site_code = generateSiteCode();
         attempts++;
         continue;
@@ -513,9 +515,50 @@ export const getUserWebsites = async (user_id: number): Promise<Website[]> => {
 
 
 export const deleteWebsite = async (website_id: number): Promise<void> => {
+  // Soft delete — preserves domain history so trial_used flag is never lost
   await sql`
-    DELETE FROM websites 
+    UPDATE websites
+    SET active = false, deleted_at = NOW()
     WHERE id = ${website_id}
+  `;
+};
+
+/**
+ * Find ALL website rows for a domain (including soft-deleted).
+ * Used by issue-connect-token to check trial history across accounts.
+ */
+export const findWebsiteByDomain = async (domain: string): Promise<Website[]> => {
+  const rows = await sql`
+    SELECT * FROM websites WHERE domain = ${domain}
+    ORDER BY created_at DESC
+  `;
+  return rows as unknown as Website[];
+};
+
+/**
+ * Find the active website row for a specific user+domain combo.
+ * Returns null if no active match (could be soft-deleted or never registered).
+ */
+export const findWebsiteByUserAndDomain = async (user_id: number, domain: string): Promise<Website | null> => {
+  const result = await sql`
+    SELECT * FROM websites
+    WHERE user_id = ${user_id} AND domain = ${domain} AND active = true
+    LIMIT 1
+  `;
+  return (result[0] as Website) || null;
+};
+
+/**
+ * Record trial start on a user (called once; safe to call only when trial_started_at IS NULL).
+ */
+export const startUserTrial = async (user_id: number): Promise<void> => {
+  await sql`
+    UPDATE users
+    SET
+      trial_started_at = NOW(),
+      trial_ends_at    = NOW() + INTERVAL '14 days',
+      updated_at       = NOW()
+    WHERE id = ${user_id} AND trial_started_at IS NULL
   `;
 };
 export const findUserByAuthId = async (auth_user_id: string): Promise<User | null> => {

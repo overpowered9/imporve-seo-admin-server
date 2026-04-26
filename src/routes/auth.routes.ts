@@ -1,8 +1,9 @@
 import express from 'express';
 import { z } from 'zod';
+import crypto from 'crypto';
 import { supabaseAdmin } from '../services/supabase.service.js';
 import sql from '../data/db.js';
-import { findUserByEmail, findUserByOAuth, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, setPasswordHash, type User } from '../models/user.models.js';
+import { findUserByEmail, findUserByOAuth, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, startUserTrial, type User } from '../models/user.models.js';
 
 const router = express.Router();
 
@@ -10,7 +11,8 @@ const signupSchema = z.object({
   email: z.string().email(),
   name: z.string().min(2),
   password: z.string().min(8),
-  plan_id: z.number().optional()
+  plan_id: z.number().optional(),
+  source: z.enum(['plugin', 'web']).optional(),
 });
 
 const loginSchema = z.object({
@@ -21,13 +23,15 @@ const loginSchema = z.object({
 // Signup with email verification
 router.post('/signup', async (req, res) => {
   try {
-    const { email, name, password, plan_id } = signupSchema.parse(req.body);
+    const { email, name, password, plan_id, source } = signupSchema.parse(req.body);
+    const isPluginSignup = source === 'plugin';
     
-    // Create user in Supabase Auth (this will trigger our database function)
+    // Create user in Supabase Auth
     const { data, error } = await supabaseAdmin.auth.admin.createUser({
       email,
       password,
-      email_confirm: false, // Require email confirmation
+      // Plugin signups are auto-confirmed — the user is present in the popup completing the flow
+      email_confirm: isPluginSignup ? true : false,
       user_metadata: {
         name,
         plan_id
@@ -358,5 +362,225 @@ router.post('/oauth-callback', async (req, res) => {
     });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plugin Connect Token endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+const issueConnectTokenSchema = z.object({
+  site_domain: z.string().min(1).max(253),
+  source: z.literal('plugin').optional(),
+});
+
+/**
+ * POST /api/v1/auth/issue-connect-token
+ *
+ * Authenticated with Supabase JWT (Authorization: Bearer <token>).
+ * Enforces one-trial-per-account and one-trial-per-domain rules,
+ * then creates (or retrieves) the website entry and returns a short-lived
+ * opaque token for the plugin to exchange.
+ */
+router.post('/issue-connect-token', async (req, res) => {
+  try {
+    // ── 1. Verify Supabase JWT ──────────────────────────────────────────────
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ success: false, error: 'Missing or invalid Authorization header' });
+    }
+    const jwt = authHeader.slice(7);
+    const { data: { user: supabaseUser }, error: authError } = await supabaseAdmin.auth.getUser(jwt);
+    if (authError || !supabaseUser) {
+      return res.status(401).json({ success: false, error: 'Invalid or expired token' });
+    }
+
+    // ── 2. Validate request body ────────────────────────────────────────────
+    const { site_domain } = issueConnectTokenSchema.parse(req.body);
+    // Normalise: strip leading www. so "www.example.com" and "example.com" are the same site
+    const domain = site_domain.replace(/^www\./, '').toLowerCase().trim();
+
+    // ── 3. Find our internal user record ───────────────────────────────────
+    const user = await findUserByEmail(supabaseUser.email!);
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User account not found. Please contact support.' });
+    }
+
+    // ── 4. Trial enforcement — four ordered checks ──────────────────────────
+
+    // Check 1: Account already used its trial?
+    if (user.trial_started_at !== null && user.trial_started_at !== undefined) {
+      // Still allow reconnect to the same domain on the same account (Check 4 below),
+      // but a completely new domain would be a second trial — block it.
+      const ownActive = await findWebsiteByUserAndDomain(user.id, domain);
+      if (!ownActive) {
+        // They already had a trial, and this is a different domain → deny
+        return res.status(403).json({
+          success: false,
+          error: 'Your account has already used its free trial.',
+          code: 'TRIAL_ACCOUNT_USED',
+        });
+      }
+      // Falls through to Check 4 (reconnect on same account)
+    }
+
+    // Check 2: Domain previously on a trial on any account (including soft-deleted)?
+    const allDomainRows = await findWebsiteByDomain(domain);
+    const trialRow = allDomainRows.find(r => r.trial_used);
+    if (trialRow && trialRow.user_id !== user.id) {
+      return res.status(403).json({
+        success: false,
+        error: 'This website has already used its free trial on another account.',
+        code: 'TRIAL_DOMAIN_USED',
+      });
+    }
+
+    // Check 3: Domain active on a DIFFERENT account right now?
+    const activeElsewhere = allDomainRows.find(r => r.active && r.user_id !== user.id);
+    if (activeElsewhere) {
+      return res.status(409).json({
+        success: false,
+        error: 'This website is currently connected to another account. Remove it there first.',
+        code: 'DOMAIN_CONFLICT',
+      });
+    }
+
+    // Check 4: Domain already active on THIS account (reconnect) → silent success
+    const ownActiveRow = allDomainRows.find(r => r.active && r.user_id === user.id);
+
+    let site_code: string;
+    let trial_status: 'new' | 'reconnect' | 'transferred';
+
+    if (ownActiveRow) {
+      // Reconnect — reuse existing site_code, no trial change
+      site_code = ownActiveRow.site_code;
+      trial_status = 'reconnect';
+    } else if (trialRow && trialRow.user_id === user.id) {
+      // This account had a trial on this domain (could be soft-deleted and re-adding)
+      // Re-enable the soft-deleted row if it exists, or create fresh without trial
+      const softDeleted = allDomainRows.find(r => !r.active && r.user_id === user.id);
+      if (softDeleted) {
+        await sql`
+          UPDATE websites
+          SET active = true, deleted_at = NULL, updated_at = NOW()
+          WHERE id = ${softDeleted.id}
+        `;
+        site_code = softDeleted.site_code;
+      } else {
+        const newSite = await createWebsite(user.id, domain, false);
+        site_code = newSite.site_code;
+      }
+      trial_status = 'reconnect';
+    } else if (trialRow && trialRow.user_id !== user.id) {
+      // Already blocked above; impossible to reach here — safety net
+      return res.status(403).json({ success: false, error: 'Trial already used on another account.', code: 'TRIAL_DOMAIN_USED' });
+    } else {
+      // All clear — brand new domain for this account, start trial
+      const newSite = await createWebsite(user.id, domain, true);
+      site_code = newSite.site_code;
+      await startUserTrial(user.id);
+      trial_status = 'new';
+    }
+
+    // ── 5. Issue short-lived connect token ──────────────────────────────────
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+
+    await sql`
+      INSERT INTO connect_tokens (token, user_id, site_code, expires_at)
+      VALUES (${token}, ${user.id}, ${site_code}, ${expiresAt.toISOString()})
+    `;
+
+    // Reload user to get fresh trial dates
+    const freshUser = await findUserByEmail(supabaseUser.email!);
+
+    return res.json({
+      success: true,
+      data: {
+        connect_token: token,
+        trial_status,
+        trial_ends_at: freshUser?.trial_ends_at ?? null,
+      },
+    });
+
+  } catch (error) {
+    console.error('issue-connect-token error:', error);
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ success: false, error: 'Invalid request data', details: error.errors });
+    }
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+const exchangeConnectTokenSchema = z.object({
+  connect_token: z.string().length(64), // 32 bytes → 64 hex chars
+});
+
+/**
+ * POST /api/v1/auth/exchange-connect-token
+ *
+ * Public endpoint (no auth required). Called by the WordPress plugin immediately
+ * after receiving the connect_token via postMessage. Single-use + 5-min TTL.
+ * Returns the credentials the plugin needs (api_key, site_code, trial info).
+ */
+router.post('/exchange-connect-token', async (req, res) => {
+  try {
+    const { connect_token } = exchangeConnectTokenSchema.parse(req.body);
+
+    // ── 1. Look up and validate token ───────────────────────────────────────
+    const tokenRows = await sql`
+      SELECT ct.*, u.api_key, u.name as user_name, u.trial_ends_at, u.trial_started_at
+      FROM connect_tokens ct
+      JOIN users u ON u.id = ct.user_id
+      WHERE ct.token = ${connect_token}
+      LIMIT 1
+    `;
+
+    if (!tokenRows[0]) {
+      return res.status(404).json({ success: false, error: 'Token not found', code: 'TOKEN_NOT_FOUND' });
+    }
+
+    const row = tokenRows[0] as any;
+
+    if (row.used) {
+      return res.status(410).json({ success: false, error: 'Token has already been used', code: 'TOKEN_USED' });
+    }
+
+    if (new Date(row.expires_at) < new Date()) {
+      return res.status(410).json({ success: false, error: 'Token has expired. Please reconnect.', code: 'TOKEN_EXPIRED' });
+    }
+
+    // ── 2. Mark token as used (single-use, prevent replay) ──────────────────
+    await sql`
+      UPDATE connect_tokens SET used = true WHERE token = ${connect_token}
+    `;
+
+    // ── 3. Compute days remaining in trial ──────────────────────────────────
+    let days_remaining: number | null = null;
+    if (row.trial_ends_at) {
+      const msLeft = new Date(row.trial_ends_at).getTime() - Date.now();
+      days_remaining = Math.max(0, Math.ceil(msLeft / (1000 * 60 * 60 * 24)));
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        api_key: row.api_key,
+        site_code: row.site_code,
+        user_name: row.user_name,
+        trial_started_at: row.trial_started_at,
+        trial_ends_at: row.trial_ends_at,
+        days_remaining,
+      },
+    });
+
+  } catch (error) {
+    console.error('exchange-connect-token error:', error);
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ success: false, error: 'Invalid token format', details: error.errors });
+    }
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 export default router;
