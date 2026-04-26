@@ -50,7 +50,9 @@ router.post('/signup', async (req, res) => {
     
     res.status(201).json({
       success: true,
-      message: 'User created successfully. Please check your email for verification.',
+      message: isPluginSignup
+        ? 'User created successfully.'
+        : 'User created successfully. Please check your email for verification.',
       data: {
         user: {
           id: user?.id,
@@ -58,7 +60,7 @@ router.post('/signup', async (req, res) => {
           name: user?.name,
           api_key: user?.api_key,
           plan_id: user?.plan_id,
-          email_confirmed: false
+          email_confirmed: isPluginSignup,
         }
       }
     });
@@ -406,24 +408,28 @@ router.post('/issue-connect-token', async (req, res) => {
 
     // ── 4. Trial enforcement — four ordered checks ──────────────────────────
 
+    // Fetch all rows for this domain upfront (active + soft-deleted, all accounts).
+    // This is used in all four checks below.
+    const allDomainRows = await findWebsiteByDomain(domain);
+
     // Check 1: Account already used its trial?
     if (user.trial_started_at !== null && user.trial_started_at !== undefined) {
-      // Still allow reconnect to the same domain on the same account (Check 4 below),
+      // Still allow reconnect/re-add for the same domain on the same account (Checks 2–4 below),
       // but a completely new domain would be a second trial — block it.
-      const ownActive = await findWebsiteByUserAndDomain(user.id, domain);
-      if (!ownActive) {
-        // They already had a trial, and this is a different domain → deny
+      // We check any row (active OR soft-deleted) belonging to this user for this domain.
+      const ownAnyRow = allDomainRows.find(r => r.user_id === user.id);
+      if (!ownAnyRow) {
+        // They already had a trial on a different domain → deny
         return res.status(403).json({
           success: false,
           error: 'Your account has already used its free trial.',
           code: 'TRIAL_ACCOUNT_USED',
         });
       }
-      // Falls through to Check 4 (reconnect on same account)
+      // Falls through to reconnect / re-enable logic below
     }
 
     // Check 2: Domain previously on a trial on any account (including soft-deleted)?
-    const allDomainRows = await findWebsiteByDomain(domain);
     const trialRow = allDomainRows.find(r => r.trial_used);
     if (trialRow && trialRow.user_id !== user.id) {
       return res.status(403).json({
@@ -460,7 +466,7 @@ router.post('/issue-connect-token', async (req, res) => {
       if (softDeleted) {
         await sql`
           UPDATE websites
-          SET active = true, deleted_at = NULL, updated_at = NOW()
+          SET active = true, deleted_at = NULL
           WHERE id = ${softDeleted.id}
         `;
         site_code = softDeleted.site_code;
@@ -474,7 +480,23 @@ router.post('/issue-connect-token', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Trial already used on another account.', code: 'TRIAL_DOMAIN_USED' });
     } else {
       // All clear — brand new domain for this account, start trial
-      const newSite = await createWebsite(user.id, domain, true);
+      let newSite;
+      try {
+        newSite = await createWebsite(user.id, domain, true);
+      } catch (error: any) {
+        if (error.code === '23505' || error.message === 'Failed to generate unique site code') {
+          // Concurrent request raced us and inserted first — domain is now active elsewhere.
+          // The unique partial index on (domain WHERE active=true) blocked us.
+          // Note: createWebsite retries up to 10 times on 23505; if it exhausts retries
+          // due to a domain conflict, it throws a plain Error without .code — handle both.
+          return res.status(409).json({
+            success: false,
+            error: 'Connection is already in progress. Please try again in a moment.',
+            code: 'CONCURRENT_REQUEST',
+          });
+        }
+        throw error;
+      }
       site_code = newSite.site_code;
       await startUserTrial(user.id);
       trial_status = 'new';
@@ -483,6 +505,9 @@ router.post('/issue-connect-token', async (req, res) => {
     // ── 5. Issue short-lived connect token ──────────────────────────────────
     const token = crypto.randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+
+    // Opportunistic cleanup of expired tokens (runs async, doesn't block the response)
+    sql`DELETE FROM connect_tokens WHERE expires_at < NOW() - INTERVAL '1 hour'`.catch(() => {/* ignore */});
 
     await sql`
       INSERT INTO connect_tokens (token, user_id, site_code, expires_at)
@@ -525,33 +550,45 @@ router.post('/exchange-connect-token', async (req, res) => {
   try {
     const { connect_token } = exchangeConnectTokenSchema.parse(req.body);
 
-    // ── 1. Look up and validate token ───────────────────────────────────────
-    const tokenRows = await sql`
-      SELECT ct.*, u.api_key, u.name as user_name, u.trial_ends_at, u.trial_started_at
-      FROM connect_tokens ct
-      JOIN users u ON u.id = ct.user_id
-      WHERE ct.token = ${connect_token}
-      LIMIT 1
+    // ── 1. Atomically mark token as used and retrieve it in one query ───────
+    // Using a single UPDATE…RETURNING prevents TOCTOU races where two concurrent
+    // requests both see used=false, both pass validation, and both receive credentials.
+    const markedRows = await sql`
+      UPDATE connect_tokens
+      SET    used = true
+      WHERE  token      = ${connect_token}
+        AND  used       = false
+        AND  expires_at > NOW()
+      RETURNING *
     `;
 
-    if (!tokenRows[0]) {
-      return res.status(404).json({ success: false, error: 'Token not found', code: 'TOKEN_NOT_FOUND' });
-    }
-
-    const row = tokenRows[0] as any;
-
-    if (row.used) {
-      return res.status(410).json({ success: false, error: 'Token has already been used', code: 'TOKEN_USED' });
-    }
-
-    if (new Date(row.expires_at) < new Date()) {
+    if (!markedRows[0]) {
+      // Determine the exact reason for the caller to display the right message
+      const checkRows = await sql`
+        SELECT used, expires_at FROM connect_tokens WHERE token = ${connect_token} LIMIT 1
+      `;
+      if (!checkRows[0]) {
+        return res.status(404).json({ success: false, error: 'Token not found', code: 'TOKEN_NOT_FOUND' });
+      }
+      if (checkRows[0].used) {
+        return res.status(410).json({ success: false, error: 'Token has already been used', code: 'TOKEN_USED' });
+      }
       return res.status(410).json({ success: false, error: 'Token has expired. Please reconnect.', code: 'TOKEN_EXPIRED' });
     }
 
-    // ── 2. Mark token as used (single-use, prevent replay) ──────────────────
-    await sql`
-      UPDATE connect_tokens SET used = true WHERE token = ${connect_token}
+    const tokenRow = markedRows[0] as any;
+
+    // ── 2. Fetch user credentials ───────────────────────────────────────────
+    const userRows = await sql`
+      SELECT api_key, name AS user_name, trial_started_at, trial_ends_at
+      FROM   users
+      WHERE  id = ${tokenRow.user_id}
+      LIMIT  1
     `;
+    if (!userRows[0]) {
+      return res.status(404).json({ success: false, error: 'User account not found', code: 'USER_NOT_FOUND' });
+    }
+    const row = { ...tokenRow, ...userRows[0] } as any;
 
     // ── 3. Compute days remaining in trial ──────────────────────────────────
     let days_remaining: number | null = null;
