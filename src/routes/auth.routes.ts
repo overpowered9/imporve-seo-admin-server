@@ -3,7 +3,7 @@ import { z } from 'zod';
 import crypto from 'crypto';
 import { supabaseAdmin } from '../services/supabase.service.js';
 import sql from '../data/db.js';
-import { findUserByEmail, findUserByOAuth, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, startUserTrial, type User } from '../models/user.models.js';
+import { findUserByEmail, findUserByOAuth, createUser, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, startUserTrial, type User } from '../models/user.models.js';
 
 const router = express.Router();
 
@@ -45,9 +45,18 @@ router.post('/signup', async (req, res) => {
       });
     }
 
-    // Get the created user from our users table
-    const user = await findUserByEmail(email);
-    
+    // Get or create user in our users table.
+    // Idempotent: a Supabase DB trigger may have already inserted the row, in which case
+    // findUserByEmail finds it. If no trigger exists (common in self-managed setups),
+    // we create it explicitly so issue-connect-token never returns 404 for new signups.
+    let user = await findUserByEmail(email);
+    if (!user) {
+      const freePlanId = await getFreePlanId();
+      const apiKey = generateApiKey();
+      user = await createUser({ email, name, api_key: apiKey, plan_id: freePlanId, password });
+      await initializeUserCredits(user.id, freePlanId);
+    }
+
     res.status(201).json({
       success: true,
       message: isPluginSignup
