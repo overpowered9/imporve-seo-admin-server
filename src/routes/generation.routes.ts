@@ -9,6 +9,7 @@ import { validateApiAccess, validateCredits, AuthenticatedRequest } from '../mid
 import { deductCredits } from '../models/user.models.js';
 import sql from '../data/db.js';
 import { FluxAIService } from '../services/fluxai.service.js';
+import { chat } from '../services/openai.js';
 
 const router = Router();
 
@@ -1274,6 +1275,74 @@ router.post('/generatekeywordded', validateApiAccess, validateCredits('keywords'
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to deduct keyword credits'
+    });
+  }
+});
+
+/**
+ * Generate auxiliary text (meta title, meta description, audience data).
+ * No credit cost — these are small supporting GPT calls. Auth-only.
+ * POST /api/v1/generate/auxiliary
+ *
+ * Body: { type, seed_keyword, title?, content? }
+ *   type: 'meta_title' | 'meta_description' | 'audience_data'
+ *   title:   required for meta_title and meta_description
+ *   content: optional, used by meta_description for context
+ *
+ * Response: { success: true, data: { type, text } }
+ */
+router.post('/auxiliary', validateApiAccess, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { type, seed_keyword, title, content } = req.body as {
+      type?: string;
+      seed_keyword?: string;
+      title?: string;
+      content?: string;
+    };
+
+    if (!type) {
+      return res.status(400).json({
+        success: false,
+        error: 'type is required (meta_title | meta_description | audience_data)'
+      });
+    }
+    if (!seed_keyword) {
+      return res.status(400).json({
+        success: false,
+        error: 'seed_keyword is required'
+      });
+    }
+
+    let prompt: string;
+    switch (type) {
+      case 'meta_title':
+        prompt = `Create an SEO optimized meta title based on the blog post title \`${title || ''}\` and the keyword \`${seed_keyword}\`. Max length of title should be 50-60 characters including spaces.`;
+        break;
+      case 'meta_description':
+        prompt = `Create an SEO optimized meta description. Max length of description should be 70-80 characters including spaces. Meta description is based on the blog post title \`${title || ''}\`, the keyword \`${seed_keyword}\` and the blog post content i.e. ${content || ''}.`;
+        break;
+      case 'audience_data':
+        prompt = `Assume someone enters the keyword ${seed_keyword} into a search engine. Analyze the following characteristics: 1. [demographic information] 2. [tone preferences] 3. [reading level preference] 4. [emotional needs/pain points]. This information will be used to create content that is specifically appealing to such people. Do not give content recommendations yet. As an output, write just information for characteristics without any explanation or introduction.`;
+        break;
+      default:
+        return res.status(400).json({
+          success: false,
+          error: `Unknown type "${type}". Must be: meta_title, meta_description, or audience_data.`
+        });
+    }
+
+    console.log(`✨ Auxiliary generation | type=${type} | seed_keyword="${seed_keyword.substring(0, 60)}"`);
+    const text = await chat([{ role: 'user', content: prompt }]);
+
+    res.json({
+      success: true,
+      data: { type, text }
+    });
+  } catch (error) {
+    console.error('❌ Auxiliary generation error:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to generate auxiliary text'
     });
   }
 });
