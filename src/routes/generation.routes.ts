@@ -1332,7 +1332,11 @@ router.post('/auxiliary', validateApiAccess, async (req: AuthenticatedRequest, r
     }
 
     console.log(`✨ Auxiliary generation | type=${type} | seed_keyword="${seed_keyword.substring(0, 60)}"`);
-    const text = await chat([{ role: 'user', content: prompt }]);
+    let text = await chat([{ role: 'user', content: prompt }]);
+
+    // Strip quote characters — GPT routinely wraps outputs in quotes and that
+    // bleeds into rendered SEO tags / context blocks downstream.
+    text = text.replace(/["'‘’“”]/g, '').trim();
 
     res.json({
       success: true,
