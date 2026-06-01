@@ -1324,10 +1324,13 @@ router.post('/auxiliary', validateApiAccess, async (req: AuthenticatedRequest, r
       case 'audience_data':
         prompt = `Assume someone enters the keyword ${seed_keyword} into a search engine. Analyze the following characteristics: 1. [demographic information] 2. [tone preferences] 3. [reading level preference] 4. [emotional needs/pain points]. This information will be used to create content that is specifically appealing to such people. Do not give content recommendations yet. As an output, write just information for characteristics without any explanation or introduction.`;
         break;
+      case 'keyword_context':
+        prompt = `In a few sentences (max 500 characters not including spaces) explain what the following list of keywords is about and what their common thread is. The goal is to create a context that is relevant to all keywords in the list. Do not use the words "keyword list" or "list" in your output. Start your output with "The context is..." Keyword List: ${seed_keyword}`;
+        break;
       default:
         return res.status(400).json({
           success: false,
-          error: `Unknown type "${type}". Must be: meta_title, meta_description, or audience_data.`
+          error: `Unknown type "${type}". Must be: meta_title, meta_description, audience_data, or keyword_context.`
         });
     }
 
