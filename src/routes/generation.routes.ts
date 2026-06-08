@@ -1284,26 +1284,30 @@ router.post('/generatekeywordded', validateApiAccess, validateCredits('keywords'
  * No credit cost — these are small supporting GPT calls. Auth-only.
  * POST /api/v1/generate/auxiliary
  *
- * Body: { type, seed_keyword, title?, content? }
- *   type: 'meta_title' | 'meta_description' | 'audience_data'
- *   title:   required for meta_title and meta_description
- *   content: optional, used by meta_description for context
+ * Body: { type, seed_keyword, title?, content?, audience_data?, title_type? }
+ *   type:          'meta_title' | 'meta_description' | 'audience_data' | 'keyword_context' | 'title'
+ *   title:         required for meta_title and meta_description
+ *   content:       optional, used by meta_description for context
+ *   audience_data: optional, used by 'title' to tailor the wizard title
+ *   title_type:    'question' formats the 'title' output as a question (seed_option3)
  *
  * Response: { success: true, data: { type, text } }
  */
 router.post('/auxiliary', validateApiAccess, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { type, seed_keyword, title, content } = req.body as {
+    const { type, seed_keyword, title, content, audience_data, title_type } = req.body as {
       type?: string;
       seed_keyword?: string;
       title?: string;
       content?: string;
+      audience_data?: string;
+      title_type?: string;
     };
 
     if (!type) {
       return res.status(400).json({
         success: false,
-        error: 'type is required (meta_title | meta_description | audience_data)'
+        error: 'type is required (meta_title | meta_description | audience_data | title)'
       });
     }
     if (!seed_keyword) {
@@ -1327,10 +1331,22 @@ router.post('/auxiliary', validateApiAccess, async (req: AuthenticatedRequest, r
       case 'keyword_context':
         prompt = `In a few sentences (max 500 characters not including spaces) explain what the following list of keywords is about and what their common thread is. The goal is to create a context that is relevant to all keywords in the list. Do not use the words "keyword list" or "list" in your output. Start your output with "The context is..." Keyword List: ${seed_keyword}`;
         break;
+      case 'title': {
+        // Wizard "Create best title / question from keyword" (seed_option2 / seed_option3).
+        // title_type 'question' formats the title as a question; otherwise a regular title.
+        const asQuestion = title_type === 'question';
+        const questionConstraint = asQuestion ? ' Title should be formed as a question.' : '';
+        prompt = `You are a content creator who creates SEO optimized titles for blog posts. You are provided a word or phrase that is searched by the reader, and the audience data of the reader, including demographic information, tone preferences, reading level preference and emotional needs/pain points. Using this information you should come up with a title that will be engaging and interesting for people who are described in the audience data and search provided word or phrase.${questionConstraint} In the title do not include emojis or hashtags. Limit characters not including spaces to 80-100. As an output, write just a title without explanation or introduction.
+
+Now generate a SEO optimized title based on the following information:
+Keyword: ${seed_keyword}
+Audience data: {${audience_data || ''}}`;
+        break;
+      }
       default:
         return res.status(400).json({
           success: false,
-          error: `Unknown type "${type}". Must be: meta_title, meta_description, audience_data, or keyword_context.`
+          error: `Unknown type "${type}". Must be: meta_title, meta_description, audience_data, keyword_context, or title.`
         });
     }
 
