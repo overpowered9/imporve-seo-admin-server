@@ -8,6 +8,8 @@ export const config = {
   mongoUri: process.env.MONGODB_URI || 'mongodb://localhost:27017/improveseo',
   openaiApiKey: process.env.OPENAI_API_KEY || '',
   openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
+  anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-opus-4-8',
   fluxAiApiKey: process.env.FLUX_AI_API_KEY || '',
   stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
