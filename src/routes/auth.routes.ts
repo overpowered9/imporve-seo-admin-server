@@ -589,7 +589,7 @@ router.post('/exchange-connect-token', async (req, res) => {
 
     // ── 2. Fetch user credentials ───────────────────────────────────────────
     const userRows = await sql`
-      SELECT api_key, name AS user_name, trial_started_at, trial_ends_at
+      SELECT api_key, name AS user_name, email, trial_started_at, trial_ends_at
       FROM   users
       WHERE  id = ${tokenRow.user_id}
       LIMIT  1
@@ -612,6 +612,7 @@ router.post('/exchange-connect-token', async (req, res) => {
         api_key: row.api_key,
         site_code: row.site_code,
         user_name: row.user_name,
+        email: row.email,
         trial_started_at: row.trial_started_at,
         trial_ends_at: row.trial_ends_at,
         days_remaining,
