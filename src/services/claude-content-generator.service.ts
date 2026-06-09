@@ -11,12 +11,15 @@
  */
 
 import { claudeText, claudeJSON, parseJsonLoose, ClaudeUsage } from './claude.service.js';
+import { PromptManagementService } from './prompt-management.service.js';
 import {
   buildBlueprint,
   blueprintDirective,
   variantFromWords,
   ContentBlueprint,
 } from './content-blueprint.js';
+
+const promptService = new PromptManagementService();
 
 export interface BrandProfile {
   business_name?: string;
@@ -141,6 +144,38 @@ Apply every pass:
 
 Return ONLY the revised HTML article — no explanation, no JSON.`;
 
+// ---------- DB-tunable prompt definitions ----------
+// Each v2 system prompt is stored in the prompt-management DB (admin-panel tunable) and falls back to
+// the in-code constant above if no active DB version exists. The seed script (seed-content-v2-prompts.ts)
+// registers these as templates so prompt engineers can version them from the admin panel.
+
+export const V2_PROMPT_DEFS = {
+  intelligence: {
+    templateType: 'content_v2_intelligence' as const,
+    displayName: 'Content v2 — Intelligence (audience / LSI / FAQ)',
+    fallback: INTEL_SYSTEM,
+  },
+  generation: {
+    templateType: 'content_v2_system' as const,
+    displayName: 'Content v2 — Article Writer',
+    fallback: GEN_SYSTEM,
+  },
+  humanize: {
+    templateType: 'content_v2_humanize' as const,
+    displayName: 'Content v2 — Humanizer (de-tell pass)',
+    fallback: HUMANIZE_SYSTEM,
+  },
+};
+
+async function getV2Prompt(def: { templateType: string; fallback: string }): Promise<string> {
+  try {
+    const text = await promptService.getPrompt(def.templateType);
+    return text && text.trim() ? text : def.fallback;
+  } catch {
+    return def.fallback; // no template / no active version → use the in-code constant
+  }
+}
+
 // ---------- pipeline ----------
 
 export async function generateContentV2(params: GenerateV2Params): Promise<GenerateV2Result> {
@@ -148,6 +183,13 @@ export async function generateContentV2(params: GenerateV2Params): Promise<Gener
   const usage: Record<string, ClaudeUsage> = {};
   const lang = params.content_lang || 'English (US)';
   const variant = variantFromWords(params.nos_of_words || '1200 to 2400 words');
+
+  // Resolve the three system prompts from DB (admin-tunable) with in-code fallback.
+  const [intelSystem, genSystem, humanizeSystem] = await Promise.all([
+    getV2Prompt(V2_PROMPT_DEFS.intelligence),
+    getV2Prompt(V2_PROMPT_DEFS.generation),
+    getV2Prompt(V2_PROMPT_DEFS.humanize),
+  ]);
 
   // ---- Phase 1: intelligence JSON ----
   let intelligence: AudienceIntelligence | null = null;
@@ -166,7 +208,7 @@ Return JSON exactly in this shape:
   "faq_questions": ["3 questions exactly as this customer types them into Google"]
 }`;
     try {
-      const r = await claudeJSON<AudienceIntelligence>({ system: INTEL_SYSTEM, user, maxTokens: 1800 });
+      const r = await claudeJSON<AudienceIntelligence>({ system: intelSystem, user, maxTokens: 1800 });
       intelligence = r.data;
       usage.intelligence = r.usage;
     } catch (e) {
@@ -190,7 +232,7 @@ Return JSON exactly in this shape:
   const maxTokens = variant === 'large' ? 12000 : variant === 'medium' ? 8000 : 5000;
   // Thinking OFF for the writing pass: the blueprint already plans structure, and on Sonnet
   // adaptive-thinking tokens consume the same max_tokens budget (starving the article).
-  const gen = await claudeText({ system: GEN_SYSTEM, user: genUser, maxTokens, thinking: false });
+  const gen = await claudeText({ system: genSystem, user: genUser, maxTokens, thinking: false });
   usage.generation = gen.usage;
   timings.generation = Date.now() - t3;
 
@@ -202,7 +244,7 @@ Return JSON exactly in this shape:
     const t4 = Date.now();
     try {
       const h = await claudeText({
-        system: HUMANIZE_SYSTEM,
+        system: humanizeSystem,
         user: article,
         maxTokens,
         thinking: false,
