@@ -145,39 +145,89 @@ export function buildBlueprint(params: {
   };
 }
 
-const OPENING_DIRECTIVE: Record<OpeningMove, string> = {
-  lived_scenario: 'Open mid-scene with a real situation this reader has lived. No statistics, no "In today\'s world".',
-  direct_question: 'Open with the exact question this reader would type or speak, then answer it head-on.',
-  contrarian_claim: 'Open with a specific contrarian claim that challenges common advice in this niche.',
-  micro_anecdote: 'Open with a short, concrete two-sentence anecdote — a single moment, not a summary.',
-  myth_correction: 'Open by naming a widespread myth in this niche and correcting it immediately.',
+/**
+ * Directive wording — the prose injected into the generation prompt for each blueprint choice.
+ * This is the TUNABLE structural layer: prompt engineers edit these strings (stored as JSON in the
+ * `content_v2_blueprint_directives` DB template) to change how openings/accents/closings/FAQ/POV are
+ * phrased, WITHOUT touching the deterministic selection logic above. Placeholders: {count}, {placement},
+ * {pov}. Unknown/missing keys fall back to these defaults via mergeDirectives().
+ */
+export interface BlueprintDirectives {
+  opening: Record<OpeningMove, string>;
+  accent: Record<Accent, string>;
+  close: Record<CloseMove, string>;
+  tocOn: string;
+  tocOff: string;
+  bodyIntro: string; // {count}
+  faqEnd: string;
+  faqWoven: string;
+  faqLine: string; // {count}, {placement}
+  povLine: string; // {pov}
+}
+
+export const DEFAULT_BLUEPRINT_DIRECTIVES: BlueprintDirectives = {
+  opening: {
+    lived_scenario: 'Open mid-scene with a real situation this reader has lived. No statistics, no "In today\'s world".',
+    direct_question: 'Open with the exact question this reader would type or speak, then answer it head-on.',
+    contrarian_claim: 'Open with a specific contrarian claim that challenges common advice in this niche.',
+    micro_anecdote: 'Open with a short, concrete two-sentence anecdote — a single moment, not a summary.',
+    myth_correction: 'Open by naming a widespread myth in this niche and correcting it immediately.',
+  },
+  accent: {
+    none: 'Use flowing prose only — no bulleted lists or tables in the body.',
+    short_list: 'Include exactly ONE short bulleted list (3–5 items) where it genuinely helps; everything else is prose.',
+    comparison_table: 'Include exactly ONE small comparison table (2 columns, 3–4 rows) where a tradeoff is being weighed.',
+    pull_quote: 'Include exactly ONE short pull-quote line (a single emphasized sentence on its own) — no blockquote spam.',
+  },
+  close: {
+    forward_question: 'Close by turning the topic forward with a question the reader should now ask themselves.',
+    soft_fade: 'Close on a quiet, concrete note — no summary, no "In conclusion".',
+    single_punch_line: 'Close with one short, blunt sentence that lands the main point.',
+    practical_next_step: 'Close with the single most useful next step the reader can take today.',
+  },
+  tocOn: 'Include a short linked table of contents after the intro.',
+  tocOff: 'Do NOT include a table of contents.',
+  bodyIntro: 'Write {count} body sections with DELIBERATELY UNEVEN lengths (do not make them equal):',
+  faqEnd: 'near the end',
+  faqWoven: 'woven near the most relevant section',
+  faqLine: 'Place a {count}-question FAQ {placement}.',
+  povLine: 'Write in {pov}.',
 };
 
-const ACCENT_DIRECTIVE: Record<Accent, string> = {
-  none: 'Use flowing prose only — no bulleted lists or tables in the body.',
-  short_list: 'Include exactly ONE short bulleted list (3–5 items) where it genuinely helps; everything else is prose.',
-  comparison_table: 'Include exactly ONE small comparison table (2 columns, 3–4 rows) where a tradeoff is being weighed.',
-  pull_quote: 'Include exactly ONE short pull-quote line (a single emphasized sentence on its own) — no blockquote spam.',
-};
-
-const CLOSE_DIRECTIVE: Record<CloseMove, string> = {
-  forward_question: 'Close by turning the topic forward with a question the reader should now ask themselves.',
-  soft_fade: 'Close on a quiet, concrete note — no summary, no "In conclusion".',
-  single_punch_line: 'Close with one short, blunt sentence that lands the main point.',
-  practical_next_step: 'Close with the single most useful next step the reader can take today.',
-};
+/** Deep-merge a partial (admin-edited) directives object over the defaults; tolerant of garbage. */
+export function mergeDirectives(partial: unknown): BlueprintDirectives {
+  const d = DEFAULT_BLUEPRINT_DIRECTIVES;
+  if (!partial || typeof partial !== 'object') return d;
+  const p = partial as Partial<BlueprintDirectives>;
+  return {
+    opening: { ...d.opening, ...(p.opening as object) },
+    accent: { ...d.accent, ...(p.accent as object) },
+    close: { ...d.close, ...(p.close as object) },
+    tocOn: p.tocOn || d.tocOn,
+    tocOff: p.tocOff || d.tocOff,
+    bodyIntro: p.bodyIntro || d.bodyIntro,
+    faqEnd: p.faqEnd || d.faqEnd,
+    faqWoven: p.faqWoven || d.faqWoven,
+    faqLine: p.faqLine || d.faqLine,
+    povLine: p.povLine || d.povLine,
+  };
+}
 
 /** Render the blueprint into prose constraints for the generation prompt. */
-export function blueprintDirective(bp: ContentBlueprint): string {
+export function blueprintDirective(
+  bp: ContentBlueprint,
+  dirs: BlueprintDirectives = DEFAULT_BLUEPRINT_DIRECTIVES
+): string {
   const lengths = bp.sectionWordTargets.map((n, i) => `  - Section ${i + 1}: ~${n} words`).join('\n');
+  const placement = bp.faqPlacement === 'woven' ? dirs.faqWoven : dirs.faqEnd;
   return [
-    `OPENING: ${OPENING_DIRECTIVE[bp.openingMove]}`,
-    `TABLE OF CONTENTS: ${bp.includeToc ? 'Include a short linked table of contents after the intro.' : 'Do NOT include a table of contents.'}`,
-    `BODY: Write ${bp.sectionCount} body sections with DELIBERATELY UNEVEN lengths (do not make them equal):`,
+    `OPENING: ${dirs.opening[bp.openingMove] || DEFAULT_BLUEPRINT_DIRECTIVES.opening[bp.openingMove]}`,
+    `TABLE OF CONTENTS: ${bp.includeToc ? dirs.tocOn : dirs.tocOff}`,
+    `BODY: ${dirs.bodyIntro.replace('{count}', String(bp.sectionCount))}`,
     lengths,
-    `FORMATTING ACCENT: ${ACCENT_DIRECTIVE[bp.accent]}`,
-    `FAQ: Place a ${bp.faqCount}-question FAQ ${bp.faqPlacement === 'woven' ? 'woven near the most relevant section' : 'near the end'}.`,
-    `CLOSING: ${CLOSE_DIRECTIVE[bp.closeMove]}`,
-    `POINT OF VIEW: Write in ${bp.pov}.`,
+    `FORMATTING ACCENT: ${dirs.accent[bp.accent] || DEFAULT_BLUEPRINT_DIRECTIVES.accent[bp.accent]}`,
+    `FAQ: ${dirs.faqLine.replace('{count}', String(bp.faqCount)).replace('{placement}', placement)}`,
+    `CLOSING: ${dirs.close[bp.closeMove] || DEFAULT_BLUEPRINT_DIRECTIVES.close[bp.closeMove]}`,
+    `POINT OF VIEW: ${dirs.povLine.replace('{pov}', bp.pov)}`,
   ].join('\n');
 }

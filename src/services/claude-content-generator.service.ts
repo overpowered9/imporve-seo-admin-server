@@ -17,9 +17,18 @@ import {
   blueprintDirective,
   variantFromWords,
   ContentBlueprint,
+  BlueprintDirectives,
+  DEFAULT_BLUEPRINT_DIRECTIVES,
+  mergeDirectives,
 } from './content-blueprint.js';
 
 const promptService = new PromptManagementService();
+
+// Default SEO-integration microcopy appended to the writer's user message. Tunable via the
+// `content_v2_seo_rules` DB template; falls back to this string.
+const DEFAULT_SEO_RULES =
+  "Use the main keyword naturally within the first 100 words. Weave in 3-4 of the audience's real " +
+  'phrases. Do not repeat any phrase more than twice.';
 
 export interface BrandProfile {
   business_name?: string;
@@ -165,6 +174,16 @@ export const V2_PROMPT_DEFS = {
     displayName: 'Content v2 — Humanizer (de-tell pass)',
     fallback: HUMANIZE_SYSTEM,
   },
+  blueprintDirectives: {
+    templateType: 'content_v2_blueprint_directives' as const,
+    displayName: 'Content v2 — Blueprint Directives (structure wording, JSON)',
+    fallback: JSON.stringify(DEFAULT_BLUEPRINT_DIRECTIVES, null, 2),
+  },
+  seoRules: {
+    templateType: 'content_v2_seo_rules' as const,
+    displayName: 'Content v2 — SEO Integration Rules',
+    fallback: DEFAULT_SEO_RULES,
+  },
 };
 
 async function getV2Prompt(def: { templateType: string; fallback: string }): Promise<string> {
@@ -184,12 +203,23 @@ export async function generateContentV2(params: GenerateV2Params): Promise<Gener
   const lang = params.content_lang || 'English (US)';
   const variant = variantFromWords(params.nos_of_words || '1200 to 2400 words');
 
-  // Resolve the three system prompts from DB (admin-tunable) with in-code fallback.
-  const [intelSystem, genSystem, humanizeSystem] = await Promise.all([
+  // Resolve all tunable prompts from DB (admin-tunable) with in-code fallback.
+  const [intelSystem, genSystem, humanizeSystem, directivesRaw, seoRules] = await Promise.all([
     getV2Prompt(V2_PROMPT_DEFS.intelligence),
     getV2Prompt(V2_PROMPT_DEFS.generation),
     getV2Prompt(V2_PROMPT_DEFS.humanize),
+    getV2Prompt(V2_PROMPT_DEFS.blueprintDirectives),
+    getV2Prompt(V2_PROMPT_DEFS.seoRules),
   ]);
+
+  // Parse the admin-edited blueprint directives (JSON); bad/partial JSON falls back per-key.
+  let directivesCfg: BlueprintDirectives;
+  try {
+    directivesCfg = mergeDirectives(JSON.parse(directivesRaw));
+  } catch {
+    console.warn('⚠️ v2 blueprint directives JSON invalid, using defaults');
+    directivesCfg = DEFAULT_BLUEPRINT_DIRECTIVES;
+  }
 
   // ---- Phase 1: intelligence JSON ----
   let intelligence: AudienceIntelligence | null = null;
@@ -224,11 +254,11 @@ Return JSON exactly in this shape:
     variant,
     seed: params.seed,
   });
-  const directive = blueprintDirective(blueprint);
+  const directive = blueprintDirective(blueprint, directivesCfg);
 
   // ---- Phase 3: single-pass generation ----
   const t3 = Date.now();
-  const genUser = buildGenerationUser(params, lang, intelligence, directive);
+  const genUser = buildGenerationUser(params, lang, intelligence, directive, seoRules);
   const maxTokens = variant === 'large' ? 12000 : variant === 'medium' ? 8000 : 5000;
   // Thinking OFF for the writing pass: the blueprint already plans structure, and on Sonnet
   // adaptive-thinking tokens consume the same max_tokens budget (starving the article).
@@ -237,7 +267,7 @@ Return JSON exactly in this shape:
   timings.generation = Date.now() - t3;
 
   let { article, trailer } = splitArticleAndTrailer(gen.text);
-  const meta = parseTrailer(trailer);
+  let meta = parseTrailer(trailer);
 
   // ---- Phase 4: humanization (optional) ----
   if (params.humanize !== false && article) {
@@ -255,6 +285,15 @@ Return JSON exactly in this shape:
       console.warn('⚠️ v2 humanize phase failed, using un-humanized article:', e);
     }
     timings.humanize = Date.now() - t4;
+  }
+
+  // Harden the output contract: if the model didn't emit a usable trailer (e.g. a prompt edit broke
+  // the format), recover meta + FAQ from the finished article so generation never returns empty SEO
+  // fields. This is the safety net that lets prompt engineers edit GEN_SYSTEM without bricking output.
+  if (!meta.meta_title || !meta.meta_description || meta.faq.length === 0) {
+    const tr = Date.now();
+    meta = await recoverMeta(article, params, meta, usage);
+    timings.meta_recovery = Date.now() - tr;
   }
 
   // ---- Phase 5: assembly ----
@@ -285,7 +324,8 @@ function buildGenerationUser(
   params: GenerateV2Params,
   lang: string,
   intel: AudienceIntelligence | null,
-  directive: string
+  directive: string,
+  seoRules: string
 ): string {
   const nicheData = params.niche_data && Object.keys(params.niche_data).length
     ? Object.entries(params.niche_data)
@@ -336,8 +376,8 @@ ${brandLines}
 PER-ARTICLE STRUCTURE BLUEPRINT (mandatory — follow exactly):
 ${directive}
 
-Use the main keyword naturally within the first 100 words. Weave in 3-4 of the audience's real phrases.
-Do not repeat any phrase more than twice. Remember the OUTPUT CONTRACT: article HTML, then ${TRAILER_DELIM}, then the JSON trailer.`;
+${seoRules}
+Remember the OUTPUT CONTRACT: article HTML, then ${TRAILER_DELIM}, then the JSON trailer.`;
 }
 
 function stripFences(s: string): string {
@@ -367,6 +407,50 @@ function parseTrailer(trailer: string): { meta_title: string; meta_description: 
     };
   } catch {
     return empty;
+  }
+}
+
+/**
+ * Safety net for the output contract. When the trailer is missing or partial, derive meta_title,
+ * meta_description and the FAQ pairs from the finished article. Only fills what's missing.
+ */
+async function recoverMeta(
+  article: string,
+  params: GenerateV2Params,
+  partial: { meta_title: string; meta_description: string; faq: FaqPair[] },
+  usage: Record<string, ClaudeUsage>
+): Promise<{ meta_title: string; meta_description: string; faq: FaqPair[] }> {
+  try {
+    const plain = article.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 4000);
+    const user = `From the article below, output ONLY JSON:
+{"meta_title": "50-60 chars, sentence case, includes the keyword naturally, no pipes/slashes",
+ "meta_description": "140-155 chars, pain then outcome, soft CTA, human voice",
+ "faq": [{"question": "...", "answer": "35-50 words"}]}
+The faq MUST be the same 3 Q/A that already appear in the article.
+Keyword: ${params.seed_keyword}
+
+Article:
+${plain}`;
+    const r = await claudeJSON<{ meta_title?: string; meta_description?: string; faq?: FaqPair[] }>({
+      system: 'You write SEO metadata. Return ONLY valid JSON, no prose, no fences.',
+      user,
+      maxTokens: 900,
+    });
+    usage.meta_recovery = r.usage;
+    const recovered = r.data || {};
+    const recoveredFaq = Array.isArray(recovered.faq)
+      ? recovered.faq
+          .filter((f) => f && f.question && f.answer)
+          .map((f) => ({ question: f.question.trim(), answer: f.answer.trim() }))
+      : [];
+    return {
+      meta_title: partial.meta_title || (recovered.meta_title || '').trim(),
+      meta_description: partial.meta_description || (recovered.meta_description || '').trim(),
+      faq: partial.faq.length ? partial.faq : recoveredFaq,
+    };
+  } catch (e) {
+    console.warn('⚠️ v2 meta recovery failed, returning partial meta:', e);
+    return partial;
   }
 }
 
