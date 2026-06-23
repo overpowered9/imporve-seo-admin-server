@@ -222,7 +222,6 @@ export function blueprintDirective(
   const placement = bp.faqPlacement === 'woven' ? dirs.faqWoven : dirs.faqEnd;
   return [
     `OPENING: ${dirs.opening[bp.openingMove] || DEFAULT_BLUEPRINT_DIRECTIVES.opening[bp.openingMove]}`,
-    `TABLE OF CONTENTS: ${bp.includeToc ? dirs.tocOn : dirs.tocOff}`,
     `BODY: ${dirs.bodyIntro.replace('{count}', String(bp.sectionCount))}`,
     lengths,
     `FORMATTING ACCENT: ${dirs.accent[bp.accent] || DEFAULT_BLUEPRINT_DIRECTIVES.accent[bp.accent]}`,

@@ -12,6 +12,7 @@
 
 import { claudeText, claudeJSON, parseJsonLoose, ClaudeUsage } from './claude.service.js';
 import { PromptManagementService } from './prompt-management.service.js';
+import { config } from '../config/config.js';
 import {
   buildBlueprint,
   blueprintDirective,
@@ -122,20 +123,41 @@ NON-NEGOTIABLE VOICE RULES (these defeat AI-detection):
 
 BANNED words/phrases — never use any of these: ${BANNED}
 
-STRUCTURE PHILOSOPHY:
-- Follow the per-article blueprint you are given EXACTLY. Do not fall back to a generic
-  intro → equal sections → conclusion → FAQ template. The blueprint's opening move, uneven section
-  lengths, formatting accent, FAQ placement, and closing move are mandatory.
+REQUIRED ARTICLE STRUCTURE — you MUST produce every one of these sections, in this exact order. The
+blueprint controls HOW you write (opening style, number of body sections, deliberately uneven lengths,
+formatting accent, closing style) — it never removes a section. Missing any section is a failure.
+
+1. INTRODUCTION — 2 to 3 short paragraphs, NO heading. Apply the blueprint's opening move. Use the main
+   keyword naturally within the first 100 words. Do NOT write a "Table of Contents" anywhere; it is
+   added automatically after you finish.
+2. QUICK ANSWER — "<h2>Quick answer</h2>" then exactly ONE <p> of 40-60 words that directly answers the
+   core question (written for Google featured snippets and voice search).
+3. MAIN BODY — the number of <h2> sections the blueprint specifies, with deliberately UNEVEN lengths.
+   Each section starts with a specific, descriptive <h2> heading (benefit- or question-led, never generic
+   like "Overview" or "Introduction"). Use <h3> sub-points only where they genuinely help. Apply the
+   blueprint's formatting accent. Weave in the business/niche details and the audience's real phrases, and
+   put the blueprint's local-proof angle in one of these sections.
+4. KEY TAKEAWAYS — "<h2>Key takeaways</h2>" then ONE <ul> of 3 to 5 concrete, specific bullet points
+   (no filler, no restating the intro).
+5. CONCLUSION — one <h2> with a natural, specific heading (NEVER just the word "Conclusion", and never
+   begin a sentence with "In conclusion"). Apply the blueprint's closing move.
+6. FREQUENTLY ASKED QUESTIONS — "<h2>Frequently asked questions</h2>" then EXACTLY 3 question/answer
+   pairs, each in this EXACT HTML and nothing else (no <ul>, no numbering):
+   <p><strong>Q: the exact question?</strong></p>
+   <p>A: a direct answer in 35-50 words.</p>
+   One of the three MUST be the provided AI/voice-search question.
+7. WHAT'S NEXT — "<h2>What's next</h2>" then 2 to 4 sentences that deliver the provided call to action
+   naturally (do not use "Don't hesitate" or "Feel free"). If a CTA link is provided, include the raw URL
+   so it can be linked.
 
 OUTPUT CONTRACT (follow precisely):
-- First output the article as clean HTML using <h2>/<h3>/<p> and, only if the blueprint asks for it,
-  one <ul> or one simple <table>. No <html>/<body> wrapper, no markdown, no commentary.
-- The article body MUST contain the FAQ as HTML (each question in <strong> tags).
-- Then output a line containing exactly: ${TRAILER_DELIM}
-- Then output ONE JSON object: {"meta_title": "...", "meta_description": "...", "faq": [{"question":"...","answer":"..."}]}
+- Output the article as clean HTML using <h2>/<h3>/<p>/<ul>/<li> (and at most one <table> if the accent
+  calls for it). No <h1>, no <html>/<body> wrapper, no markdown, no commentary, no code fences.
+- After the article, output a line containing exactly: ${TRAILER_DELIM}
+- Then ONE JSON object: {"meta_title": "...", "meta_description": "...", "faq": [{"question":"...","answer":"..."}]}
   - meta_title: 50-60 characters, sentence case, keyword included naturally, no pipes/slashes.
   - meta_description: 140-155 characters, addresses the pain then the outcome, soft CTA, sounds human.
-  - faq: the SAME questions and answers that appear in the article body (answers 35-50 words).
+  - faq: the SAME 3 questions and answers that appear in the FAQ section.
 Output nothing after the JSON object.`;
 
 const HUMANIZE_SYSTEM = `You are a ruthless line editor whose only job is to remove machine-writing tells
@@ -149,7 +171,10 @@ Apply every pass:
   openers ("Absolutely,", "Certainly,", "Of course,", "Great question").
 - Replace any banned buzzwords (utilize→use, leverage→use, robust, seamless, game-changer, comprehensive,
   elevate, unlock) with plain words.
-- Keep all HTML tags and the FAQ intact. Do NOT add commentary.
+- PRESERVE STRUCTURE EXACTLY: keep every <h2>/<h3> heading, the Quick answer, every body section, the
+  Key takeaways <ul>, the Conclusion, all 3 FAQ pairs (each "<p><strong>Q: ...?</strong></p>" + answer),
+  and the What's next section. Do NOT drop, merge, reorder, or rename sections. Edit prose only.
+- Keep all HTML tags intact. Do NOT add commentary.
 
 Return ONLY the revised HTML article — no explanation, no JSON.`;
 
@@ -259,10 +284,10 @@ Return JSON exactly in this shape:
   // ---- Phase 3: single-pass generation ----
   const t3 = Date.now();
   const genUser = buildGenerationUser(params, lang, intelligence, directive, seoRules);
-  const maxTokens = variant === 'large' ? 12000 : variant === 'medium' ? 8000 : 5000;
-  // Thinking OFF for the writing pass: the blueprint already plans structure, and on Sonnet
-  // adaptive-thinking tokens consume the same max_tokens budget (starving the article).
-  const gen = await claudeText({ system: genSystem, user: genUser, maxTokens, thinking: false });
+  const maxTokens = variant === 'large' ? 12000 : variant === 'medium' ? 8000 : 6000;
+  // Thinking OFF for the writing pass: the blueprint already plans structure, and adaptive-thinking
+  // tokens consume the same max_tokens budget (starving the article). Use the higher-quality write model.
+  const gen = await claudeText({ system: genSystem, user: genUser, maxTokens, thinking: false, model: config.anthropicWriteModel });
   usage.generation = gen.usage;
   timings.generation = Date.now() - t3;
 
@@ -278,6 +303,7 @@ Return JSON exactly in this shape:
         user: article,
         maxTokens,
         thinking: false,
+        model: config.anthropicWriteModel,
       });
       if (h.text && h.text.length > 100) article = stripFences(h.text);
       usage.humanize = h.usage;
@@ -301,8 +327,11 @@ Return JSON exactly in this shape:
   // won't reliably self-limit. Convert spaced/standalone em-dashes to commas (keeps en-dashes in
   // numeric ranges like "$180–$350" untouched).
   article = article.replace(/\s*—\s*/g, ', ');
-  const ctaHtml = buildCtaHtml(params);
-  const content = `<div class="improveseo-v2-content">${article}${ctaHtml}</div>`;
+  // Build the Table of Contents deterministically from the H2 headings (reliable, always present),
+  // ensuring every heading has a matching id. Then linkify any bare URLs (e.g. the CTA link).
+  article = injectTableOfContents(article);
+  article = linkifyUrls(article);
+  const content = `<div class="improveseo-v2-content">${article}</div>`;
   const faqSchema = buildFaqSchema(meta.faq);
 
   return {
@@ -373,11 +402,15 @@ ${nicheData}
 BRAND PROFILE:
 ${brandLines}
 
+CALL TO ACTION (deliver this in the "What's next" section):
+  - Message: ${params.call_to_action && params.call_to_action.trim() ? params.call_to_action.trim() : '(none — write a natural closing nudge to get in touch)'}
+  - Link: ${params.cta_url && params.cta_url.trim() ? params.cta_url.trim() : '(none)'}
+
 PER-ARTICLE STRUCTURE BLUEPRINT (mandatory — follow exactly):
 ${directive}
 
 ${seoRules}
-Remember the OUTPUT CONTRACT: article HTML, then ${TRAILER_DELIM}, then the JSON trailer.`;
+Produce ALL required sections (Intro, Quick answer, the body sections, Key takeaways, Conclusion, FAQ, What's next). Remember the OUTPUT CONTRACT: article HTML, then ${TRAILER_DELIM}, then the JSON trailer.`;
 }
 
 function stripFences(s: string): string {
@@ -454,14 +487,63 @@ ${plain}`;
   }
 }
 
-function buildCtaHtml(params: GenerateV2Params): string {
-  const cta = (params.call_to_action || '').trim();
-  if (!cta) return '';
-  const url = (params.cta_url || '').trim();
-  const text = url
-    ? `${cta} <a href="${url}" target="_blank" rel="noopener">${url}</a>`
-    : cta;
-  return `<p class="improveseo-cta">${text}</p>`;
+function slugify(text: string): string {
+  return text
+    .replace(/<[^>]+>/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .trim()
+    .replace(/[\s-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/**
+ * Build a linked Table of Contents from the article's <h2> headings and ensure every heading has a
+ * matching id. Reliable and always present (no dependence on the model writing correct anchors).
+ * Inserts the TOC right after the intro (before the first <h2>).
+ */
+function injectTableOfContents(html: string): string {
+  const used = new Set<string>();
+  const headings: { id: string; text: string }[] = [];
+
+  html = html.replace(/<h2(\s[^>]*)?>([\s\S]*?)<\/h2>/gi, (_m, attrs: string, inner: string) => {
+    const rawAttrs = attrs || '';
+    const text = inner.replace(/<[^>]+>/g, '').trim();
+    let id = '';
+    const idMatch = rawAttrs.match(/id=["']([^"']+)["']/i);
+    if (idMatch) {
+      id = idMatch[1];
+    } else {
+      const base = slugify(text) || 'section';
+      id = base;
+      let n = 2;
+      while (used.has(id)) id = `${base}-${n++}`;
+    }
+    used.add(id);
+    headings.push({ id, text });
+    const attrsWithId = /id=/.test(rawAttrs) ? rawAttrs : ` id="${id}"${rawAttrs}`;
+    return `<h2${attrsWithId}>${inner}</h2>`;
+  });
+
+  if (headings.length < 2) return html; // too small to warrant a TOC
+
+  const items = headings.map((h) => `<li><a href="#${h.id}">${h.text}</a></li>`).join('');
+  const toc = `<h2 id="table-of-contents">Table of Contents</h2><ol class="improveseo-toc">${items}</ol>`;
+
+  const firstH2 = html.search(/<h2[\s>]/i);
+  return firstH2 === -1 ? html : html.slice(0, firstH2) + toc + html.slice(firstH2);
+}
+
+/** Convert bare http(s) URLs (e.g. the CTA link) into anchors, leaving existing <a> tags untouched. */
+function linkifyUrls(html: string): string {
+  const anchors: string[] = [];
+  html = html.replace(/<a\b[^>]*>[\s\S]*?<\/a>/gi, (m) => {
+    anchors.push(m);
+    return `__ISEO_A${anchors.length - 1}__`;
+  });
+  html = html.replace(/(https?:\/\/[^\s<>"')]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+  html = html.replace(/__ISEO_A(\d+)__/g, (_m, i) => anchors[parseInt(i, 10)]);
+  return html;
 }
 
 function buildFaqSchema(faq: FaqPair[]): Record<string, unknown> {

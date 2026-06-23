@@ -9,7 +9,10 @@ export const config = {
   openaiApiKey: process.env.OPENAI_API_KEY || '',
   openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
+  // Default model for cheaper structured calls (intelligence/meta recovery).
   anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-opus-4-8',
+  // Higher-quality model for the article writing + humanization passes.
+  anthropicWriteModel: process.env.ANTHROPIC_WRITE_MODEL || 'claude-opus-4-8',
   fluxAiApiKey: process.env.FLUX_AI_API_KEY || '',
   stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',

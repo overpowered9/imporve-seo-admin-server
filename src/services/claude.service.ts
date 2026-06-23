@@ -19,7 +19,8 @@ export function getAnthropic(): Anthropic {
     throw new Error('ANTHROPIC_API_KEY is not set — required for the v2 content route');
   }
   if (!client) {
-    client = new Anthropic({ apiKey: config.anthropicApiKey });
+    // Retry transient 429/500/529 (overloaded) responses — the API can be briefly overloaded.
+    client = new Anthropic({ apiKey: config.anthropicApiKey, maxRetries: 4 });
   }
   return client;
 }
@@ -34,6 +35,8 @@ export interface ClaudeCallOptions {
   thinking?: boolean;
   /** Put cache_control on the system block (default true). */
   cacheSystem?: boolean;
+  /** Override the model for this call (defaults to config.anthropicModel). */
+  model?: string;
 }
 
 export interface ClaudeUsage {
@@ -61,7 +64,7 @@ export async function claudeText(
 ): Promise<{ text: string; usage: ClaudeUsage }> {
   const anthropic = getAnthropic();
   const stream = anthropic.messages.stream({
-    model: config.anthropicModel,
+    model: opts.model ?? config.anthropicModel,
     max_tokens: opts.maxTokens ?? 8000,
     system: buildSystem(opts.system, opts.cacheSystem),
     messages: [{ role: 'user', content: opts.user }],
@@ -77,7 +80,7 @@ export async function claudeJSON<T = unknown>(
 ): Promise<{ data: T; raw: string; usage: ClaudeUsage }> {
   const anthropic = getAnthropic();
   const message = await anthropic.messages.create({
-    model: config.anthropicModel,
+    model: opts.model ?? config.anthropicModel,
     max_tokens: opts.maxTokens ?? 2500,
     system: buildSystem(opts.system, opts.cacheSystem),
     messages: [{ role: 'user', content: opts.user }],
