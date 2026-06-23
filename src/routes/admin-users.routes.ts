@@ -480,31 +480,40 @@ router.post('/:userId/gift-credits', async (req, res) => {
         SELECT id FROM credit_balances WHERE user_id = ${userId} AND credit_type = ${credit_type} LIMIT 1
       `;
 
+      // Admin adjustments operate on the PURCHASED bucket so manual grants persist across
+      // billing cycles (a monthly refill only resets the plan/included bucket). `amount`
+      // is a generated column (included + purchased) and cannot be written directly.
       if (existing.length > 0) {
         if (operation === 'add') {
           await tx`
             UPDATE credit_balances
-            SET amount = amount + ${amount}, updated_at = NOW()
+            SET purchased_remaining = purchased_remaining + ${amount}, updated_at = NOW()
             WHERE user_id = ${userId} AND credit_type = ${credit_type}
           `;
         } else if (operation === 'remove') {
+          // Remove from the total balance, draining purchased first then included.
           await tx`
             UPDATE credit_balances
-            SET amount = GREATEST(0, amount - ${amount}), updated_at = NOW()
+            SET
+              purchased_remaining = GREATEST(0, purchased_remaining - ${amount}),
+              included_remaining  = GREATEST(0, included_remaining - GREATEST(0, ${amount} - purchased_remaining)),
+              updated_at = NOW()
             WHERE user_id = ${userId} AND credit_type = ${credit_type}
           `;
         } else {
+          // "Set to X" targets the purchased bucket and clears the included bucket so the
+          // visible total equals exactly X.
           await tx`
             UPDATE credit_balances
-            SET amount = ${amount}, updated_at = NOW()
+            SET purchased_remaining = ${amount}, included_remaining = 0, updated_at = NOW()
             WHERE user_id = ${userId} AND credit_type = ${credit_type}
           `;
         }
       } else {
         const insertAmount = operation === 'remove' ? 0 : amount;
         await tx`
-          INSERT INTO credit_balances (user_id, credit_type, amount)
-          VALUES (${userId}, ${credit_type}, ${insertAmount})
+          INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
+          VALUES (${userId}, ${credit_type}, 0, 0, ${insertAmount}, NOW())
         `;
       }
 

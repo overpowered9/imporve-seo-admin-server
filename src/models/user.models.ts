@@ -32,9 +32,27 @@ export interface CreditBalance {
   id: number;
   user_id: number;
   credit_type: 'images' | 'content' | 'keywords';
+  /** Plan-included credits remaining; reset to included_allotment each billing cycle. */
+  included_remaining: number;
+  /** Purchased (top-up) credits remaining; persist across cycles, never wiped by refills. */
+  purchased_remaining: number;
+  /** Snapshot of the plan allotment at the last refill — used for "X of Y used" displays. */
+  included_allotment: number;
+  /** When included_remaining was last reset — used for "resets in N days". */
+  cycle_started_at: Date;
+  /** Effective balance = included_remaining + purchased_remaining (generated column). */
   amount: number;
   updated_at: Date;
 }
+
+type CreditType = 'images' | 'content' | 'keywords';
+const CREDIT_TYPES: CreditType[] = ['images', 'content', 'keywords'];
+
+const planAllotment = (plan: any, creditType: CreditType): number => {
+  if (creditType === 'images') return plan.image_credits;
+  if (creditType === 'content') return plan.content_credits;
+  return plan.keyword_credits;
+};
 
 // Add these interfaces to existing ones
 export interface SubscriptionPlan {
@@ -125,13 +143,14 @@ export const initializeUserCredits = async (user_id: number, plan_id?: number): 
   
   const planData = plan[0] as SubscriptionPlan;
   
-  // Initialize credit balances (one-time for free tier, monthly for paid)
+  // Initialize credit balances. New users start with the plan allotment as their
+  // included (plan) credits and zero purchased credits.
   await sql`
-    INSERT INTO credit_balances (user_id, credit_type, amount)
-    VALUES 
-      (${user_id}, 'images', ${planData.image_credits}),
-      (${user_id}, 'content', ${planData.content_credits}),
-      (${user_id}, 'keywords', ${planData.keyword_credits})
+    INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
+    VALUES
+      (${user_id}, 'images', ${planData.image_credits}, ${planData.image_credits}, 0, NOW()),
+      (${user_id}, 'content', ${planData.content_credits}, ${planData.content_credits}, 0, NOW()),
+      (${user_id}, 'keywords', ${planData.keyword_credits}, ${planData.keyword_credits}, 0, NOW())
   `;
   
   // ONLY create subscription record for PAID plans
@@ -215,11 +234,125 @@ export const getUserCreditBalance = async (user_id: number, credit_type: string)
 
 export const getUserCreditBalances = async (user_id: number): Promise<CreditBalance[]> => {
   const result = await sql`
-    SELECT * FROM credit_balances 
+    SELECT * FROM credit_balances
     WHERE user_id = ${user_id}
     ORDER BY credit_type
   `;
   return result as unknown as CreditBalance[];
+};
+
+/**
+ * Reset the PLAN (included) credits to the plan allotment for all credit types and
+ * stamp a new cycle. Purchased credits are intentionally left untouched.
+ *
+ * Called on subscription creation and on every successful monthly invoice. Idempotent.
+ */
+export const refillPlanCredits = async (user_id: number, plan: any, reason = 'Plan credits refill'): Promise<void> => {
+  await sql.begin(async sql => {
+    for (const creditType of CREDIT_TYPES) {
+      const allotment = planAllotment(plan, creditType);
+      await sql`
+        INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
+        VALUES (${user_id}, ${creditType}, ${allotment}, ${allotment}, 0, NOW())
+        ON CONFLICT (user_id, credit_type)
+        DO UPDATE SET
+          included_remaining = ${allotment},
+          included_allotment = ${allotment},
+          cycle_started_at   = NOW(),
+          updated_at         = NOW()
+      `;
+      await sql`
+        INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
+        VALUES (${user_id}, ${creditType}, ${allotment}, ${reason})
+      `;
+    }
+  });
+};
+
+/**
+ * Add PURCHASED (top-up) credits to a single credit type. These persist across billing
+ * cycles and are never wiped by a refill. Upserts so it works even if no row exists yet.
+ */
+export const addPurchasedCredits = async (
+  user_id: number,
+  credit_type: CreditType,
+  quantity: number,
+  reason = 'Credit purchase'
+): Promise<void> => {
+  await sql.begin(async sql => {
+    await sql`
+      INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
+      VALUES (${user_id}, ${credit_type}, 0, 0, ${quantity}, NOW())
+      ON CONFLICT (user_id, credit_type)
+      DO UPDATE SET
+        purchased_remaining = credit_balances.purchased_remaining + ${quantity},
+        updated_at = NOW()
+    `;
+    await sql`
+      INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
+      VALUES (${user_id}, ${credit_type}, ${quantity}, ${reason})
+    `;
+  });
+};
+
+/**
+ * Apply an immediate plan upgrade: raise the included allotment to the new plan and grant
+ * the positive difference to the user's included balance right now (prorated upgrade bump).
+ * Purchased credits are untouched.
+ */
+export const upgradeIncludedCredits = async (user_id: number, newPlan: any, reason = 'Plan upgrade'): Promise<void> => {
+  await sql.begin(async sql => {
+    for (const creditType of CREDIT_TYPES) {
+      const newAllotment = planAllotment(newPlan, creditType);
+      const rows = await sql`
+        SELECT included_allotment FROM credit_balances
+        WHERE user_id = ${user_id} AND credit_type = ${creditType}
+        LIMIT 1
+      `;
+      const oldAllotment = rows.length > 0 ? Number(rows[0].included_allotment) : 0;
+      const bump = Math.max(0, newAllotment - oldAllotment);
+
+      await sql`
+        INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
+        VALUES (${user_id}, ${creditType}, ${newAllotment}, ${newAllotment}, 0, NOW())
+        ON CONFLICT (user_id, credit_type)
+        DO UPDATE SET
+          included_allotment = ${newAllotment},
+          included_remaining = credit_balances.included_remaining + ${bump},
+          updated_at = NOW()
+      `;
+      if (bump > 0) {
+        await sql`
+          INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
+          VALUES (${user_id}, ${creditType}, ${bump}, ${reason})
+        `;
+      }
+    }
+  });
+};
+
+/**
+ * Suspend access by zeroing the PLAN (included) credits only — e.g. on a failed renewal
+ * or a bad subscription status. Purchased credits are preserved (the user paid for them).
+ */
+export const suspendPlanCredits = async (user_id: number, reason = 'Subscription suspended'): Promise<void> => {
+  await sql.begin(async sql => {
+    const rows = await sql`
+      SELECT credit_type, included_remaining FROM credit_balances
+      WHERE user_id = ${user_id} AND included_remaining > 0
+    `;
+    await sql`
+      UPDATE credit_balances
+      SET included_remaining = 0, updated_at = NOW()
+      WHERE user_id = ${user_id}
+    `;
+    for (const row of rows) {
+      await sql`
+        INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
+        VALUES (${user_id}, ${row.credit_type}, ${-Number(row.included_remaining)}, ${reason})
+      `;
+    }
+  });
 };
 
 export const getUserSubscription = async (user_id: number) => {
@@ -268,12 +401,12 @@ export const changePlan = async (
   }
 
   if (immediate) {
-    // UPGRADE: Immediate effect + add credits
+    // UPGRADE: Immediate effect + raise included allotment / grant the difference now.
     await sql.begin(async sql => {
       // Update subscription
       await sql`
         UPDATE subscriptions
-        SET 
+        SET
           previous_plan_id = plan_id,
           plan_id = ${new_plan_id}
         WHERE user_id = ${user_id}
@@ -285,41 +418,14 @@ export const changePlan = async (
         SET plan_id = ${new_plan_id}
         WHERE id = ${user_id}
       `;
-
-      // ADD credits (not replace)
-      const newPlan = await sql`SELECT * FROM subscription_plans WHERE id = ${new_plan_id}`;
-      if (newPlan.length > 0) {
-        const plan = newPlan[0];
-        
-        // Add credits to existing balance
-        await sql`
-          UPDATE credit_balances
-          SET amount = amount + ${plan.image_credits}, updated_at = NOW()
-          WHERE user_id = ${user_id} AND credit_type = 'images'
-        `;
-        
-        await sql`
-          UPDATE credit_balances
-          SET amount = amount + ${plan.content_credits}, updated_at = NOW()
-          WHERE user_id = ${user_id} AND credit_type = 'content'
-        `;
-        
-        await sql`
-          UPDATE credit_balances
-          SET amount = amount + ${plan.keyword_credits}, updated_at = NOW()
-          WHERE user_id = ${user_id} AND credit_type = 'keywords'
-        `;
-
-        // Log credit additions
-        await sql`
-          INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
-          VALUES 
-            (${user_id}, 'images', ${plan.image_credits}, 'Plan upgrade credit bonus'),
-            (${user_id}, 'content', ${plan.content_credits}, 'Plan upgrade credit bonus'),
-            (${user_id}, 'keywords', ${plan.keyword_credits}, 'Plan upgrade credit bonus')
-        `;
-      }
     });
+
+    // Raise the included allotment to the new plan and grant the upgrade difference.
+    // Purchased (top-up) credits are preserved. Runs in its own transaction.
+    const newPlan = await sql`SELECT * FROM subscription_plans WHERE id = ${new_plan_id}`;
+    if (newPlan.length > 0) {
+      await upgradeIncludedCredits(user_id, newPlan[0], 'Plan upgrade credit bonus');
+    }
   } else {
     // DOWNGRADE: Schedule for next billing date
     await sql`
@@ -451,20 +557,33 @@ export const deductCredits = async (
   generation_id?: number
 ) => {
   await sql.begin(async sql => {
-    // Deduct credits
+    // Drain PLAN (included) credits first so the expiring allotment is used before the
+    // purchased credits the user paid extra for. Any remainder comes out of purchased.
+    const rows = await sql`
+      SELECT included_remaining, purchased_remaining FROM credit_balances
+      WHERE user_id = ${user_id} AND credit_type = ${credit_type}
+      LIMIT 1
+    `;
+    const included = rows.length > 0 ? Number(rows[0].included_remaining) : 0;
+    const fromIncluded = Math.min(included, amount);
+    const fromPurchased = amount - fromIncluded;
+
     await sql`
-      UPDATE credit_balances 
-      SET amount = amount - ${amount}, updated_at = NOW()
+      UPDATE credit_balances
+      SET
+        included_remaining  = included_remaining - ${fromIncluded},
+        purchased_remaining = purchased_remaining - ${fromPurchased},
+        updated_at = NOW()
       WHERE user_id = ${user_id} AND credit_type = ${credit_type}
     `;
-    
+
     // Log transaction with website_id and generation_id
     await sql`
       INSERT INTO credit_transactions (user_id, credit_type, delta, reason, website_id, generation_id)
       VALUES (
-        ${user_id}, 
-        ${credit_type}, 
-        ${-amount}, 
+        ${user_id},
+        ${credit_type},
+        ${-amount},
         ${reason},
         ${website_id || null},
         ${generation_id || null}

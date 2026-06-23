@@ -2,15 +2,18 @@ import express, { Request, Response } from 'express';
 import Stripe from 'stripe';
 import { z } from 'zod';
 import sql from '../data/db.js';
-import { 
-  findUserByEmail, 
-  getUserCreditBalances, 
+import {
+  findUserByEmail,
+  getUserCreditBalances,
   getUserSubscription,
   getAllSubscriptionPlans,
   changePlan,
   pauseSubscription,
   resumeSubscription,
-  cancelSubscription
+  cancelSubscription,
+  refillPlanCredits,
+  addPurchasedCredits,
+  suspendPlanCredits
 } from '../models/user.models.js';
 
 const router = express.Router();
@@ -19,6 +22,114 @@ const router = express.Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
   apiVersion: '2025-10-29.clover'
 });
+
+/**
+ * Append the Stripe checkout session id to a success URL using the correct
+ * separator. Stripe replaces {CHECKOUT_SESSION_ID} at redirect time.
+ * Using a fixed `?` breaks URLs that already contain a query string.
+ */
+const withSessionId = (url: string): string => {
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}session_id={CHECKOUT_SESSION_ID}`;
+};
+
+/**
+ * Create/refresh a user's subscription row and refill their credits in the DB.
+ *
+ * This is intentionally idempotent (subscription row keyed on user_id, credit
+ * balances REPLACED to the plan amount). It is called both synchronously when a
+ * subscription is created via a saved card (so the user gets credits instantly,
+ * regardless of webhook timing/health) and from the customer.subscription.created
+ * webhook. Running both is safe — they converge to the same end state.
+ */
+const activateSubscriptionInDb = async (params: {
+  userId: number;
+  planId: number;
+  stripeSubscriptionId: string;
+  stripeCustomerId: string;
+  nextBillingTimestamp: number;
+}): Promise<void> => {
+  const { userId, planId, stripeSubscriptionId, stripeCustomerId, nextBillingTimestamp } = params;
+
+  await sql`
+    INSERT INTO subscriptions (
+      user_id, plan_id, status, stripe_subscription_id, stripe_customer_id, start_date, next_billing_date
+    )
+    VALUES (
+      ${userId}, ${planId}, 'active', ${stripeSubscriptionId}, ${stripeCustomerId}, NOW(), TO_TIMESTAMP(${nextBillingTimestamp})
+    )
+    ON CONFLICT (user_id)
+    DO UPDATE SET
+      plan_id = ${planId},
+      status = 'active',
+      stripe_subscription_id = ${stripeSubscriptionId},
+      stripe_customer_id = ${stripeCustomerId},
+      next_billing_date = TO_TIMESTAMP(${nextBillingTimestamp}),
+      cancel_at_period_end = FALSE,
+      pending_plan_id = NULL,
+      pending_plan_effective_date = NULL
+  `;
+
+  await sql`
+    UPDATE users SET plan_id = ${planId}, updated_at = NOW() WHERE id = ${userId}
+  `;
+
+  const planResult = await sql`SELECT * FROM subscription_plans WHERE id = ${planId}`;
+  if (planResult.length > 0) {
+    // Reset the plan (included) credits; purchased top-ups are preserved.
+    await refillPlanCredits(userId, planResult[0], 'Subscription activated');
+  }
+};
+
+/**
+ * Apply a one-time credit top-up exactly once for a given checkout session.
+ *
+ * The claim is keyed on the *session id* (not the webhook event id) so the
+ * webhook and the synchronous /verify-session endpoint can never double-credit:
+ * whichever runs first wins the claim, the other no-ops.
+ *
+ * Returns true if this call applied the credits, false if it was already applied
+ * (or the session lacked the metadata needed to apply it).
+ */
+const applyCreditTopupOnce = async (session: Stripe.Checkout.Session): Promise<boolean> => {
+  const claimId = `topup_${session.id}`;
+
+  const claim = await sql`
+    INSERT INTO stripe_webhook_events (event_id, event_type, processed)
+    VALUES (${claimId}, 'credit_topup', false)
+    ON CONFLICT (event_id) DO NOTHING
+    RETURNING event_id
+  `;
+
+  // Someone else already claimed (and is applying / has applied) this session.
+  if (claim.length === 0) return false;
+
+  const userId = parseInt(session.metadata?.user_id || '0');
+  const creditType = session.metadata?.credit_type as 'images' | 'content' | 'keywords' | undefined;
+  const quantity = parseInt(session.metadata?.quantity || '0');
+
+  if (!userId || !creditType || !quantity) {
+    await sql`
+      UPDATE stripe_webhook_events
+      SET processed = true, processed_at = NOW(), error_message = 'missing credit_topup metadata'
+      WHERE event_id = ${claimId}
+    `;
+    return false;
+  }
+
+  // Add to the PURCHASED bucket so these credits persist across billing cycles
+  // and are never wiped by a monthly refill.
+  await addPurchasedCredits(userId, creditType, quantity, 'Credit purchase via Stripe');
+
+  await sql`
+    UPDATE stripe_webhook_events
+    SET processed = true, processed_at = NOW()
+    WHERE event_id = ${claimId}
+  `;
+
+  console.log(`✅ Applied top-up of ${quantity} ${creditType} credits to user ${userId} (session ${session.id})`);
+  return true;
+};
 
 // Validation schemas
 const createCheckoutSessionSchema = z.object({
@@ -73,7 +184,7 @@ router.post('/create-checkout-session', async (req: Request, res: Response) => {
         },
       ],
       mode: 'subscription',
-      success_url: `${success_url}?session_id={CHECKOUT_SESSION_ID}`,
+      success_url: withSessionId(success_url),
       cancel_url: cancel_url,
       metadata: {
         user_id: user_id.toString()
@@ -144,7 +255,7 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
         },
       ],
       mode: 'payment',
-      success_url: `${success_url}?session_id={CHECKOUT_SESSION_ID}`,
+      success_url: withSessionId(success_url),
       cancel_url: cancel_url,
       metadata: {
         user_id: user_id.toString(),
@@ -227,7 +338,7 @@ router.post('/upgrade-plan', async (req: Request, res: Response) => {
         },
       ],
       mode: 'subscription',
-      success_url: `${success_url}?session_id={CHECKOUT_SESSION_ID}`,
+      success_url: withSessionId(success_url),
       cancel_url: cancel_url,
       metadata: {
         user_id: user_id.toString(),
@@ -308,22 +419,8 @@ router.post('/webhook', async (req: Request, res: Response) => {
         const purchaseType = session.metadata?.purchase_type;
 
         if (purchaseType === 'credit_topup') {
-          // Handle credit purchase
-          const creditType = session.metadata?.credit_type as 'images' | 'content' | 'keywords';
-          const quantity = parseInt(session.metadata?.quantity || '0');
-
-          await sql`
-            UPDATE credit_balances
-            SET amount = amount + ${quantity}, updated_at = NOW()
-            WHERE user_id = ${userId} AND credit_type = ${creditType}
-          `;
-
-          await sql`
-            INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
-            VALUES (${userId}, ${creditType}, ${quantity}, 'Credit purchase via Stripe')
-          `;
-
-          console.log(`✅ Added ${quantity} ${creditType} credits to user ${userId}`);
+          // Idempotent (session-keyed) so a later /verify-session call can't double-credit.
+          await applyCreditTopupOnce(session);
         } else {
           // Handle subscription/plan upgrade (checkout completed)
           const planId = parseInt(session.metadata?.plan_id || '1');
@@ -374,58 +471,15 @@ router.post('/webhook', async (req: Request, res: Response) => {
           // Calculate next billing date (use current_period_end timestamp)
           const nextBillingTimestamp = (subscription as any).current_period_end || Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
 
-          // Update or create subscription (user_id is UNIQUE)
-          await sql`
-            INSERT INTO subscriptions (
-              user_id, 
-              plan_id, 
-              status, 
-              stripe_subscription_id,
-              stripe_customer_id,
-              start_date,
-              next_billing_date
-            )
-            VALUES (
-              ${userId}, 
-              ${planId}, 
-              'active', 
-              ${subscription.id},
-              ${subscription.customer as string},
-              NOW(),
-              TO_TIMESTAMP(${nextBillingTimestamp})
-            )
-            ON CONFLICT (user_id) 
-            DO UPDATE SET 
-              plan_id = ${planId},
-              status = 'active',
-              stripe_subscription_id = ${subscription.id},
-              stripe_customer_id = ${subscription.customer as string},
-              next_billing_date = TO_TIMESTAMP(${nextBillingTimestamp})
-          `;
+          await activateSubscriptionInDb({
+            userId,
+            planId,
+            stripeSubscriptionId: subscription.id,
+            stripeCustomerId: subscription.customer as string,
+            nextBillingTimestamp,
+          });
 
-          // Also update user's plan_id for consistency with account info display
-          await sql`
-            UPDATE users SET plan_id = ${planId}, updated_at = NOW()
-            WHERE id = ${userId}
-          `;
-
-          // Refill credits based on new plan
-          const planResult = await sql`SELECT * FROM subscription_plans WHERE id = ${planId}`;
-          if (planResult.length > 0) {
-            const plan = planResult[0];
-
-            await sql`
-              INSERT INTO credit_balances (user_id, credit_type, amount)
-              VALUES 
-                (${userId}, 'images', ${plan.image_credits}),
-                (${userId}, 'content', ${plan.content_credits}),
-                (${userId}, 'keywords', ${plan.keyword_credits})
-              ON CONFLICT (user_id, credit_type)
-              DO UPDATE SET amount = EXCLUDED.amount, updated_at = NOW()
-            `;
-
-            console.log(`✅ Subscription created for user ${userId}, plan ${planId}, credits refilled`);
-          }
+          console.log(`✅ Subscription created for user ${userId}, plan ${planId}, credits refilled`);
         } else {
           console.warn(`⚠️ Could not determine user_id for subscription ${subscription.id}`);
         }
@@ -454,15 +508,12 @@ router.post('/webhook', async (req: Request, res: Response) => {
             WHERE stripe_subscription_id = ${subscription.id}
           `;
 
-          // ✅ CRITICAL: Revoke credits if subscription becomes unpayable
+          // ✅ CRITICAL: Revoke PLAN credits if subscription becomes unpayable.
+          // Purchased top-ups are preserved — the user paid for those separately.
           const badStatuses = ['incomplete', 'incomplete_expired', 'past_due', 'unpaid', 'canceled'];
           if (badStatuses.includes(subscription.status)) {
-            await sql`
-              UPDATE credit_balances
-              SET amount = 0, updated_at = NOW()
-              WHERE user_id = ${userId}
-            `;
-            console.warn(`⚠️ Credits revoked for user ${userId} - subscription status: ${subscription.status}`);
+            await suspendPlanCredits(userId, `Subscription ${subscription.status}`);
+            console.warn(`⚠️ Plan credits revoked for user ${userId} - subscription status: ${subscription.status}`);
           }
 
           console.log(`✅ Subscription updated for user ${userId}, status: ${subscription.status}`);
@@ -512,26 +563,13 @@ router.post('/webhook', async (req: Request, res: Response) => {
           if (subResult.length > 0) {
             const { user_id, plan_id } = subResult[0];
 
-            // Refill credits for monthly billing
+            // Refill credits for monthly billing.
+            // ⚠️ BUSINESS LOGIC: Use-it-or-lose-it applies to PLAN credits only — they
+            // reset to the plan allotment each cycle. Purchased top-ups are preserved.
             const planResult = await sql`SELECT * FROM subscription_plans WHERE id = ${plan_id}`;
             if (planResult.length > 0) {
-              const plan = planResult[0];
-
-              // ⚠️ BUSINESS LOGIC: Use-it-or-lose-it credit model
-              // Credits are REPLACED (not added) each billing cycle
-              // This prevents credit hoarding and encourages consistent usage
-              // Alternative: Change EXCLUDED.amount to (credit_balances.amount + EXCLUDED.amount) to accumulate
-              await sql`
-                INSERT INTO credit_balances (user_id, credit_type, amount)
-                VALUES 
-                  (${user_id}, 'images', ${plan.image_credits}),
-                  (${user_id}, 'content', ${plan.content_credits}),
-                  (${user_id}, 'keywords', ${plan.keyword_credits})
-                ON CONFLICT (user_id, credit_type)
-                DO UPDATE SET amount = EXCLUDED.amount, updated_at = NOW()
-              `;
-
-              console.log(`✅ Monthly credits refilled for user ${user_id} (invoice paid)`);
+              await refillPlanCredits(user_id, planResult[0], 'Monthly plan credits refill');
+              console.log(`✅ Monthly plan credits refilled for user ${user_id} (invoice paid)`);
             }
           }
         }
@@ -557,14 +595,11 @@ router.post('/webhook', async (req: Request, res: Response) => {
               WHERE user_id = ${userId}
             `;
             
-            // ✅ CRITICAL: Revoke credits immediately on payment failure
-            await sql`
-              UPDATE credit_balances
-              SET amount = 0, updated_at = NOW()
-              WHERE user_id = ${userId}
-            `;
-            
-            console.warn(`⚠️ Payment failed for user ${userId} - subscription suspended, credits revoked`);
+            // ✅ CRITICAL: Revoke PLAN credits immediately on payment failure.
+            // Purchased top-ups are preserved — the user paid for those separately.
+            await suspendPlanCredits(userId, 'Payment failed');
+
+            console.warn(`⚠️ Payment failed for user ${userId} - subscription suspended, plan credits revoked`);
             // TODO: Send email notification to user
           }
         }
@@ -636,6 +671,82 @@ router.post('/webhook', async (req: Request, res: Response) => {
     res.status(500).json({
       success: false,
       error: 'Webhook processing failed'
+    });
+  }
+});
+
+/**
+ * Verify a completed Stripe Checkout session and apply its effect idempotently.
+ *
+ * Called by the CMS when the user returns to the success URL after a redirect-based
+ * checkout (e.g. buy-credits). This guarantees the purchase is reflected immediately,
+ * even if the webhook is delayed or the endpoint is misconfigured. Safe to call
+ * repeatedly — both the credit top-up and subscription activation are idempotent and
+ * shared with the webhook handler.
+ *
+ * POST /api/v1/stripe/verify-session  { session_id }
+ */
+router.post('/verify-session', async (req: Request, res: Response) => {
+  try {
+    const { session_id } = z.object({ session_id: z.string().min(1) }).parse(req.body);
+
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+
+    const paid =
+      session.payment_status === 'paid' ||
+      session.payment_status === 'no_payment_required' ||
+      session.status === 'complete';
+
+    if (!paid) {
+      return res.json({
+        success: false,
+        status: session.payment_status,
+        message: 'Payment has not completed yet.'
+      });
+    }
+
+    const purchaseType = session.metadata?.purchase_type;
+
+    if (purchaseType === 'credit_topup') {
+      const applied = await applyCreditTopupOnce(session);
+      return res.json({ success: true, type: 'credit_topup', applied });
+    }
+
+    // Redirect-based subscription checkout (create-checkout-session / upgrade-plan).
+    if (session.mode === 'subscription' && session.subscription) {
+      const subscription = await stripe.subscriptions.retrieve(session.subscription as string);
+
+      if (subscription.status === 'active' || subscription.status === 'trialing') {
+        const userId = parseInt(session.metadata?.user_id || subscription.metadata?.user_id || '0');
+        let planId = parseInt(session.metadata?.plan_id || subscription.metadata?.plan_id || '0');
+
+        if (userId) {
+          if (!planId) {
+            const userRow = await sql`SELECT plan_id FROM users WHERE id = ${userId}`;
+            planId = userRow.length > 0 ? userRow[0].plan_id : 0;
+          }
+          if (planId) {
+            const nextBillingTimestamp = (subscription as any).current_period_end
+              || Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+            await activateSubscriptionInDb({
+              userId,
+              planId,
+              stripeSubscriptionId: subscription.id,
+              stripeCustomerId: subscription.customer as string,
+              nextBillingTimestamp,
+            });
+          }
+        }
+      }
+      return res.json({ success: true, type: 'subscription', status: subscription.status });
+    }
+
+    return res.json({ success: true, type: 'unknown' });
+  } catch (error) {
+    console.error('Verify session error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to verify session'
     });
   }
 });
@@ -777,6 +888,33 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
 
       // Only respond success if subscription is active or trialing
       if (subscription.status === 'active' || subscription.status === 'trialing') {
+        // ✅ CRITICAL: Persist the subscription + refill credits synchronously here,
+        // BEFORE responding. Do NOT rely on the customer.subscription.created webhook —
+        // if the webhook endpoint is misconfigured/down the user would be charged but
+        // receive nothing, and even when healthy the frontend reloads credits before the
+        // async webhook lands. activateSubscriptionInDb is idempotent with the webhook.
+        const nextBillingTimestamp = (subscription as any).current_period_end
+          || Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+
+        try {
+          await activateSubscriptionInDb({
+            userId: user_id,
+            planId: plan_id,
+            stripeSubscriptionId: subscription.id,
+            stripeCustomerId: user.stripe_customer_id,
+            nextBillingTimestamp,
+          });
+        } catch (dbError) {
+          // Payment succeeded but our DB write failed. Surface a clear error and let the
+          // webhook reconcile — but never report a misleading "credits added" success.
+          console.error('❌ Subscription persisted in Stripe but DB activation failed:', dbError);
+          return res.status(500).json({
+            success: false,
+            error: 'Your payment succeeded but we had trouble updating your account. Your credits will appear shortly — please refresh in a minute or contact support if they do not.',
+            subscription_id: subscription.id
+          });
+        }
+
         res.json({
           success: true,
           message: 'Subscription created successfully! Credits have been added.',
