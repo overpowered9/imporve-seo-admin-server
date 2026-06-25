@@ -12,6 +12,7 @@
 
 import { claudeText, claudeJSON, parseJsonLoose, ClaudeUsage } from './claude.service.js';
 import { PromptManagementService } from './prompt-management.service.js';
+import { postProcessArticle } from './content-postprocess.js';
 import { config } from '../config/config.js';
 import {
   buildBlueprint,
@@ -322,15 +323,10 @@ Return JSON exactly in this shape:
     timings.meta_recovery = Date.now() - tr;
   }
 
-  // ---- Phase 5: assembly ----
-  // Deterministic em-dash guard: em-dash overuse is the single highest-signal AI tell, and the model
-  // won't reliably self-limit. Convert spaced/standalone em-dashes to commas (keeps en-dashes in
-  // numeric ranges like "$180–$350" untouched).
-  article = article.replace(/\s*—\s*/g, ', ');
-  // Build the Table of Contents deterministically from the H2 headings (reliable, always present),
-  // ensuring every heading has a matching id. Then linkify any bare URLs (e.g. the CTA link).
-  article = injectTableOfContents(article);
-  article = linkifyUrls(article);
+  // ---- Phase 5: assembly + deterministic post-processing ----
+  // Defensive fixes (markdown→HTML, anchor repair, em-dash guard, whitespace cleanup, code-built TOC
+  // with matching ids, email/URL linkification). See content-postprocess.ts.
+  article = postProcessArticle(article);
   const content = `<div class="improveseo-v2-content">${article}</div>`;
   const faqSchema = buildFaqSchema(meta.faq);
 
@@ -485,65 +481,6 @@ ${plain}`;
     console.warn('⚠️ v2 meta recovery failed, returning partial meta:', e);
     return partial;
   }
-}
-
-function slugify(text: string): string {
-  return text
-    .replace(/<[^>]+>/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, '')
-    .trim()
-    .replace(/[\s-]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
-
-/**
- * Build a linked Table of Contents from the article's <h2> headings and ensure every heading has a
- * matching id. Reliable and always present (no dependence on the model writing correct anchors).
- * Inserts the TOC right after the intro (before the first <h2>).
- */
-function injectTableOfContents(html: string): string {
-  const used = new Set<string>();
-  const headings: { id: string; text: string }[] = [];
-
-  html = html.replace(/<h2(\s[^>]*)?>([\s\S]*?)<\/h2>/gi, (_m, attrs: string, inner: string) => {
-    const rawAttrs = attrs || '';
-    const text = inner.replace(/<[^>]+>/g, '').trim();
-    let id = '';
-    const idMatch = rawAttrs.match(/id=["']([^"']+)["']/i);
-    if (idMatch) {
-      id = idMatch[1];
-    } else {
-      const base = slugify(text) || 'section';
-      id = base;
-      let n = 2;
-      while (used.has(id)) id = `${base}-${n++}`;
-    }
-    used.add(id);
-    headings.push({ id, text });
-    const attrsWithId = /id=/.test(rawAttrs) ? rawAttrs : ` id="${id}"${rawAttrs}`;
-    return `<h2${attrsWithId}>${inner}</h2>`;
-  });
-
-  if (headings.length < 2) return html; // too small to warrant a TOC
-
-  const items = headings.map((h) => `<li><a href="#${h.id}">${h.text}</a></li>`).join('');
-  const toc = `<h2 id="table-of-contents">Table of Contents</h2><ol class="improveseo-toc">${items}</ol>`;
-
-  const firstH2 = html.search(/<h2[\s>]/i);
-  return firstH2 === -1 ? html : html.slice(0, firstH2) + toc + html.slice(firstH2);
-}
-
-/** Convert bare http(s) URLs (e.g. the CTA link) into anchors, leaving existing <a> tags untouched. */
-function linkifyUrls(html: string): string {
-  const anchors: string[] = [];
-  html = html.replace(/<a\b[^>]*>[\s\S]*?<\/a>/gi, (m) => {
-    anchors.push(m);
-    return `__ISEO_A${anchors.length - 1}__`;
-  });
-  html = html.replace(/(https?:\/\/[^\s<>"')]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
-  html = html.replace(/__ISEO_A(\d+)__/g, (_m, i) => anchors[parseInt(i, 10)]);
-  return html;
 }
 
 function buildFaqSchema(faq: FaqPair[]): Record<string, unknown> {
