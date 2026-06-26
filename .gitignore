@@ -75,3 +75,4 @@ add_stripe_price_id.sql
 *.sql
 /extra
 /src/scripts
+/claude reference
