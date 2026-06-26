@@ -79,13 +79,51 @@ async function startServer() {
     await connectToDatabase();
     
     // Start Express server
-    app.listen(port, () => {
+    const server = app.listen(port, () => {
       console.log(`[improveseo-ai-server] listening on http://localhost:${port}`);
       console.log(`🚀 Server ready with user management system`);
       console.log(`📋 Admin Panel: http://localhost:${port}/api/admin/prompts/health`);
       console.log(`🔧 Features: Authentication + Website Management + Credit System`);
       console.log(`🧪 Test signup: POST ${port}/api/v1/auth/signup`);
     });
+
+    // ── Keep-alive timeout tuning (prevents intermittent 502 / ECONNRESET) ─────
+    // Cloud load balancers (Render, ELB, etc.) keep upstream connections idle for
+    // ~60s. Node's default keepAliveTimeout is only 5s, so Node can close a socket
+    // the LB still believes is open; the next request the LB sends on that dead
+    // socket fails with a 502/connection reset. Setting our timeouts ABOVE the LB's
+    // idle window guarantees the LB always closes first. headersTimeout must be
+    // greater than keepAliveTimeout.
+    server.keepAliveTimeout = 65_000;
+    server.headersTimeout = 66_000;
+    // Cap total request duration so a stuck client/socket can't hold a connection
+    // open forever (0 = disabled by default in Node).
+    server.requestTimeout = 120_000;
+
+    // ── Graceful shutdown ──────────────────────────────────────────────────────
+    // Render sends SIGTERM on every deploy. Without draining, in-flight logins are
+    // killed mid-request and users see connection errors during each deploy.
+    let shuttingDown = false;
+    const shutdown = (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.log(`\n${signal} received — draining connections…`);
+      server.close((err) => {
+        if (err) {
+          console.error('Error during server close:', err);
+          process.exit(1);
+        }
+        console.log('✅ All connections drained. Exiting.');
+        process.exit(0);
+      });
+      // Hard limit: don't hang the platform's shutdown forever.
+      setTimeout(() => {
+        console.error('⏱️  Drain timeout — forcing exit.');
+        process.exit(1);
+      }, 25_000).unref();
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
   } catch (error) {
     console.error('❌ Failed to start server:', error);
     process.exit(1);
