@@ -393,33 +393,48 @@ const issueConnectTokenSchema = z.object({
  */
 router.post('/issue-connect-token', async (req, res) => {
   try {
-    // ── 1. Verify Supabase JWT ──────────────────────────────────────────────
+    // ── 1. Validate request body first (sync, no network cost) ─────────────
+    const { site_domain } = issueConnectTokenSchema.parse(req.body);
+    // Normalise: strip leading www. so "www.example.com" and "example.com" are the same site
+    const domain = site_domain.replace(/^www\./, '').toLowerCase().trim();
+
+    // ── 2. Verify Supabase JWT (8 s timeout — guards against auth service hangs) ──
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({ success: false, error: 'Missing or invalid Authorization header' });
     }
     const jwt = authHeader.slice(7);
-    const { data: { user: supabaseUser }, error: authError } = await supabaseAdmin.auth.getUser(jwt);
-    if (authError || !supabaseUser) {
+    let supabaseUser: Awaited<ReturnType<typeof supabaseAdmin.auth.getUser>>['data']['user'];
+    try {
+      const result = await Promise.race([
+        supabaseAdmin.auth.getUser(jwt),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('jwt_timeout')), 8000)
+        ),
+      ]);
+      if (result.error || !result.data.user) {
+        return res.status(401).json({ success: false, error: 'Invalid or expired token' });
+      }
+      supabaseUser = result.data.user;
+    } catch (err: any) {
+      if (err.message === 'jwt_timeout') {
+        return res.status(503).json({ success: false, error: 'Authentication service unavailable. Please try again in a moment.' });
+      }
       return res.status(401).json({ success: false, error: 'Invalid or expired token' });
     }
 
-    // ── 2. Validate request body ────────────────────────────────────────────
-    const { site_domain } = issueConnectTokenSchema.parse(req.body);
-    // Normalise: strip leading www. so "www.example.com" and "example.com" are the same site
-    const domain = site_domain.replace(/^www\./, '').toLowerCase().trim();
+    // ── 3. Fetch user record + domain rows in parallel ──────────────────────
+    const [user, allDomainRows] = await Promise.all([
+      findUserByEmail(supabaseUser.email!),
+      findWebsiteByDomain(domain),
+    ]);
 
-    // ── 3. Find our internal user record ───────────────────────────────────
-    const user = await findUserByEmail(supabaseUser.email!);
     if (!user) {
       return res.status(404).json({ success: false, error: 'User account not found. Please contact support.' });
     }
 
     // ── 4. Trial enforcement — four ordered checks ──────────────────────────
-
-    // Fetch all rows for this domain upfront (active + soft-deleted, all accounts).
-    // This is used in all four checks below.
-    const allDomainRows = await findWebsiteByDomain(domain);
+    // allDomainRows already fetched above.
 
     // Check 1: Account already used its trial?
     if (user.trial_started_at !== null && user.trial_started_at !== undefined) {
@@ -511,36 +526,60 @@ router.post('/issue-connect-token', async (req, res) => {
       trial_status = 'new';
     }
 
-    // ── 5. Issue short-lived connect token ──────────────────────────────────
-    const token = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
-
-    // Opportunistic cleanup of expired tokens (runs async, doesn't block the response)
-    sql`DELETE FROM connect_tokens WHERE expires_at < NOW() - INTERVAL '1 hour'`.catch(() => {/* ignore */});
-
-    await sql`
-      INSERT INTO connect_tokens (token, user_id, site_code, expires_at)
-      VALUES (${token}, ${user.id}, ${site_code}, ${expiresAt.toISOString()})
+    // ── 5. Issue short-lived connect token (idempotent) ─────────────────────
+    // Return an existing valid token if one already exists for this user+site_code.
+    // This handles the race where the client calls this endpoint twice in quick
+    // succession (e.g. TOKEN_REFRESHED firing alongside INITIAL_SESSION).
+    const existingRows = await sql`
+      SELECT token FROM connect_tokens
+      WHERE  user_id   = ${user.id}
+        AND  site_code = ${site_code}
+        AND  used      = false
+        AND  expires_at > NOW()
+      ORDER BY expires_at DESC
+      LIMIT 1
     `;
 
-    // Reload user to get fresh trial dates
-    const freshUser = await findUserByEmail(supabaseUser.email!);
+    let token: string;
+    if (existingRows[0]) {
+      token = existingRows[0].token as string;
+    } else {
+      token = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+
+      // Opportunistic cleanup — runs async, doesn't block the response
+      sql`DELETE FROM connect_tokens WHERE expires_at < NOW() - INTERVAL '1 hour'`.catch(() => {/* ignore */});
+
+      await sql`
+        INSERT INTO connect_tokens (token, user_id, site_code, expires_at)
+        VALUES (${token}, ${user.id}, ${site_code}, ${expiresAt.toISOString()})
+      `;
+    }
+
+    // trial_ends_at: for new trials startUserTrial just set it to NOW() + 14 days;
+    // compute locally to avoid a second DB round-trip. For reconnects use the value
+    // already in `user` (nothing in the users table was changed).
+    const trial_ends_at =
+      trial_status === 'new'
+        ? new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString()
+        : (user.trial_ends_at ? new Date(user.trial_ends_at).toISOString() : null);
 
     return res.json({
       success: true,
       data: {
         connect_token: token,
         trial_status,
-        trial_ends_at: freshUser?.trial_ends_at ?? null,
+        trial_ends_at,
       },
     });
 
   } catch (error) {
-    console.error('issue-connect-token error:', error);
+    const errorId = crypto.randomBytes(4).toString('hex');
+    console.error(`[issue-connect-token] [${errorId}]`, error);
     if (error instanceof z.ZodError) {
       return res.status(400).json({ success: false, error: 'Invalid request data', details: error.errors });
     }
-    res.status(500).json({ success: false, error: 'Internal server error' });
+    res.status(500).json({ success: false, error: 'Internal server error', error_id: errorId });
   }
 });
 
@@ -620,11 +659,12 @@ router.post('/exchange-connect-token', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('exchange-connect-token error:', error);
+    const errorId = crypto.randomBytes(4).toString('hex');
+    console.error(`[exchange-connect-token] [${errorId}]`, error);
     if (error instanceof z.ZodError) {
       return res.status(400).json({ success: false, error: 'Invalid token format', details: error.errors });
     }
-    res.status(500).json({ success: false, error: 'Internal server error' });
+    res.status(500).json({ success: false, error: 'Internal server error', error_id: errorId });
   }
 });
 
