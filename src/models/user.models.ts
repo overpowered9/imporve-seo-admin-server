@@ -48,6 +48,22 @@ export interface CreditBalance {
 type CreditType = 'images' | 'content' | 'keywords';
 const CREDIT_TYPES: CreditType[] = ['images', 'content', 'keywords'];
 
+/**
+ * One-time free credits granted when an ELIGIBLE account first attaches a site that
+ * has never been granted before. "Just enough to test." There is NO time limit — once
+ * these run out the user must buy credits or subscribe. Single source of truth: tune here.
+ */
+export const FREE_TEST_CREDITS: Record<CreditType, number> = {
+  images: 3,
+  content: 3,
+  keywords: 5,
+};
+
+export type TrialGrantResult =
+  | 'granted'       // free credits awarded just now
+  | 'account_used'  // this account already received its one-time free credits
+  | 'domain_used';  // this domain already received free credits (on any account)
+
 const planAllotment = (plan: any, creditType: CreditType): number => {
   if (creditType === 'images') return plan.image_credits;
   if (creditType === 'content') return plan.content_credits;
@@ -142,15 +158,21 @@ export const initializeUserCredits = async (user_id: number, plan_id?: number): 
   if (!plan[0]) throw new Error('Invalid plan');
   
   const planData = plan[0] as SubscriptionPlan;
-  
-  // Initialize credit balances. New users start with the plan allotment as their
-  // included (plan) credits and zero purchased credits.
+
+  // Initialize credit balances. FREE accounts start at ZERO usable credits — the
+  // one-time free test credits are granted later, only when an eligible account
+  // first attaches a never-granted site (see maybeGrantFreeCredits). Paid plans
+  // still receive their full allotment up front.
+  const isFree = planData.price_cents === 0;
+  const img = isFree ? 0 : planData.image_credits;
+  const con = isFree ? 0 : planData.content_credits;
+  const key = isFree ? 0 : planData.keyword_credits;
   await sql`
     INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
     VALUES
-      (${user_id}, 'images', ${planData.image_credits}, ${planData.image_credits}, 0, NOW()),
-      (${user_id}, 'content', ${planData.content_credits}, ${planData.content_credits}, 0, NOW()),
-      (${user_id}, 'keywords', ${planData.keyword_credits}, ${planData.keyword_credits}, 0, NOW())
+      (${user_id}, 'images', ${img}, ${img}, 0, NOW()),
+      (${user_id}, 'content', ${con}, ${con}, 0, NOW()),
+      (${user_id}, 'keywords', ${key}, ${key}, 0, NOW())
   `;
   
   // ONLY create subscription record for PAID plans
@@ -670,17 +692,61 @@ export const findWebsiteByUserAndDomain = async (user_id: number, domain: string
 };
 
 /**
- * Record trial start on a user (called once; safe to call only when trial_started_at IS NULL).
+ * Award the one-time free test credits IFF BOTH are true:
+ *   - this account has never been granted before  (users.trial_started_at IS NULL), AND
+ *   - this domain has never been granted on ANY account (no websites row with trial_used)
+ *
+ * On grant (atomically): stamp the account, mark this domain's website row trial_used,
+ * and deposit FREE_TEST_CREDITS. There is no expiry — trial_started_at is just the
+ * "already granted" marker. Race-safe: the user row is locked FOR UPDATE so two
+ * concurrent attaches can't both grant.
+ *
+ * @param websiteId the active website row for this user+domain to mark as granted
  */
-export const startUserTrial = async (user_id: number): Promise<void> => {
-  await sql`
-    UPDATE users
-    SET
-      trial_started_at = NOW(),
-      trial_ends_at    = NOW() + INTERVAL '14 days',
-      updated_at       = NOW()
-    WHERE id = ${user_id} AND trial_started_at IS NULL
-  `;
+export const maybeGrantFreeCredits = async (
+  user_id: number,
+  websiteId: number,
+  domain: string,
+): Promise<TrialGrantResult> => {
+  return await sql.begin(async (sql) => {
+    // Account guard (locked so concurrent attaches serialize)
+    const userRows = await sql`
+      SELECT trial_started_at FROM users WHERE id = ${user_id} LIMIT 1 FOR UPDATE
+    `;
+    if (userRows[0]?.trial_started_at) return 'account_used' as TrialGrantResult;
+
+    // Domain guard — has this domain ever been granted, on any account?
+    const domainTrialed = await sql`
+      SELECT 1 FROM websites WHERE domain = ${domain} AND trial_used = true LIMIT 1
+    `;
+    if (domainTrialed[0]) return 'domain_used' as TrialGrantResult;
+
+    // Eligible — stamp account, mark domain, deposit credits.
+    await sql`
+      UPDATE users SET trial_started_at = NOW(), updated_at = NOW()
+      WHERE id = ${user_id} AND trial_started_at IS NULL
+    `;
+    await sql`UPDATE websites SET trial_used = true WHERE id = ${websiteId}`;
+
+    for (const creditType of CREDIT_TYPES) {
+      const amount = FREE_TEST_CREDITS[creditType];
+      await sql`
+        INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
+        VALUES (${user_id}, ${creditType}, ${amount}, ${amount}, 0, NOW())
+        ON CONFLICT (user_id, credit_type)
+        DO UPDATE SET
+          included_remaining = credit_balances.included_remaining + ${amount},
+          included_allotment = GREATEST(credit_balances.included_allotment, ${amount}),
+          updated_at = NOW()
+      `;
+      await sql`
+        INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
+        VALUES (${user_id}, ${creditType}, ${amount}, 'Free test credits')
+      `;
+    }
+
+    return 'granted' as TrialGrantResult;
+  });
 };
 export const findUserByAuthId = async (auth_user_id: string): Promise<User | null> => {
   const result = await sql`

@@ -3,7 +3,7 @@ import { z } from 'zod';
 import crypto from 'crypto';
 import { supabaseAdmin } from '../services/supabase.service.js';
 import sql from '../data/db.js';
-import { findUserByEmail, findUserByOAuth, createUser, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, startUserTrial, type User } from '../models/user.models.js';
+import { findUserByEmail, findUserByOAuth, createUser, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, maybeGrantFreeCredits, type TrialGrantResult, type User } from '../models/user.models.js';
 
 const router = express.Router();
 
@@ -433,37 +433,9 @@ router.post('/issue-connect-token', async (req, res) => {
       return res.status(404).json({ success: false, error: 'User account not found. Please contact support.' });
     }
 
-    // ── 4. Trial enforcement — four ordered checks ──────────────────────────
-    // allDomainRows already fetched above.
-
-    // Check 1: Account already used its trial?
-    if (user.trial_started_at !== null && user.trial_started_at !== undefined) {
-      // Still allow reconnect/re-add for the same domain on the same account (Checks 2–4 below),
-      // but a completely new domain would be a second trial — block it.
-      // We check any row (active OR soft-deleted) belonging to this user for this domain.
-      const ownAnyRow = allDomainRows.find(r => r.user_id === user.id);
-      if (!ownAnyRow) {
-        // They already had a trial on a different domain → deny
-        return res.status(403).json({
-          success: false,
-          error: 'Your account has already used its free trial.',
-          code: 'TRIAL_ACCOUNT_USED',
-        });
-      }
-      // Falls through to reconnect / re-enable logic below
-    }
-
-    // Check 2: Domain previously on a trial on any account (including soft-deleted)?
-    const trialRow = allDomainRows.find(r => r.trial_used);
-    if (trialRow && trialRow.user_id !== user.id) {
-      return res.status(403).json({
-        success: false,
-        error: 'This website has already used its free trial on another account.',
-        code: 'TRIAL_DOMAIN_USED',
-      });
-    }
-
-    // Check 3: Domain active on a DIFFERENT account right now?
+    // ── 4. Resolve this account's website row (connection = ownership/linkage) ──
+    // Connecting is decoupled from the credit grant. The ONLY hard block is a site
+    // that is actively owned by a DIFFERENT account right now.
     const activeElsewhere = allDomainRows.find(r => r.active && r.user_id !== user.id);
     if (activeElsewhere) {
       return res.status(409).json({
@@ -473,46 +445,27 @@ router.post('/issue-connect-token', async (req, res) => {
       });
     }
 
-    // Check 4: Domain already active on THIS account (reconnect) → silent success
-    const ownActiveRow = allDomainRows.find(r => r.active && r.user_id === user.id);
-
+    // Reconnect own active row, reactivate own soft-deleted row, or create a fresh one.
+    let websiteId: number;
     let site_code: string;
-    let trial_status: 'new' | 'reconnect' | 'transferred';
+    const ownActiveRow   = allDomainRows.find(r => r.active && r.user_id === user.id);
+    const ownSoftDeleted = allDomainRows.find(r => !r.active && r.user_id === user.id);
 
     if (ownActiveRow) {
-      // Reconnect — reuse existing site_code, no trial change
+      websiteId = ownActiveRow.id;
       site_code = ownActiveRow.site_code;
-      trial_status = 'reconnect';
-    } else if (trialRow && trialRow.user_id === user.id) {
-      // This account had a trial on this domain (could be soft-deleted and re-adding)
-      // Re-enable the soft-deleted row if it exists, or create fresh without trial
-      const softDeleted = allDomainRows.find(r => !r.active && r.user_id === user.id);
-      if (softDeleted) {
-        await sql`
-          UPDATE websites
-          SET active = true, deleted_at = NULL
-          WHERE id = ${softDeleted.id}
-        `;
-        site_code = softDeleted.site_code;
-      } else {
-        const newSite = await createWebsite(user.id, domain, false);
-        site_code = newSite.site_code;
-      }
-      trial_status = 'reconnect';
-    } else if (trialRow && trialRow.user_id !== user.id) {
-      // Already blocked above; impossible to reach here — safety net
-      return res.status(403).json({ success: false, error: 'Trial already used on another account.', code: 'TRIAL_DOMAIN_USED' });
+    } else if (ownSoftDeleted) {
+      await sql`UPDATE websites SET active = true, deleted_at = NULL WHERE id = ${ownSoftDeleted.id}`;
+      websiteId = ownSoftDeleted.id;
+      site_code = ownSoftDeleted.site_code;
     } else {
-      // All clear — brand new domain for this account, start trial
       let newSite;
       try {
-        newSite = await createWebsite(user.id, domain, true);
+        newSite = await createWebsite(user.id, domain, false);
       } catch (error: any) {
         if (error.code === '23505' || error.message === 'Failed to generate unique site code') {
-          // Concurrent request raced us and inserted first — domain is now active elsewhere.
-          // The unique partial index on (domain WHERE active=true) blocked us.
-          // Note: createWebsite retries up to 10 times on 23505; if it exhausts retries
-          // due to a domain conflict, it throws a plain Error without .code — handle both.
+          // A concurrent request raced us and inserted first (unique partial index on
+          // domain WHERE active=true). createWebsite may throw with or without .code.
           return res.status(409).json({
             success: false,
             error: 'Connection is already in progress. Please try again in a moment.',
@@ -521,12 +474,25 @@ router.post('/issue-connect-token', async (req, res) => {
         }
         throw error;
       }
+      websiteId = newSite.id;
       site_code = newSite.site_code;
-      await startUserTrial(user.id);
-      trial_status = 'new';
     }
 
-    // ── 5. Issue short-lived connect token (idempotent) ─────────────────────
+    // ── 5. One-time free credit grant (gated by BOTH account AND domain history) ──
+    // Connecting always succeeds above; granting credits is a separate, idempotent step.
+    const grant = await maybeGrantFreeCredits(user.id, websiteId, domain);
+    let trial_status: 'new' | 'reconnect' | 'none';
+    let trial_reason: TrialGrantResult | null = null;
+    if (grant === 'granted') {
+      trial_status = 'new';                 // free credits awarded
+    } else if (ownActiveRow || ownSoftDeleted) {
+      trial_status = 'reconnect';           // their own existing site, no new grant
+    } else {
+      trial_status = 'none';                // connected, but not eligible for free credits
+      trial_reason = grant;                 // 'account_used' | 'domain_used'
+    }
+
+    // ── 6. Issue short-lived connect token (idempotent) ─────────────────────
     // Return an existing valid token if one already exists for this user+site_code.
     // This handles the race where the client calls this endpoint twice in quick
     // succession (e.g. TOKEN_REFRESHED firing alongside INITIAL_SESSION).
@@ -556,20 +522,12 @@ router.post('/issue-connect-token', async (req, res) => {
       `;
     }
 
-    // trial_ends_at: for new trials startUserTrial just set it to NOW() + 14 days;
-    // compute locally to avoid a second DB round-trip. For reconnects use the value
-    // already in `user` (nothing in the users table was changed).
-    const trial_ends_at =
-      trial_status === 'new'
-        ? new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString()
-        : (user.trial_ends_at ? new Date(user.trial_ends_at).toISOString() : null);
-
     return res.json({
       success: true,
       data: {
         connect_token: token,
-        trial_status,
-        trial_ends_at,
+        trial_status,   // 'new' | 'reconnect' | 'none'
+        trial_reason,   // 'account_used' | 'domain_used' | null  (only when status === 'none')
       },
     });
 

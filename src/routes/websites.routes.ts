@@ -1,11 +1,14 @@
 import express from 'express';
 import { z } from 'zod';
-import { 
-  createWebsite, 
-  getUserWebsites, 
+import {
+  createWebsite,
+  getUserWebsites,
   deleteWebsite,
-  getUserWithPlan 
+  getUserWithPlan,
+  findWebsiteByDomain,
+  maybeGrantFreeCredits,
 } from '../models/user.models.js';
+import sql from '../data/db.js';
 
 const router = express.Router();
 
@@ -56,12 +59,47 @@ router.post('/', async (req, res) => {
         });
       }
     }
-    
-    const website = await createWebsite(user_id, domain);
-    
+
+    // Normalise domain (strip protocol/www, lowercase) so this path matches the
+    // plugin-connect path and the free-credit gate can't be bypassed by paste-in setup.
+    let normDomain: string;
+    try {
+      normDomain = new URL(domain).hostname.replace(/^www\./, '').toLowerCase().trim();
+    } catch (_) {
+      normDomain = domain.replace(/^www\./, '').toLowerCase().trim();
+    }
+
+    // Same hard block as connect: site actively owned by a DIFFERENT account.
+    const allRows = await findWebsiteByDomain(normDomain);
+    const activeElsewhere = allRows.find((r) => r.active && r.user_id !== user_id);
+    if (activeElsewhere) {
+      return res.status(409).json({
+        success: false,
+        error: 'This website is currently connected to another account. Remove it there first.',
+        code: 'DOMAIN_CONFLICT',
+      });
+    }
+
+    // Reuse own active / reactivate own soft-deleted / create fresh.
+    const ownActive = allRows.find((r) => r.active && r.user_id === user_id);
+    const ownSoftDeleted = allRows.find((r) => !r.active && r.user_id === user_id);
+    let website: any;
+    if (ownActive) {
+      website = ownActive;
+    } else if (ownSoftDeleted) {
+      await sql`UPDATE websites SET active = true, deleted_at = NULL WHERE id = ${ownSoftDeleted.id}`;
+      website = ownSoftDeleted;
+    } else {
+      website = await createWebsite(user_id, normDomain, false);
+    }
+
+    // One-time free credit grant — gated by BOTH account and domain history.
+    const trial_status = await maybeGrantFreeCredits(user_id, website.id, normDomain);
+
     res.status(201).json({
       success: true,
-      data: website
+      data: website,
+      trial_status, // 'granted' | 'account_used' | 'domain_used'
     });
     
   } catch (error) {
