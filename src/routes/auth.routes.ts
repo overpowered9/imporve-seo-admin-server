@@ -497,7 +497,7 @@ router.post('/issue-connect-token', async (req, res) => {
     // This handles the race where the client calls this endpoint twice in quick
     // succession (e.g. TOKEN_REFRESHED firing alongside INITIAL_SESSION).
     const existingRows = await sql`
-      SELECT token FROM connect_tokens
+      SELECT token, trial_status, trial_reason FROM connect_tokens
       WHERE  user_id   = ${user.id}
         AND  site_code = ${site_code}
         AND  used      = false
@@ -509,6 +509,10 @@ router.post('/issue-connect-token', async (req, res) => {
     let token: string;
     if (existingRows[0]) {
       token = existingRows[0].token as string;
+      // Keep the response consistent with what exchange will later return: reuse the
+      // outcome recorded when this token was first issued (the grant ran on that call).
+      trial_status = (existingRows[0].trial_status as typeof trial_status) || trial_status;
+      trial_reason = (existingRows[0].trial_reason as typeof trial_reason) ?? trial_reason;
     } else {
       token = crypto.randomBytes(32).toString('hex');
       const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
@@ -516,9 +520,11 @@ router.post('/issue-connect-token', async (req, res) => {
       // Opportunistic cleanup — runs async, doesn't block the response
       sql`DELETE FROM connect_tokens WHERE expires_at < NOW() - INTERVAL '1 hour'`.catch(() => {/* ignore */});
 
+      // Persist the trial outcome on the token so the redirect-fallback path (which
+      // never receives the postMessage) can read the exact status at exchange time.
       await sql`
-        INSERT INTO connect_tokens (token, user_id, site_code, expires_at)
-        VALUES (${token}, ${user.id}, ${site_code}, ${expiresAt.toISOString()})
+        INSERT INTO connect_tokens (token, user_id, site_code, expires_at, trial_status, trial_reason)
+        VALUES (${token}, ${user.id}, ${site_code}, ${expiresAt.toISOString()}, ${trial_status}, ${trial_reason})
       `;
     }
 
@@ -596,13 +602,6 @@ router.post('/exchange-connect-token', async (req, res) => {
     }
     const row = { ...tokenRow, ...userRows[0] } as any;
 
-    // ── 3. Compute days remaining in trial ──────────────────────────────────
-    let days_remaining: number | null = null;
-    if (row.trial_ends_at) {
-      const msLeft = new Date(row.trial_ends_at).getTime() - Date.now();
-      days_remaining = Math.max(0, Math.ceil(msLeft / (1000 * 60 * 60 * 24)));
-    }
-
     return res.json({
       success: true,
       data: {
@@ -610,9 +609,10 @@ router.post('/exchange-connect-token', async (req, res) => {
         site_code: row.site_code,
         user_name: row.user_name,
         email: row.email,
-        trial_started_at: row.trial_started_at,
-        trial_ends_at: row.trial_ends_at,
-        days_remaining,
+        // Trial is now a one-time credit grant with no expiry — surface the recorded
+        // outcome so the redirect-fallback path shows the correct screen 3 variant.
+        trial_status: row.trial_status || 'new',          // 'new' | 'reconnect' | 'none'
+        trial_reason: row.trial_reason || null,           // 'account_used' | 'domain_used' | null
       },
     });
 
