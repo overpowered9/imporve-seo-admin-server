@@ -6,7 +6,6 @@ import {
   deleteWebsite,
   getUserWithPlan,
   findWebsiteByDomain,
-  maybeGrantFreeCredits,
 } from '../models/user.models.js';
 import sql from '../data/db.js';
 
@@ -60,8 +59,7 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // Normalise domain (strip protocol/www, lowercase) so this path matches the
-    // plugin-connect path and the free-credit gate can't be bypassed by paste-in setup.
+    // Normalise domain (strip protocol/www, lowercase) to match the connect path.
     let normDomain: string;
     try {
       normDomain = new URL(domain).hostname.replace(/^www\./, '').toLowerCase().trim();
@@ -93,13 +91,14 @@ router.post('/', async (req, res) => {
       website = await createWebsite(user_id, normDomain, false);
     }
 
-    // One-time free credit grant — gated by BOTH account and domain history.
-    const trial_status = await maybeGrantFreeCredits(user_id, website.id, normDomain);
-
+    // NOTE: NO free-credit grant here. Adding a domain in the dashboard proves
+    // nothing about ownership — anyone can type any domain. Free credits are only
+    // awarded through the plugin connect flow (issue-connect-token), which proves
+    // the user controls the site (the connect token is minted by the plugin running
+    // on that actual WordPress install). This is the "verified domain" requirement.
     res.status(201).json({
       success: true,
       data: website,
-      trial_status, // 'granted' | 'account_used' | 'domain_used'
     });
     
   } catch (error) {
