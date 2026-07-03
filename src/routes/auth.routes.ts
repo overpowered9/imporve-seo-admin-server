@@ -671,10 +671,20 @@ router.post('/issue-connect-token', async (req, res) => {
     let token: string;
     if (existingRows[0]) {
       token = existingRows[0].token as string;
-      // Keep the response consistent with what exchange will later return: reuse the
-      // outcome recorded when this token was first issued (the grant ran on that call).
-      trial_status = (existingRows[0].trial_status as typeof trial_status) || trial_status;
-      trial_reason = (existingRows[0].trial_reason as typeof trial_reason) ?? trial_reason;
+      if (grant === 'granted') {
+        // The user verified and was granted on THIS call, after the token was first
+        // issued (e.g. first attempt skipped verification). The stored status is
+        // stale — update the row so exchange reports the grant correctly.
+        await sql`
+          UPDATE connect_tokens SET trial_status = ${trial_status}, trial_reason = ${trial_reason}
+          WHERE token = ${token}
+        `;
+      } else {
+        // No new grant this call: the outcome recorded at first issue is authoritative
+        // (keeps the response consistent with what exchange will later return).
+        trial_status = (existingRows[0].trial_status as typeof trial_status) || trial_status;
+        trial_reason = (existingRows[0].trial_reason as typeof trial_reason) ?? trial_reason;
+      }
     } else {
       token = crypto.randomBytes(32).toString('hex');
       const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
