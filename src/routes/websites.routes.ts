@@ -65,9 +65,9 @@ router.post('/', async (req, res) => {
     // Normalise domain (strip protocol/www, lowercase) to match the connect path.
     let normDomain: string;
     try {
-      normDomain = new URL(domain).hostname.replace(/^www\./, '').toLowerCase().trim();
+      normDomain = new URL(domain).hostname.trim().toLowerCase().replace(/^www\./, '');
     } catch (_) {
-      normDomain = domain.replace(/^www\./, '').toLowerCase().trim();
+      normDomain = domain.trim().toLowerCase().replace(/^www\./, '');
     }
 
     // Same hard block as connect: site actively owned by a DIFFERENT account.

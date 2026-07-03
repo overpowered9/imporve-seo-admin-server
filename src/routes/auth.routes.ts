@@ -419,7 +419,10 @@ router.post('/request-link-code', async (req, res) => {
     }).parse(req.body);
 
     const normEmail = email.trim().toLowerCase();
-    const domain = site_domain.replace(/^www\./, '').toLowerCase().trim();
+    // Normalise: trim + lowercase FIRST, then strip www. (order matters — an
+    // uppercase "WWW." would survive a case-sensitive strip done before lowercasing,
+    // and the proof lookup is an exact string match on this value).
+    const domain = site_domain.trim().toLowerCase().replace(/^www\./, '');
 
     // Company-email policy
     const policy = checkCompanyEmail(normEmail);
@@ -552,7 +555,10 @@ router.post('/issue-connect-token', async (req, res) => {
     // ── 1. Validate request body first (sync, no network cost) ─────────────
     const { site_domain, link_proof } = issueConnectTokenSchema.parse(req.body);
     // Normalise: strip leading www. so "www.example.com" and "example.com" are the same site
-    const domain = site_domain.replace(/^www\./, '').toLowerCase().trim();
+    // Normalise: trim + lowercase FIRST, then strip www. (order matters — an
+    // uppercase "WWW." would survive a case-sensitive strip done before lowercasing,
+    // and the proof lookup is an exact string match on this value).
+    const domain = site_domain.trim().toLowerCase().replace(/^www\./, '');
 
     // ── 2. Verify Supabase JWT (8 s timeout — guards against auth service hangs) ──
     const authHeader = req.headers.authorization;
