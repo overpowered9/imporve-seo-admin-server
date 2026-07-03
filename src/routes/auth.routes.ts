@@ -3,7 +3,7 @@ import { z } from 'zod';
 import crypto from 'crypto';
 import { supabaseAdmin } from '../services/supabase.service.js';
 import sql from '../data/db.js';
-import { findUserByEmail, findUserByOAuth, createUser, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, grantFreeCreditsWithEmail, type TrialGrantResult, type User } from '../models/user.models.js';
+import { findUserByEmail, findUserByOAuth, createUser, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, getUserWebsites, getUserWithPlan, grantFreeCreditsWithEmail, type TrialGrantResult, type User } from '../models/user.models.js';
 import { sendEmail, emailTemplates } from '../services/email.service.js';
 import { checkCompanyEmail } from '../services/company-email.js';
 import { hashCode, timingSafeEqualHex, consumeLinkProof } from '../services/link-verification.js';
@@ -79,6 +79,18 @@ router.post('/signup', async (req, res) => {
     
   } catch (error) {
     console.error('Signup error:', error);
+    if (error instanceof z.ZodError) {
+      // Map validation issues to a single friendly sentence instead of leaking
+      // the raw zod issue array through error.message.
+      const first = error.errors[0];
+      const field = first?.path?.join('.') || 'input';
+      const friendly =
+        field === 'password' ? 'Password must be at least 8 characters.' :
+        field === 'email'    ? 'Please enter a valid email address.' :
+        field === 'name'     ? 'Please enter your name (at least 2 characters).' :
+        `Invalid ${field}.`;
+      return res.status(400).json({ success: false, error: friendly });
+    }
     res.status(400).json({
       success: false,
       error: error instanceof Error ? error.message : 'Signup failed'
@@ -98,17 +110,28 @@ router.post('/login', async (req, res) => {
     });
 
     if (error) {
+      // Supabase rejects unconfirmed accounts BEFORE credentials succeed, so the
+      // email_confirmed_at check below never fires for them — detect it here and
+      // return an actionable message instead of a misleading "Invalid credentials".
+      if (/email\s*not\s*confirmed/i.test(error.message || '')) {
+        return res.status(400).json({
+          success: false,
+          error: 'Please verify your email before logging in. Check your inbox for the confirmation link.',
+          code: 'EMAIL_NOT_CONFIRMED',
+        });
+      }
       return res.status(401).json({
         success: false,
         error: 'Invalid credentials'
       });
     }
 
-    // Check if email is confirmed
+    // Check if email is confirmed (defensive — normally caught above)
     if (!data.user?.email_confirmed_at) {
       return res.status(400).json({
         success: false,
-        error: 'Please verify your email before logging in'
+        error: 'Please verify your email before logging in',
+        code: 'EMAIL_NOT_CONFIRMED',
       });
     }
 
@@ -303,12 +326,19 @@ router.post('/oauth-callback', async (req, res) => {
       });
     }
 
-    // 2. Check if email already exists (links OAuth to existing account)
+    // 2. Check if email already exists (links OAuth to existing account).
+    // Backfill oauth_provider/oauth_id here: trigger-created rows for OAuth
+    // signups have them NULL, which broke Google-only account detection.
     const emailUser = await findUserByEmail(user.email);
 
     if (emailUser) {
       try {
-        await updateUserOAuthData(emailUser.id, { avatar_url: user.image, name: user.name || emailUser.name });
+        await updateUserOAuthData(emailUser.id, {
+          avatar_url: user.image,
+          name: user.name || emailUser.name,
+          oauth_provider: provider,
+          oauth_id: user.id,
+        });
       } catch { /* non-fatal */ }
 
       return res.json({
@@ -612,6 +642,24 @@ router.post('/issue-connect-token', async (req, res) => {
     let site_code: string;
     const ownActiveRow   = allDomainRows.find(r => r.active && r.user_id === user.id);
     const ownSoftDeleted = allDomainRows.find(r => !r.active && r.user_id === user.id);
+
+    // Enforce the plan's website_limit whenever this connect would ACTIVATE a new
+    // site (fresh create or soft-delete reactivation). Reconnecting an already
+    // active site never counts. Previously only the dashboard add-website path
+    // enforced this, so the plugin flow bypassed the limit entirely.
+    if (!ownActiveRow) {
+      const userWithPlan = await getUserWithPlan(user.id);
+      if (userWithPlan && userWithPlan.website_limit !== null) {
+        const activeSites = await getUserWebsites(user.id);
+        if (activeSites.length >= userWithPlan.website_limit) {
+          return res.status(403).json({
+            success: false,
+            error: `Website limit reached. Your plan allows ${userWithPlan.website_limit} website(s). Remove a site or upgrade your plan to connect this one.`,
+            code: 'WEBSITE_LIMIT_REACHED',
+          });
+        }
+      }
+    }
 
     if (ownActiveRow) {
       websiteId = ownActiveRow.id;

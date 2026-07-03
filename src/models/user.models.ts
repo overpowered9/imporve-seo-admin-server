@@ -798,12 +798,19 @@ export const createOAuthUser = async (userData: {
 export const updateUserOAuthData = async (user_id: number, data: {
   avatar_url?: string;
   name?: string;
+  oauth_provider?: string;
+  oauth_id?: string;
 }): Promise<User | null> => {
   const result = await sql`
-    UPDATE users 
-    SET 
+    UPDATE users
+    SET
       avatar_url = COALESCE(${data.avatar_url || null}, avatar_url),
       name = COALESCE(${data.name || null}, name),
+      -- Backfill provider identity only when not already set (reversed COALESCE):
+      -- users created by the DB signup trigger have these NULL even for OAuth
+      -- signups, which broke the "this account uses Google sign-in" detection.
+      oauth_provider = COALESCE(oauth_provider, ${data.oauth_provider || null}),
+      oauth_id = COALESCE(oauth_id, ${data.oauth_id || null}),
       updated_at = NOW()
     WHERE id = ${user_id}
     RETURNING id, email, name, api_key, plan_id, oauth_provider, oauth_id, avatar_url, created_at, updated_at

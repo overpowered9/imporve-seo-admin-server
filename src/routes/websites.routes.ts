@@ -9,22 +9,35 @@ import {
   grantFreeCreditsWithEmail,
 } from '../models/user.models.js';
 import { consumeLinkProof } from '../services/link-verification.js';
+import { requireSupabaseUser, type SupabaseAuthedRequest } from '../middleware/supabaseAuth.middleware.js';
 import sql from '../data/db.js';
 
 const router = express.Router();
 
+// All /websites routes require a valid Supabase JWT. Identity comes from the
+// token (req.appUser), never from the request body/params — previously these
+// endpoints were unauthenticated and took user_id from the caller, letting
+// anyone list/add/delete websites for arbitrary accounts.
+router.use(requireSupabaseUser);
+
 const addWebsiteSchema = z.object({
   domain: z.string().url(),
-  user_id: z.number(),
+  // Legacy field — still sent by older clients. If present it must match the
+  // authenticated user; it is never used as the identity.
+  user_id: z.number().optional(),
   link_proof: z.string().optional(), // single-use proof from verify-link-code; unlocks the grant
 });
 
-// Get user websites
-router.get('/:user_id', async (req, res) => {
+// Get the authenticated user's websites. The :user_id path segment is kept for
+// backward compatibility but must match the token identity.
+router.get('/:user_id', async (req: SupabaseAuthedRequest, res) => {
   try {
-    const user_id = parseInt(req.params.user_id);
-    const websites = await getUserWebsites(user_id);
-    
+    const requested = parseInt(req.params.user_id);
+    if (!Number.isNaN(requested) && requested !== req.appUser!.id) {
+      return res.status(403).json({ success: false, error: 'Not authorized for this account.' });
+    }
+    const websites = await getUserWebsites(req.appUser!.id);
+
     res.json({
       success: true,
       data: websites
@@ -37,11 +50,15 @@ router.get('/:user_id', async (req, res) => {
   }
 });
 
-// Add new website
-router.post('/', async (req, res) => {
+// Add new website (for the authenticated user)
+router.post('/', async (req: SupabaseAuthedRequest, res) => {
   try {
-    const { domain, user_id, link_proof } = addWebsiteSchema.parse(req.body);
-    
+    const { domain, user_id: bodyUserId, link_proof } = addWebsiteSchema.parse(req.body);
+    const user_id = req.appUser!.id;
+    if (bodyUserId !== undefined && bodyUserId !== user_id) {
+      return res.status(403).json({ success: false, error: 'Not authorized for this account.' });
+    }
+
     // Check user's website limit
     const userWithPlan = await getUserWithPlan(user_id);
     if (!userWithPlan) {
@@ -50,7 +67,7 @@ router.post('/', async (req, res) => {
         error: 'User not found'
       });
     }
-    
+
     // Check website limit (null = unlimited)
     if (userWithPlan.website_limit !== null) {
       const currentWebsites = await getUserWebsites(user_id);
@@ -62,7 +79,7 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // Normalise domain (strip protocol/www, lowercase) to match the connect path.
+    // Normalise domain (trim + lowercase, then strip www) to match the connect path.
     let normDomain: string;
     try {
       normDomain = new URL(domain).hostname.trim().toLowerCase().replace(/^www\./, '');
@@ -107,8 +124,11 @@ router.post('/', async (req, res) => {
       data: website,
       trial_status, // 'granted' | 'account_used' | 'domain_used' | 'email_used' | 'unverified'
     });
-    
+
   } catch (error) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ success: false, error: 'Invalid request data' });
+    }
     console.error('Add website error:', error);
     res.status(400).json({
       success: false,
@@ -117,14 +137,24 @@ router.post('/', async (req, res) => {
   }
 });
 
-// Delete website
-router.delete('/:website_id', async (req, res) => {
+// Delete (soft) one of the authenticated user's websites — ownership enforced.
+router.delete('/:website_id', async (req: SupabaseAuthedRequest, res) => {
   try {
     const website_id = parseInt(req.params.website_id);
-    console.log('Deleting website:', website_id);
+    if (Number.isNaN(website_id)) {
+      return res.status(400).json({ success: false, error: 'Invalid website id' });
+    }
+
+    const rows = await sql`SELECT user_id FROM websites WHERE id = ${website_id} LIMIT 1`;
+    if (!rows[0]) {
+      return res.status(404).json({ success: false, error: 'Website not found' });
+    }
+    if (rows[0].user_id !== req.appUser!.id) {
+      return res.status(403).json({ success: false, error: 'Not authorized to delete this website.' });
+    }
+
     await deleteWebsite(website_id);
-    console.log('Website deleted successfully:', website_id);
-    
+
     res.json({
       success: true,
       message: 'Website deleted successfully'
