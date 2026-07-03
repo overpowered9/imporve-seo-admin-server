@@ -162,7 +162,7 @@ export const initializeUserCredits = async (user_id: number, plan_id?: number): 
 
   // Initialize credit balances. FREE accounts start at ZERO usable credits — the
   // one-time free test credits are granted later, only when an eligible account
-  // first attaches a never-granted site (see maybeGrantFreeCredits). Paid plans
+  // first attaches a never-granted site (see grantFreeCreditsWithEmail). Paid plans
   // still receive their full allotment up front.
   const isFree = planData.price_cents === 0;
   const img = isFree ? 0 : planData.image_credits;
