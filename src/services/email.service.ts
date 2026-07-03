@@ -54,6 +54,57 @@ export const sendEmail = async (options: EmailOptions): Promise<boolean> => {
 
 // Email template generators
 export const emailTemplates = {
+  linkVerificationCode: (code: string, siteDomain: string) => {
+    return {
+      subject: `Your ImproveSEO verification code: ${code}`,
+      html: `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2c3e50; margin: 0; padding: 0; background: #f5f7fa; }
+            .wrapper { background: #f5f7fa; padding: 20px; }
+            .container { max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+            .header { background: linear-gradient(135deg, #1c7293 0%, #2ec5b6 100%); padding: 44px 30px; text-align: center; }
+            .header h1 { margin: 0; color: #fff; font-size: 26px; font-weight: 700; letter-spacing: -0.5px; }
+            .header-subtext { color: rgba(255,255,255,0.9); font-size: 14px; margin-top: 8px; }
+            .content { padding: 40px 30px; text-align: center; }
+            .content p { margin: 12px 0; color: #555; font-size: 15px; line-height: 1.7; }
+            .code-box { display: inline-block; background: #f0f7f9; border: 2px dashed #1c7293; border-radius: 10px; padding: 20px 34px; margin: 24px 0; }
+            .code { font-family: 'Courier New', monospace; font-size: 38px; font-weight: 800; letter-spacing: 10px; color: #1c7293; }
+            .meta { font-size: 13px; color: #888; }
+            .footer { background: #f8f9fa; padding: 26px; text-align: center; border-top: 1px solid #eee; }
+            .footer p { margin: 4px 0; font-size: 12px; color: #999; }
+            .footer-brand { font-weight: 600; color: #1c7293; }
+          </style>
+        </head>
+        <body>
+          <div class="wrapper">
+            <div class="container">
+              <div class="header">
+                <h1>Verify your email</h1>
+                <p class="header-subtext">To activate free credits for ${siteDomain || 'your site'}</p>
+              </div>
+              <div class="content">
+                <p>Enter this verification code in ImproveSEO to continue:</p>
+                <div class="code-box"><span class="code">${code}</span></div>
+                <p class="meta">This code expires in 10 minutes. If you didn't request it, you can safely ignore this email.</p>
+              </div>
+              <div class="footer">
+                <p><span class="footer-brand">ImproveSEO</span></p>
+                <p>© 2026 ImproveSEO. All rights reserved.</p>
+              </div>
+            </div>
+          </div>
+        </body>
+        </html>
+      `,
+      text: `Your ImproveSEO verification code is: ${code}\n\nEnter it in ImproveSEO to activate free credits for ${siteDomain || 'your site'}.\nThis code expires in 10 minutes. If you didn't request it, ignore this email.\n\n© 2026 ImproveSEO`,
+    };
+  },
+
   ticketCreated: (ticketId: string, ticketDisplayId: string, subject: string, userName: string, cmsUrl: string) => {
     return {
       subject: `Your Support Ticket Has Been Created - ${ticketDisplayId}`,

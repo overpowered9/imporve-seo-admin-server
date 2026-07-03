@@ -62,7 +62,8 @@ export const FREE_TEST_CREDITS: Record<CreditType, number> = {
 export type TrialGrantResult =
   | 'granted'       // free credits awarded just now
   | 'account_used'  // this account already received its one-time free credits
-  | 'domain_used';  // this domain already received free credits (on any account)
+  | 'domain_used'   // this domain already received free credits (on any account)
+  | 'email_used';   // this verified company email was already used for a grant
 
 const planAllotment = (plan: any, creditType: CreditType): number => {
   if (creditType === 'images') return plan.image_credits;
@@ -703,50 +704,53 @@ export const findWebsiteByUserAndDomain = async (user_id: number, domain: string
  *
  * @param websiteId the active website row for this user+domain to mark as granted
  */
-export const maybeGrantFreeCredits = async (
+export const grantFreeCreditsWithEmail = async (
   user_id: number,
   websiteId: number,
   domain: string,
+  email: string,
 ): Promise<TrialGrantResult> => {
-  return await sql.begin(async (sql) => {
-    // Account guard (locked so concurrent attaches serialize)
-    const userRows = await sql`
-      SELECT trial_started_at FROM users WHERE id = ${user_id} LIMIT 1 FOR UPDATE
-    `;
-    if (userRows[0]?.trial_started_at) return 'account_used' as TrialGrantResult;
-
-    // Domain guard — has this domain ever been granted, on any account?
-    const domainTrialed = await sql`
-      SELECT 1 FROM websites WHERE domain = ${domain} AND trial_used = true LIMIT 1
-    `;
-    if (domainTrialed[0]) return 'domain_used' as TrialGrantResult;
-
-    // Eligible — stamp account, mark domain, deposit credits.
-    await sql`
-      UPDATE users SET trial_started_at = NOW(), updated_at = NOW()
-      WHERE id = ${user_id} AND trial_started_at IS NULL
-    `;
-    await sql`UPDATE websites SET trial_used = true WHERE id = ${websiteId}`;
-
-    for (const creditType of CREDIT_TYPES) {
-      const amount = FREE_TEST_CREDITS[creditType];
+  const normEmail = email.trim().toLowerCase();
+  try {
+    await sql.begin(async (sql) => {
+      // The credit_grants ledger is the authoritative, race-proof gate: unique
+      // indexes on user_id, domain and lower(email) mean the INSERT itself enforces
+      // all three one-time caps. A 23505 tells us exactly which dimension collided.
       await sql`
-        INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
-        VALUES (${user_id}, ${creditType}, ${amount}, ${amount}, 0, NOW())
-        ON CONFLICT (user_id, credit_type)
-        DO UPDATE SET
-          included_remaining = credit_balances.included_remaining + ${amount},
-          included_allotment = GREATEST(credit_balances.included_allotment, ${amount}),
-          updated_at = NOW()
+        INSERT INTO credit_grants (user_id, website_id, domain, email, credits)
+        VALUES (${user_id}, ${websiteId}, ${domain}, ${normEmail}, ${sql.json(FREE_TEST_CREDITS)})
       `;
-      await sql`
-        INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
-        VALUES (${user_id}, ${creditType}, ${amount}, 'Free test credits')
-      `;
+
+      // Eligible — deposit credits and update the legacy markers used elsewhere.
+      for (const creditType of CREDIT_TYPES) {
+        const amount = FREE_TEST_CREDITS[creditType];
+        await sql`
+          INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
+          VALUES (${user_id}, ${creditType}, ${amount}, ${amount}, 0, NOW())
+          ON CONFLICT (user_id, credit_type)
+          DO UPDATE SET
+            included_remaining = credit_balances.included_remaining + ${amount},
+            included_allotment = GREATEST(credit_balances.included_allotment, ${amount}),
+            updated_at = NOW()
+        `;
+        await sql`
+          INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
+          VALUES (${user_id}, ${creditType}, ${amount}, 'Free test credits')
+        `;
+      }
+      await sql`UPDATE users SET trial_started_at = COALESCE(trial_started_at, NOW()), updated_at = NOW() WHERE id = ${user_id}`;
+      await sql`UPDATE websites SET trial_used = true WHERE id = ${websiteId}`;
+    });
+    return 'granted';
+  } catch (e: any) {
+    if (e && e.code === '23505') {
+      const c = String(e.constraint_name || '');
+      if (c.includes('user'))   return 'account_used';
+      if (c.includes('domain')) return 'domain_used';
+      if (c.includes('email'))  return 'email_used';
     }
-
-    return 'granted' as TrialGrantResult;
-  });
+    throw e;
+  }
 };
 export const findUserByAuthId = async (auth_user_id: string): Promise<User | null> => {
   const result = await sql`

@@ -6,14 +6,17 @@ import {
   deleteWebsite,
   getUserWithPlan,
   findWebsiteByDomain,
+  grantFreeCreditsWithEmail,
 } from '../models/user.models.js';
+import { consumeLinkProof } from '../services/link-verification.js';
 import sql from '../data/db.js';
 
 const router = express.Router();
 
 const addWebsiteSchema = z.object({
   domain: z.string().url(),
-  user_id: z.number()
+  user_id: z.number(),
+  link_proof: z.string().optional(), // single-use proof from verify-link-code; unlocks the grant
 });
 
 // Get user websites
@@ -37,7 +40,7 @@ router.get('/:user_id', async (req, res) => {
 // Add new website
 router.post('/', async (req, res) => {
   try {
-    const { domain, user_id } = addWebsiteSchema.parse(req.body);
+    const { domain, user_id, link_proof } = addWebsiteSchema.parse(req.body);
     
     // Check user's website limit
     const userWithPlan = await getUserWithPlan(user_id);
@@ -91,14 +94,18 @@ router.post('/', async (req, res) => {
       website = await createWebsite(user_id, normDomain, false);
     }
 
-    // NOTE: NO free-credit grant here. Adding a domain in the dashboard proves
-    // nothing about ownership — anyone can type any domain. Free credits are only
-    // awarded through the plugin connect flow (issue-connect-token), which proves
-    // the user controls the site (the connect token is minted by the plugin running
-    // on that actual WordPress install). This is the "verified domain" requirement.
+    // Free credits require a verified company email (single-use proof from
+    // verify-link-code) — the same gate as the plugin connect flow. Adding a site
+    // without a proof still works, but grants nothing.
+    const verifiedEmail = await consumeLinkProof(link_proof, user_id, normDomain);
+    const trial_status = verifiedEmail
+      ? await grantFreeCreditsWithEmail(user_id, website.id, normDomain, verifiedEmail)
+      : 'unverified';
+
     res.status(201).json({
       success: true,
       data: website,
+      trial_status, // 'granted' | 'account_used' | 'domain_used' | 'email_used' | 'unverified'
     });
     
   } catch (error) {
