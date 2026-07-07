@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { findUserByApiKey, findWebsiteByCode, getUserCreditBalance } from '../models/user.models.js';
+import sql from '../data/db.js';
 
 export interface AuthenticatedRequest extends Request {
   user?: any;
@@ -65,6 +66,23 @@ export const validateCredits = (creditType: 'images' | 'content' | 'keywords', r
           success: false,
           error: 'User not authenticated'
         });
+      }
+
+      // Trial enforcement: free-plan accounts get a time-boxed trial (started at
+      // signup). Once it ends, generation stops even if trial credits remain —
+      // upgrading to a paid plan changes plan_id, which bypasses this check.
+      if (req.user.trial_ends_at && new Date(req.user.trial_ends_at).getTime() < Date.now()) {
+        const planRows = await sql`
+          SELECT price_cents FROM subscription_plans WHERE id = ${req.user.plan_id} LIMIT 1
+        `;
+        const isFreePlan = !planRows[0] || Number(planRows[0].price_cents) === 0;
+        if (isFreePlan) {
+          return res.status(402).json({
+            success: false,
+            error: 'Your free trial has ended. Upgrade your plan to continue generating content.',
+            code: 'TRIAL_EXPIRED',
+          });
+        }
       }
 
       const balance = await getUserCreditBalance(req.user.id, creditType);

@@ -6,9 +6,7 @@ import {
   deleteWebsite,
   getUserWithPlan,
   findWebsiteByDomain,
-  grantFreeCreditsWithEmail,
 } from '../models/user.models.js';
-import { consumeLinkProof } from '../services/link-verification.js';
 import { requireSupabaseUser, type SupabaseAuthedRequest } from '../middleware/supabaseAuth.middleware.js';
 import sql from '../data/db.js';
 
@@ -25,7 +23,6 @@ const addWebsiteSchema = z.object({
   // Legacy field — still sent by older clients. If present it must match the
   // authenticated user; it is never used as the identity.
   user_id: z.number().optional(),
-  link_proof: z.string().optional(), // single-use proof from verify-link-code; unlocks the grant
 });
 
 // Get the authenticated user's websites. The :user_id path segment is kept for
@@ -53,7 +50,7 @@ router.get('/:user_id', async (req: SupabaseAuthedRequest, res) => {
 // Add new website (for the authenticated user)
 router.post('/', async (req: SupabaseAuthedRequest, res) => {
   try {
-    const { domain, user_id: bodyUserId, link_proof } = addWebsiteSchema.parse(req.body);
+    const { domain, user_id: bodyUserId } = addWebsiteSchema.parse(req.body);
     const user_id = req.appUser!.id;
     if (bodyUserId !== undefined && bodyUserId !== user_id) {
       return res.status(403).json({ success: false, error: 'Not authorized for this account.' });
@@ -87,18 +84,9 @@ router.post('/', async (req: SupabaseAuthedRequest, res) => {
       normDomain = domain.trim().toLowerCase().replace(/^www\./, '');
     }
 
-    // Same hard block as connect: site actively owned by a DIFFERENT account.
+    // Any number of accounts may add the same domain — other accounts' rows are
+    // ignored. Reuse own active / reactivate own soft-deleted / create fresh.
     const allRows = await findWebsiteByDomain(normDomain);
-    const activeElsewhere = allRows.find((r) => r.active && r.user_id !== user_id);
-    if (activeElsewhere) {
-      return res.status(409).json({
-        success: false,
-        error: 'This website is currently connected to another account. Remove it there first.',
-        code: 'DOMAIN_CONFLICT',
-      });
-    }
-
-    // Reuse own active / reactivate own soft-deleted / create fresh.
     const ownActive = allRows.find((r) => r.active && r.user_id === user_id);
     const ownSoftDeleted = allRows.find((r) => !r.active && r.user_id === user_id);
     let website: any;
@@ -111,18 +99,9 @@ router.post('/', async (req: SupabaseAuthedRequest, res) => {
       website = await createWebsite(user_id, normDomain, false);
     }
 
-    // Free credits require a verified company email (single-use proof from
-    // verify-link-code) — the same gate as the plugin connect flow. Adding a site
-    // without a proof still works, but grants nothing.
-    const verifiedEmail = await consumeLinkProof(link_proof, user_id, normDomain);
-    const trial_status = verifiedEmail
-      ? await grantFreeCreditsWithEmail(user_id, website.id, normDomain, verifiedEmail)
-      : 'unverified';
-
     res.status(201).json({
       success: true,
       data: website,
-      trial_status, // 'granted' | 'account_used' | 'domain_used' | 'email_used' | 'unverified'
     });
 
   } catch (error) {

@@ -3,10 +3,7 @@ import { z } from 'zod';
 import crypto from 'crypto';
 import { supabaseAdmin } from '../services/supabase.service.js';
 import sql from '../data/db.js';
-import { findUserByEmail, findUserByOAuth, createUser, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, getUserWebsites, getUserWithPlan, grantFreeCreditsWithEmail, type TrialGrantResult, type User } from '../models/user.models.js';
-import { sendEmail, emailTemplates } from '../services/email.service.js';
-import { checkCompanyEmail } from '../services/company-email.js';
-import { hashCode, timingSafeEqualHex, consumeLinkProof } from '../services/link-verification.js';
+import { findUserByEmail, findUserByOAuth, createUser, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, getUserWebsites, getUserWithPlan, startUserTrial, type User } from '../models/user.models.js';
 
 const router = express.Router();
 
@@ -59,6 +56,10 @@ router.post('/signup', async (req, res) => {
       user = await createUser({ email, name, api_key: apiKey, plan_id: freePlanId, password });
       await initializeUserCredits(user.id, freePlanId);
     }
+
+    // Every signup starts the free trial (idempotent — the DB trigger may have
+    // already started it when it created the row).
+    await startUserTrial(user.id);
 
     res.status(201).json({
       success: true,
@@ -340,6 +341,7 @@ router.post('/oauth-callback', async (req, res) => {
           oauth_id: user.id,
         });
       } catch { /* non-fatal */ }
+      await startUserTrial(emailUser.id); // idempotent — ensure the trial exists
 
       return res.json({
         success: true,
@@ -382,6 +384,7 @@ router.post('/oauth-callback', async (req, res) => {
     }
 
     await initializeUserCredits(newUser.id, freePlanId);
+    await startUserTrial(newUser.id);
 
     return res.status(201).json({
       success: true,
@@ -408,186 +411,28 @@ router.post('/oauth-callback', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Email verification (company-email gate for free credits)
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Verify the Supabase JWT (8s timeout) and return the auth user, or an error tuple.
-async function getAuthedSupabaseUser(
-  req: express.Request,
-): Promise<{ user: NonNullable<Awaited<ReturnType<typeof supabaseAdmin.auth.getUser>>['data']['user']> } | { error: string; status: number }> {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return { error: 'Missing or invalid Authorization header', status: 401 };
-  }
-  const jwt = authHeader.slice(7);
-  try {
-    const result = await Promise.race([
-      supabaseAdmin.auth.getUser(jwt),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('jwt_timeout')), 8000)),
-    ]);
-    if (result.error || !result.data.user) return { error: 'Invalid or expired token', status: 401 };
-    return { user: result.data.user };
-  } catch (err: any) {
-    if (err.message === 'jwt_timeout') return { error: 'Authentication service unavailable. Please try again in a moment.', status: 503 };
-    return { error: 'Invalid or expired token', status: 401 };
-  }
-}
-
-/**
- * POST /api/v1/auth/request-link-code
- * Auth: Supabase JWT. Sends a 6-digit code to a company email so the user can
- * unlock the one-time free credits for a site link. Rate-limited; policy-checked.
- */
-router.post('/request-link-code', async (req, res) => {
-  try {
-    const auth = await getAuthedSupabaseUser(req);
-    if ('error' in auth) return res.status(auth.status).json({ success: false, error: auth.error });
-
-    const { email, site_domain } = z.object({
-      email: z.string().email(),
-      site_domain: z.string().min(1).max(253),
-    }).parse(req.body);
-
-    const normEmail = email.trim().toLowerCase();
-    // Normalise: trim + lowercase FIRST, then strip www. (order matters — an
-    // uppercase "WWW." would survive a case-sensitive strip done before lowercasing,
-    // and the proof lookup is an exact string match on this value).
-    const domain = site_domain.trim().toLowerCase().replace(/^www\./, '');
-
-    // Company-email policy
-    const policy = checkCompanyEmail(normEmail);
-    if (!policy.ok) return res.status(400).json({ success: false, error: policy.message, code: policy.code });
-
-    // Early reject: this email already claimed a grant (better UX than a doomed code).
-    const used = await sql`SELECT 1 FROM credit_grants WHERE lower(email) = ${normEmail} LIMIT 1`;
-    if (used[0]) return res.status(409).json({ success: false, error: 'This email has already been used to claim free credits.', code: 'EMAIL_ALREADY_USED' });
-
-    const user = await findUserByEmail(auth.user.email!);
-    if (!user) return res.status(404).json({ success: false, error: 'User account not found.' });
-
-    // Rate limit: 60s between sends per (user,email); max 5 requests/hour per user.
-    const recent = await sql`
-      SELECT last_sent_at FROM email_verifications
-      WHERE user_id = ${user.id} AND lower(email) = ${normEmail}
-      ORDER BY last_sent_at DESC LIMIT 1
-    `;
-    if (recent[0] && Date.now() - new Date(recent[0].last_sent_at).getTime() < 60_000) {
-      return res.status(429).json({ success: false, error: 'Please wait a minute before requesting another code.' });
-    }
-    const hourCount = await sql`
-      SELECT count(*)::int c FROM email_verifications
-      WHERE user_id = ${user.id} AND created_at > NOW() - INTERVAL '1 hour'
-    `;
-    if ((hourCount[0]?.c ?? 0) >= 5) {
-      return res.status(429).json({ success: false, error: 'Too many code requests. Please try again later.' });
-    }
-
-    const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
-    const codeHash = hashCode(code);
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-    const rows = await sql`
-      INSERT INTO email_verifications (email, code_hash, purpose, user_id, site_domain, expires_at, last_sent_at)
-      VALUES (${normEmail}, ${codeHash}, 'site_link', ${user.id}, ${domain}, ${expiresAt.toISOString()}, NOW())
-      RETURNING id
-    `;
-
-    const tpl = emailTemplates.linkVerificationCode(code, domain);
-    const sent = await sendEmail({ to: normEmail, subject: tpl.subject, html: tpl.html, text: tpl.text });
-
-    // Dev fallback: if Mailgun isn't configured yet, return the code (non-prod only)
-    // so the flow is testable end-to-end.
-    const devFallback = !sent && process.env.NODE_ENV !== 'production';
-    if (!sent && !devFallback) {
-      return res.status(502).json({ success: false, error: 'Could not send the verification email. Please try again.' });
-    }
-
-    return res.json({
-      success: true,
-      verification_id: rows[0].id,
-      ...(devFallback ? { dev_code: code } : {}),
-    });
-  } catch (error) {
-    if (error instanceof z.ZodError) return res.status(400).json({ success: false, error: 'Invalid request data', details: error.errors });
-    const errorId = crypto.randomBytes(4).toString('hex');
-    console.error(`[request-link-code] [${errorId}]`, error);
-    return res.status(500).json({ success: false, error: 'Internal server error', error_id: errorId });
-  }
-});
-
-/**
- * POST /api/v1/auth/verify-link-code
- * Auth: Supabase JWT. Checks the 6-digit code and, on success, returns a single-use
- * link_proof (15-min TTL) that the connect / add-website grant paths consume.
- */
-router.post('/verify-link-code', async (req, res) => {
-  try {
-    const auth = await getAuthedSupabaseUser(req);
-    if ('error' in auth) return res.status(auth.status).json({ success: false, error: auth.error });
-
-    const { verification_id, code } = z.object({
-      verification_id: z.number().int(),
-      code: z.string().regex(/^\d{6}$/),
-    }).parse(req.body);
-
-    const user = await findUserByEmail(auth.user.email!);
-    if (!user) return res.status(404).json({ success: false, error: 'User account not found.' });
-
-    const rows = await sql`
-      SELECT * FROM email_verifications WHERE id = ${verification_id} AND user_id = ${user.id} LIMIT 1
-    `;
-    const v = rows[0] as any;
-    if (!v) return res.status(404).json({ success: false, error: 'Verification not found.' });
-    if (v.consumed_at) return res.status(410).json({ success: false, error: 'This code was already used. Request a new one.' });
-    if (new Date(v.expires_at).getTime() < Date.now()) return res.status(410).json({ success: false, error: 'Code expired. Please request a new one.' });
-    if (v.attempts >= 5) return res.status(429).json({ success: false, error: 'Too many incorrect attempts. Please request a new code.' });
-
-    if (!timingSafeEqualHex(hashCode(code), v.code_hash)) {
-      await sql`UPDATE email_verifications SET attempts = attempts + 1 WHERE id = ${v.id}`;
-      return res.status(400).json({ success: false, error: 'Incorrect code.', attempts_left: Math.max(0, 5 - (v.attempts + 1)) });
-    }
-
-    const proof = crypto.randomBytes(32).toString('hex');
-    const proofExpires = new Date(Date.now() + 15 * 60 * 1000);
-    await sql`
-      UPDATE email_verifications
-      SET consumed_at = NOW(), proof_token = ${proof}, proof_expires_at = ${proofExpires.toISOString()}
-      WHERE id = ${v.id}
-    `;
-    return res.json({ success: true, link_proof: proof, email: v.email });
-  } catch (error) {
-    if (error instanceof z.ZodError) return res.status(400).json({ success: false, error: 'Invalid request data', details: error.errors });
-    const errorId = crypto.randomBytes(4).toString('hex');
-    console.error(`[verify-link-code] [${errorId}]`, error);
-    return res.status(500).json({ success: false, error: 'Internal server error', error_id: errorId });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Plugin Connect Token endpoints
 // ─────────────────────────────────────────────────────────────────────────────
 
 const issueConnectTokenSchema = z.object({
   site_domain: z.string().min(1).max(253),
   source: z.literal('plugin').optional(),
-  link_proof: z.string().optional(), // single-use proof from verify-link-code; unlocks the grant
 });
 
 /**
  * POST /api/v1/auth/issue-connect-token
  *
  * Authenticated with Supabase JWT (Authorization: Bearer <token>).
- * Enforces one-trial-per-account and one-trial-per-domain rules,
- * then creates (or retrieves) the website entry and returns a short-lived
- * opaque token for the plugin to exchange.
+ * Links the site to the account (any number of accounts may link the same
+ * domain) and returns a short-lived opaque token for the plugin to exchange.
+ * Credits/trial are granted at SIGNUP, not here.
  */
 router.post('/issue-connect-token', async (req, res) => {
   try {
     // ── 1. Validate request body first (sync, no network cost) ─────────────
-    const { site_domain, link_proof } = issueConnectTokenSchema.parse(req.body);
-    // Normalise: strip leading www. so "www.example.com" and "example.com" are the same site
+    const { site_domain } = issueConnectTokenSchema.parse(req.body);
     // Normalise: trim + lowercase FIRST, then strip www. (order matters — an
-    // uppercase "WWW." would survive a case-sensitive strip done before lowercasing,
-    // and the proof lookup is an exact string match on this value).
+    // uppercase "WWW." would survive a case-sensitive strip done before lowercasing).
     const domain = site_domain.trim().toLowerCase().replace(/^www\./, '');
 
     // ── 2. Verify Supabase JWT (8 s timeout — guards against auth service hangs) ──
@@ -625,19 +470,10 @@ router.post('/issue-connect-token', async (req, res) => {
       return res.status(404).json({ success: false, error: 'User account not found. Please contact support.' });
     }
 
-    // ── 4. Resolve this account's website row (connection = ownership/linkage) ──
-    // Connecting is decoupled from the credit grant. The ONLY hard block is a site
-    // that is actively owned by a DIFFERENT account right now.
-    const activeElsewhere = allDomainRows.find(r => r.active && r.user_id !== user.id);
-    if (activeElsewhere) {
-      return res.status(409).json({
-        success: false,
-        error: 'This website is currently connected to another account. Remove it there first.',
-        code: 'DOMAIN_CONFLICT',
-      });
-    }
-
-    // Reconnect own active row, reactivate own soft-deleted row, or create a fresh one.
+    // ── 4. Resolve this account's website row ────────────────────────────────
+    // Any number of accounts may link the same domain — other accounts' rows for
+    // this domain are simply ignored. Reconnect own active row, reactivate own
+    // soft-deleted row, or create a fresh one.
     let websiteId: number;
     let site_code: string;
     const ownActiveRow   = allDomainRows.find(r => r.active && r.user_id === user.id);
@@ -674,8 +510,7 @@ router.post('/issue-connect-token', async (req, res) => {
         newSite = await createWebsite(user.id, domain, false);
       } catch (error: any) {
         if (error.code === '23505' || error.message === 'Failed to generate unique site code') {
-          // A concurrent request raced us and inserted first (unique partial index on
-          // domain WHERE active=true). createWebsite may throw with or without .code.
+          // A concurrent request raced us on site_code generation.
           return res.status(409).json({
             success: false,
             error: 'Connection is already in progress. Please try again in a moment.',
@@ -688,32 +523,19 @@ router.post('/issue-connect-token', async (req, res) => {
       site_code = newSite.site_code;
     }
 
-    // ── 5. One-time free credit grant — requires a verified company email ────
-    // Connecting always succeeds above. Credits are only awarded when a valid,
-    // single-use link_proof (from verify-link-code) is presented, and only if the
-    // account, domain and verified email have never been granted before.
-    const verifiedEmail = await consumeLinkProof(link_proof, user.id, domain);
-    const grant: TrialGrantResult | 'unverified' = verifiedEmail
-      ? await grantFreeCreditsWithEmail(user.id, websiteId, domain, verifiedEmail)
-      : 'unverified';
-
-    let trial_status: 'new' | 'reconnect' | 'none';
-    let trial_reason: string | null = null;
-    if (grant === 'granted') {
-      trial_status = 'new';                 // free credits awarded
-    } else if (ownActiveRow || ownSoftDeleted) {
-      trial_status = 'reconnect';           // their own existing site, no new grant
-    } else {
-      trial_status = 'none';                // connected, but no credits granted
-      trial_reason = grant;                 // 'account_used' | 'domain_used' | 'email_used' | 'unverified'
-    }
+    // ── 5. Trial info (granted at signup — nothing to grant here) ────────────
+    const trial_status: 'new' | 'reconnect' = (ownActiveRow || ownSoftDeleted) ? 'reconnect' : 'new';
+    const trial_ends_at = user.trial_ends_at ? new Date(user.trial_ends_at).toISOString() : null;
+    const days_remaining = user.trial_ends_at
+      ? Math.max(0, Math.ceil((new Date(user.trial_ends_at).getTime() - Date.now()) / 86_400_000))
+      : null;
 
     // ── 6. Issue short-lived connect token (idempotent) ─────────────────────
     // Return an existing valid token if one already exists for this user+site_code.
     // This handles the race where the client calls this endpoint twice in quick
     // succession (e.g. TOKEN_REFRESHED firing alongside INITIAL_SESSION).
     const existingRows = await sql`
-      SELECT token, trial_status, trial_reason FROM connect_tokens
+      SELECT token FROM connect_tokens
       WHERE  user_id   = ${user.id}
         AND  site_code = ${site_code}
         AND  used      = false
@@ -725,20 +547,6 @@ router.post('/issue-connect-token', async (req, res) => {
     let token: string;
     if (existingRows[0]) {
       token = existingRows[0].token as string;
-      if (grant === 'granted') {
-        // The user verified and was granted on THIS call, after the token was first
-        // issued (e.g. first attempt skipped verification). The stored status is
-        // stale — update the row so exchange reports the grant correctly.
-        await sql`
-          UPDATE connect_tokens SET trial_status = ${trial_status}, trial_reason = ${trial_reason}
-          WHERE token = ${token}
-        `;
-      } else {
-        // No new grant this call: the outcome recorded at first issue is authoritative
-        // (keeps the response consistent with what exchange will later return).
-        trial_status = (existingRows[0].trial_status as typeof trial_status) || trial_status;
-        trial_reason = (existingRows[0].trial_reason as typeof trial_reason) ?? trial_reason;
-      }
     } else {
       token = crypto.randomBytes(32).toString('hex');
       const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
@@ -746,11 +554,11 @@ router.post('/issue-connect-token', async (req, res) => {
       // Opportunistic cleanup — runs async, doesn't block the response
       sql`DELETE FROM connect_tokens WHERE expires_at < NOW() - INTERVAL '1 hour'`.catch(() => {/* ignore */});
 
-      // Persist the trial outcome on the token so the redirect-fallback path (which
-      // never receives the postMessage) can read the exact status at exchange time.
+      // Persist trial_status so the redirect-fallback path (which never receives
+      // the postMessage) can read it at exchange time.
       await sql`
-        INSERT INTO connect_tokens (token, user_id, site_code, expires_at, trial_status, trial_reason)
-        VALUES (${token}, ${user.id}, ${site_code}, ${expiresAt.toISOString()}, ${trial_status}, ${trial_reason})
+        INSERT INTO connect_tokens (token, user_id, site_code, expires_at, trial_status)
+        VALUES (${token}, ${user.id}, ${site_code}, ${expiresAt.toISOString()}, ${trial_status})
       `;
     }
 
@@ -758,8 +566,9 @@ router.post('/issue-connect-token', async (req, res) => {
       success: true,
       data: {
         connect_token: token,
-        trial_status,   // 'new' | 'reconnect' | 'none'
-        trial_reason,   // 'account_used' | 'domain_used' | null  (only when status === 'none')
+        trial_status,     // 'new' | 'reconnect'
+        trial_ends_at,    // ISO timestamp or null
+        days_remaining,   // integer days left in the trial, or null
       },
     });
 
@@ -828,6 +637,13 @@ router.post('/exchange-connect-token', async (req, res) => {
     }
     const row = { ...tokenRow, ...userRows[0] } as any;
 
+    // Days remaining in the signup trial (7-day window started at signup).
+    let days_remaining: number | null = null;
+    if (row.trial_ends_at) {
+      const msLeft = new Date(row.trial_ends_at).getTime() - Date.now();
+      days_remaining = Math.max(0, Math.ceil(msLeft / 86_400_000));
+    }
+
     return res.json({
       success: true,
       data: {
@@ -835,10 +651,10 @@ router.post('/exchange-connect-token', async (req, res) => {
         site_code: row.site_code,
         user_name: row.user_name,
         email: row.email,
-        // Trial is now a one-time credit grant with no expiry — surface the recorded
-        // outcome so the redirect-fallback path shows the correct screen 3 variant.
-        trial_status: row.trial_status || 'new',          // 'new' | 'reconnect' | 'none'
-        trial_reason: row.trial_reason || null,           // 'account_used' | 'domain_used' | null
+        trial_status: row.trial_status || 'new',  // 'new' | 'reconnect'
+        trial_started_at: row.trial_started_at,
+        trial_ends_at: row.trial_ends_at,
+        days_remaining,
       },
     });
 
