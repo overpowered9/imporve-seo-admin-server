@@ -43,6 +43,7 @@ router.get('/status', validateApiAccess, async (req, res) => {
     res.json({
       success: true,
       user: user.name || user.email,
+      email: user.email,
       website: website?.domain,
       credits: {
         images: credits.find(c => c.credit_type === 'images')?.amount || 0,
