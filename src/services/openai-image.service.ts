@@ -84,12 +84,31 @@ function nicheKey(niche?: string): string {
 
 export function buildImagePrompt(p: GenerateImageParams): string {
   if (p.prompt && p.prompt.trim()) return p.prompt.trim();
-  const scene = SCENE_TEMPLATES[nicheKey(p.niche)] || DEFAULT_SCENE;
-  const subject = p.title ? ` The article is about: ${p.title}.` : '';
-  const loc = [p.city, p.state].filter(Boolean).join(', ');
-  const location = loc ? ` Location context: ${loc}.` : '';
+  const nicheScene = SCENE_TEMPLATES[nicheKey(p.niche)];
   const wrapper = p.style === 'illustration' ? ILLUSTRATION_WRAPPER : DOCUMENTARY_WRAPPER;
-  return `${scene}.${subject}${location} ${wrapper}`;
+  const loc = [p.city, p.state].filter(Boolean).join(', ');
+  const locationHint = loc
+    ? ` The scene is in ${loc}; hint at the location only through architecture, climate and vegetation — never with text or signs.`
+    : '';
+  const title = (p.title || '').trim();
+
+  // Niche-only request: the stock scene is the subject (previous behaviour).
+  if (!title) {
+    return `${nicheScene || DEFAULT_SCENE}.${locationHint} ${wrapper}`;
+  }
+
+  // Title-led prompt: the title's concrete subject drives the image; the niche scene is only
+  // supporting context, so a specific title never gets buried under a generic stock scene.
+  const parts = [
+    `Cover photo for a blog article titled "${title}".`,
+    'Depict the single most concrete, visually recognisable subject from that exact title and make it the clear focus of the scene — a viewer should be able to guess the article topic from the image alone.',
+  ];
+  if (nicheScene) {
+    parts.push(`For flavour only, a typical setting in this industry looks like: ${nicheScene}. Borrow from it only where it fits the title; when the title suggests something more specific, the title wins.`);
+  }
+  if (locationHint) parts.push(locationHint.trim());
+  parts.push(wrapper);
+  return parts.join(' ');
 }
 
 /** Map an axios/OpenAI failure to a clean ImageGenError. */
