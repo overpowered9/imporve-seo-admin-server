@@ -102,7 +102,9 @@ router.post('/by-email', async (req, res) => {
         has_password: !!user.password_hash,
         credits,
         websites_count: websites.length,
-        created_at: user.created_at
+        created_at: user.created_at,
+        trial_started_at: user.trial_started_at || null,
+        trial_ends_at: user.trial_ends_at || null
       }
     });
     
