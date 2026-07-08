@@ -13,7 +13,8 @@ import {
   cancelSubscription,
   refillPlanCredits,
   addPurchasedCredits,
-  suspendPlanCredits
+  suspendPlanCredits,
+  getFreePlanId
 } from '../models/user.models.js';
 
 const router = express.Router();
@@ -533,19 +534,24 @@ router.post('/webhook', async (req: Request, res: Response) => {
         if (subResult.length > 0) {
           const userId = subResult[0].user_id;
 
-          // Downgrade to basic plan
+          // Downgrade to the FREE plan (was hardcoded plan_id=1 = Basic, a PAID
+          // plan — which both mislabeled cancelled users and let them bypass the
+          // free-plan trial gate forever). Plan (included) credits are revoked;
+          // purchased top-ups are preserved — the user paid for those.
+          const freePlanId = await getFreePlanId();
           await sql`
-            UPDATE users SET plan_id = 1, updated_at = NOW()
+            UPDATE users SET plan_id = ${freePlanId}, updated_at = NOW()
             WHERE id = ${userId}
           `;
+          await suspendPlanCredits(userId, 'Subscription cancelled');
 
           await sql`
-            UPDATE subscriptions 
+            UPDATE subscriptions
             SET status = 'cancelled'
             WHERE user_id = ${userId}
           `;
 
-          console.log(`⚠️ Subscription cancelled for user ${userId}, downgraded to basic plan`);
+          console.log(`⚠️ Subscription cancelled for user ${userId}, downgraded to free plan (purchased credits preserved)`);
         }
         break;
       }
