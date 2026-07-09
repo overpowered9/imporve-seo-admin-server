@@ -6,6 +6,10 @@ interface EmailOptions {
   subject: string;
   html: string;
   text?: string;
+  /** Override the default "From" header (e.g. "Nathan from ImproveSEO <nathan@…>"). */
+  from?: string;
+  /** Set a Reply-To so replies reach a monitored inbox. */
+  replyTo?: string;
 }
 
 export const sendEmail = async (options: EmailOptions): Promise<boolean> => {
@@ -14,9 +18,10 @@ export const sendEmail = async (options: EmailOptions): Promise<boolean> => {
     const mailgunApiKey = process.env.MAILGUN_API_KEY;
     const mailgunFromName = process.env.MAILGUN_FROM_NAME || 'ImproveSEO Support';
     const mailgunFromEmail = process.env.MAILGUN_FROM_EMAIL || 'noreply@improveseo.app';
-    const mailgunFromHeader = mailgunFromEmail.includes('<')
+    const defaultFromHeader = mailgunFromEmail.includes('<')
       ? mailgunFromEmail
       : `${mailgunFromName} <${mailgunFromEmail}>`;
+    const fromHeader = options.from || defaultFromHeader;
 
     if (!mailgunDomain || !mailgunApiKey) {
       console.warn('Mailgun configuration missing. Skipping email send.');
@@ -24,12 +29,15 @@ export const sendEmail = async (options: EmailOptions): Promise<boolean> => {
     }
 
     const form = new FormData();
-    form.append('from', mailgunFromHeader);
+    form.append('from', fromHeader);
     form.append('to', options.to);
     form.append('subject', options.subject);
     form.append('html', options.html);
     if (options.text) {
       form.append('text', options.text);
+    }
+    if (options.replyTo) {
+      form.append('h:Reply-To', options.replyTo);
     }
 
     const response = await axios.post(
@@ -52,58 +60,99 @@ export const sendEmail = async (options: EmailOptions): Promise<boolean> => {
   }
 };
 
+// ── Trial drip emails (personal, from the CEO) ───────────────────────────────
+// Simple, letter-style layout — these read as a person writing, not a product
+// broadcast. bodyHtml is a series of <p>…</p> paragraphs; ctaLabel/ctaUrl render
+// an optional button.
+const trialEmailShell = (bodyHtml: string, ctaLabel?: string, ctaUrl?: string): string => `
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.65; color: #2c3e50; margin: 0; padding: 0; background: #f5f7fa; }
+      .wrapper { background: #f5f7fa; padding: 24px; }
+      .container { max-width: 560px; margin: 0 auto; background: #ffffff; border-radius: 10px; padding: 36px 34px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+      .container p { margin: 0 0 16px; font-size: 15px; color: #333; }
+      .container ul { margin: 0 0 16px; padding-left: 20px; }
+      .container li { font-size: 15px; color: #333; margin-bottom: 8px; }
+      .cta { text-align: center; margin: 28px 0; }
+      .cta a { display: inline-block; background: #1c7293; color: #ffffff !important; text-decoration: none; padding: 14px 30px; border-radius: 8px; font-weight: 700; font-size: 15px; }
+      .sig { margin-top: 24px; }
+      .footer { max-width: 560px; margin: 14px auto 0; text-align: center; color: #9aa0a6; font-size: 11px; }
+      .footer a { color: #9aa0a6; }
+    </style>
+  </head>
+  <body>
+    <div class="wrapper">
+      <div class="container">
+        ${bodyHtml}
+        ${ctaLabel && ctaUrl ? `<div class="cta"><a href="${ctaUrl}">${ctaLabel}</a></div>` : ''}
+        <div class="sig">
+          <p style="margin:0;">Best,<br><strong>Nathan</strong><br>CEO of ImproveSEO</p>
+        </div>
+      </div>
+      <div class="footer">
+        <p>© 2026 ImproveSEO. You're receiving this because you started a free trial.</p>
+      </div>
+    </div>
+  </body>
+  </html>
+`;
+
 // Email template generators
 export const emailTemplates = {
-  linkVerificationCode: (code: string, siteDomain: string) => {
-    return {
-      subject: `Your ImproveSEO verification code: ${code}`,
-      html: `
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <meta charset="UTF-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2c3e50; margin: 0; padding: 0; background: #f5f7fa; }
-            .wrapper { background: #f5f7fa; padding: 20px; }
-            .container { max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-            .header { background: linear-gradient(135deg, #1c7293 0%, #2ec5b6 100%); padding: 44px 30px; text-align: center; }
-            .header h1 { margin: 0; color: #fff; font-size: 26px; font-weight: 700; letter-spacing: -0.5px; }
-            .header-subtext { color: rgba(255,255,255,0.9); font-size: 14px; margin-top: 8px; }
-            .content { padding: 40px 30px; text-align: center; }
-            .content p { margin: 12px 0; color: #555; font-size: 15px; line-height: 1.7; }
-            .code-box { display: inline-block; background: #f0f7f9; border: 2px dashed #1c7293; border-radius: 10px; padding: 20px 34px; margin: 24px 0; }
-            .code { font-family: 'Courier New', monospace; font-size: 38px; font-weight: 800; letter-spacing: 10px; color: #1c7293; }
-            .meta { font-size: 13px; color: #888; }
-            .footer { background: #f8f9fa; padding: 26px; text-align: center; border-top: 1px solid #eee; }
-            .footer p { margin: 4px 0; font-size: 12px; color: #999; }
-            .footer-brand { font-weight: 600; color: #1c7293; }
-          </style>
-        </head>
-        <body>
-          <div class="wrapper">
-            <div class="container">
-              <div class="header">
-                <h1>Verify your email</h1>
-                <p class="header-subtext">To activate free credits for ${siteDomain || 'your site'}</p>
-              </div>
-              <div class="content">
-                <p>Enter this verification code in ImproveSEO to continue:</p>
-                <div class="code-box"><span class="code">${code}</span></div>
-                <p class="meta">This code expires in 10 minutes. If you didn't request it, you can safely ignore this email.</p>
-              </div>
-              <div class="footer">
-                <p><span class="footer-brand">ImproveSEO</span></p>
-                <p>© 2026 ImproveSEO. All rights reserved.</p>
-              </div>
-            </div>
-          </div>
-        </body>
-        </html>
+  // Email 1 — Welcome (sent at signup / trial start)
+  trialWelcome: (firstName: string, createUrl: string) => ({
+    subject: "You're in — let's create your first local SEO page",
+    html: trialEmailShell(
+      `
+      <p>Hi ${firstName},</p>
+      <p>Welcome to ImproveSEO! You've already got the technical setup email — this one's just from us, human to human.</p>
+      <p>Most local businesses lose customers to competitors simply because they don't have enough content targeting the neighborhoods, services, and search terms people actually search for — and increasingly, ask AI chatbots like ChatGPT and Google's AI answers about. That's what this plugin solves — it generates new, local-search-ready content built to get found both on Google and in AI chatbot answers, without you needing to write it yourself or know anything about SEO.</p>
+      <p><strong>One thing to do today:</strong> Log in and generate your first page or post. Takes a few minutes, and you'll see exactly how it's built for local search.</p>
+      <p>Stuck or confused? Just reply — a real person reads these.</p>
       `,
-      text: `Your ImproveSEO verification code is: ${code}\n\nEnter it in ImproveSEO to activate free credits for ${siteDomain || 'your site'}.\nThis code expires in 10 minutes. If you didn't request it, ignore this email.\n\n© 2026 ImproveSEO`,
-    };
-  },
+      'Create My First Page →',
+      createUrl,
+    ),
+    text: `Hi ${firstName},\n\nWelcome to ImproveSEO! You've already got the technical setup email — this one's just from us, human to human.\n\nMost local businesses lose customers to competitors simply because they don't have enough content targeting the neighborhoods, services, and search terms people actually search for — and increasingly, ask AI chatbots like ChatGPT and Google's AI answers about. That's what this plugin solves — it generates new, local-search-ready content built to get found both on Google and in AI chatbot answers, without you needing to write it yourself or know anything about SEO.\n\nOne thing to do today: Log in and generate your first page or post. Takes a few minutes, and you'll see exactly how it's built for local search.\n\nCreate My First Page: ${createUrl}\n\nStuck or confused? Just reply — a real person reads these.\n\nBest,\nNathan, CEO of ImproveSEO`,
+  }),
+
+  // Email 2 — Check-in (Day 3-4)
+  trialCheckin: (firstName: string) => ({
+    subject: "How's it going so far?",
+    html: trialEmailShell(
+      `
+      <p>Hi ${firstName},</p>
+      <p>A few days into your trial — checking in.</p>
+      <p>Have you generated your first piece of content yet? Most business owners are surprised how much local detail (neighborhoods, services, common customer phrases) the ImproveSEO builds in automatically — content designed to help you get found on Google and when people ask AI chatbots for recommendations.</p>
+      <p>If you haven't started, or aren't sure what to create first, reply and tell us your business type and service area. We'll suggest exactly where to start.</p>
+      `,
+    ),
+    text: `Hi ${firstName},\n\nA few days into your trial — checking in.\n\nHave you generated your first piece of content yet? Most business owners are surprised how much local detail (neighborhoods, services, common customer phrases) the ImproveSEO builds in automatically — content designed to help you get found on Google and when people ask AI chatbots for recommendations.\n\nIf you haven't started, or aren't sure what to create first, reply and tell us your business type and service area. We'll suggest exactly where to start.\n\nBest,\nNathan, CEO of ImproveSEO`,
+  }),
+
+  // Email 3 — Trial ending (morning of the last day)
+  trialEnding: (firstName: string, upgradeUrl: string) => ({
+    subject: 'Your trial wraps up today',
+    html: trialEmailShell(
+      `
+      <p>Hi ${firstName},</p>
+      <p>Your 7-day trial ends tonight. Here's a quick recap of what ImproveSEO does for you:</p>
+      <ul>
+        <li>Generates new, local-search-ready content for your site — no writing or SEO knowledge needed</li>
+        <li>Helps you show up for the neighborhoods, services, and search terms your customers are actually searching — including through AI chatbots like ChatGPT, not just Google</li>
+      </ul>
+      <p><strong>To keep it going:</strong> $25/month, no contract, cancel anytime.</p>
+      <p>Questions or on the fence? Reply — happy to help you decide either way.</p>
+      `,
+      'Keep My Plugin Active →',
+      upgradeUrl,
+    ),
+    text: `Hi ${firstName},\n\nYour 7-day trial ends tonight. Here's a quick recap of what ImproveSEO does for you:\n\n- Generates new, local-search-ready content for your site — no writing or SEO knowledge needed\n- Helps you show up for the neighborhoods, services, and search terms your customers are actually searching — including through AI chatbots like ChatGPT, not just Google\n\nTo keep it going: $25/month, no contract, cancel anytime.\n\nKeep My Plugin Active: ${upgradeUrl}\n\nQuestions or on the fence? Reply — happy to help you decide either way.\n\nBest,\nNathan, CEO of ImproveSEO`,
+  }),
 
   ticketCreated: (ticketId: string, ticketDisplayId: string, subject: string, userName: string, cmsUrl: string) => {
     return {

@@ -8,6 +8,7 @@ import { connectToDatabase } from './config/database.js';
 import adminPromptRoutes from './routes/admin/prompts.routes.js';
 import generationsRoutes from './routes/generations.routes.js';
 import { testConnection } from './data/db.js';
+import { startTrialEmailScheduler } from './services/trial-emails.service.js';
 
 dotenv.config();
 
@@ -77,7 +78,10 @@ async function startServer() {
     }
     // Connect to MongoDB
     await connectToDatabase();
-    
+
+    // Start the trial-email drip scheduler (no-op unless TRIAL_EMAILS_ENABLED=true)
+    startTrialEmailScheduler();
+
     // Start Express server
     const server = app.listen(port, () => {
       console.log(`[improveseo-ai-server] listening on http://localhost:${port}`);
