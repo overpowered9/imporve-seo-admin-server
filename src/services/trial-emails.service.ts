@@ -40,10 +40,19 @@ const firstNameOf = (name?: string | null): string => {
   return n.split(/\s+/)[0];
 };
 
-type DueRow = { id: number; email: string; name: string | null };
+type DueRow = { id: number; email: string; name: string | null; trial_ends_at?: string | null };
 
+const fmtDate = (d?: string | null): string =>
+  d ? new Date(d).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : 'in 7 days';
+
+// Send from the CEO (custom from + reply-to) — the relationship emails.
 async function send(row: DueRow, tpl: { subject: string; html: string; text: string }, c: ReturnType<typeof cfg>): Promise<boolean> {
   return sendEmail({ to: row.email, subject: tpl.subject, html: tpl.html, text: tpl.text, from: c.from, replyTo: c.replyTo });
+}
+
+// Send from the default system sender — the transactional confirmation.
+async function sendSystem(row: DueRow, tpl: { subject: string; html: string; text: string }): Promise<boolean> {
+  return sendEmail({ to: row.email, subject: tpl.subject, html: tpl.html, text: tpl.text });
 }
 
 /** Run one pass of all three drip emails. Returns per-type counts sent. */
@@ -52,19 +61,23 @@ export async function processTrialEmails(): Promise<{ welcome: number; checkin: 
   const counts = { welcome: 0, checkin: 0, trialEnding: 0 };
   if (!c.enabled) return counts;
 
-  // ── Welcome — any user not yet welcomed (existing users were back-marked) ──
+  // ── Account confirmation + Welcome — both sent at account creation ─────────
+  // Per spec, a new signup gets the transactional confirmation (system sender)
+  // AND the human Welcome (from the CEO). One claim gates both.
   const welcomeRows = await sql<DueRow[]>`
     WITH due AS (SELECT id FROM users WHERE welcome_email_sent_at IS NULL ORDER BY id LIMIT ${BATCH_LIMIT})
     UPDATE users u SET welcome_email_sent_at = NOW()
     FROM due WHERE u.id = due.id
-    RETURNING u.id, u.email, u.name
+    RETURNING u.id, u.email, u.name, u.trial_ends_at
   `;
   for (const row of welcomeRows) {
-    const ok = await send(row, emailTemplates.trialWelcome(firstNameOf(row.name), c.createUrl), c);
-    if (ok) { counts.welcome++; }
-    else { // un-claim so it retries next pass instead of being silently dropped
+    const first = firstNameOf(row.name);
+    const confOk = await sendSystem(row, emailTemplates.accountConfirmation(first, c.createUrl, fmtDate(row.trial_ends_at)));
+    const welcomeOk = await send(row, emailTemplates.trialWelcome(first, c.createUrl), c);
+    if (confOk && welcomeOk) { counts.welcome++; }
+    else { // un-claim so the pair retries next pass instead of being silently dropped
       await sql`UPDATE users SET welcome_email_sent_at = NULL WHERE id = ${row.id}`;
-      console.warn(`[trial-emails] welcome send failed for user ${row.id} (will retry)`);
+      console.warn(`[trial-emails] signup emails failed for user ${row.id} (conf:${confOk} welcome:${welcomeOk}) — will retry`);
     }
   }
 

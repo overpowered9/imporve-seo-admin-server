@@ -103,7 +103,59 @@ const trialEmailShell = (bodyHtml: string, ctaLabel?: string, ctaUrl?: string): 
 
 // Email template generators
 export const emailTemplates = {
-  // Email 1 — Welcome (sent at signup / trial start)
+  // Email 1 (of 4) — Technical account-creation confirmation. Transactional,
+  // sent from the default system sender alongside the (human) Welcome email.
+  accountConfirmation: (firstName: string, dashboardUrl: string, trialEndsDate: string) => ({
+    subject: 'Your ImproveSEO account is ready',
+    html: `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2c3e50; margin: 0; padding: 0; background: #f5f7fa; }
+          .wrapper { background: #f5f7fa; padding: 22px; }
+          .container { max-width: 560px; margin: 0 auto; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+          .header { background: linear-gradient(135deg, #1c7293 0%, #2ec5b6 100%); padding: 40px 30px; text-align: center; }
+          .header h1 { margin: 0; color: #fff; font-size: 24px; font-weight: 700; }
+          .content { padding: 34px 30px; }
+          .content p { margin: 0 0 14px; font-size: 15px; color: #333; }
+          .facts { background: #f0f7f9; border-radius: 8px; padding: 16px 18px; margin: 18px 0; }
+          .facts p { margin: 6px 0; font-size: 14px; color: #1c7293; }
+          .cta { text-align: center; margin: 26px 0 6px; }
+          .cta a { display: inline-block; background: #1c7293; color: #fff !important; text-decoration: none; padding: 13px 30px; border-radius: 8px; font-weight: 700; font-size: 15px; }
+          .footer { background: #f8f9fa; padding: 22px; text-align: center; border-top: 1px solid #eee; }
+          .footer p { margin: 3px 0; font-size: 11px; color: #9aa0a6; }
+        </style>
+      </head>
+      <body>
+        <div class="wrapper">
+          <div class="container">
+            <div class="header"><h1>Your account is ready</h1></div>
+            <div class="content">
+              <p>Hi ${firstName},</p>
+              <p>Your ImproveSEO account has been created and your <strong>7-day free trial</strong> is now active.</p>
+              <div class="facts">
+                <p><strong>Trial ends:</strong> ${trialEndsDate}</p>
+                <p><strong>Included:</strong> 10 free credits each for articles, images &amp; keywords</p>
+              </div>
+              <p>Log in any time to start generating local-search-ready content.</p>
+              <div class="cta"><a href="${dashboardUrl}">Go to Dashboard</a></div>
+            </div>
+            <div class="footer">
+              <p>This is an automated confirmation from ImproveSEO.</p>
+              <p>© 2026 ImproveSEO. All rights reserved.</p>
+            </div>
+          </div>
+        </div>
+      </body>
+      </html>
+    `,
+    text: `Hi ${firstName},\n\nYour ImproveSEO account has been created and your 7-day free trial is now active.\n\nTrial ends: ${trialEndsDate}\nIncluded: 10 free credits each for articles, images & keywords\n\nLog in any time to start generating local-search-ready content:\n${dashboardUrl}\n\nThis is an automated confirmation from ImproveSEO.\n© 2026 ImproveSEO`,
+  }),
+
+  // Email 2 (of 4) — Welcome (human, from the CEO; sent with the confirmation)
   trialWelcome: (firstName: string, createUrl: string) => ({
     subject: "You're in — let's create your first local SEO page",
     html: trialEmailShell(
