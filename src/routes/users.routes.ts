@@ -14,7 +14,8 @@ import {
   deleteUserWebsite,
   getUserSubscription,
   updateUserName,
-  regenerateApiKey
+  regenerateApiKey,
+  reconcileTrialCredits
 } from '../models/user.models.js';
 
 const router = express.Router();
@@ -34,12 +35,16 @@ router.get('/status', validateApiAccess, async (req, res) => {
       });
     }
 
+    // Void any expired trial (plan) credits before reading, so the numbers we return
+    // reflect the truth immediately rather than only after a generation attempt.
+    const trialExpired = await reconcileTrialCredits(user);
+
     // Get user credit balances
     const credits = await getUserCreditBalances(user.id);
-    
+
     // Get user subscription/plan details
     const subscription = await getUserSubscription(user.id);
-    
+
     res.json({
       success: true,
       user: user.name || user.email,
@@ -50,6 +55,7 @@ router.get('/status', validateApiAccess, async (req, res) => {
         content: credits.find(c => c.credit_type === 'content')?.amount || 0,
         keywords: credits.find(c => c.credit_type === 'keywords')?.amount || 0
       },
+      trial_expired: trialExpired,
       subscription: subscription || null,
       server_status: 'connected',
       timestamp: new Date().toISOString()
@@ -76,15 +82,19 @@ router.post('/by-email', async (req, res) => {
       });
     }
 
+    // Void any expired trial (plan) credits before reading, so the dashboard shows the
+    // truthful post-expiry balance (plan credits zeroed, purchased preserved).
+    const trialExpired = await reconcileTrialCredits(user);
+
     // Get user with plan details
     const userWithPlan = await getUserWithPlan(user.id);
-    
+
     // Get credit balances
     const credits = await getUserCreditBalances(user.id);
-    
+
     // Get websites
     const websites = await getUserWebsites(user.id);
-    
+
     res.json({
       success: true,
       user: {
@@ -104,7 +114,8 @@ router.post('/by-email', async (req, res) => {
         websites_count: websites.length,
         created_at: user.created_at,
         trial_started_at: user.trial_started_at || null,
-        trial_ends_at: user.trial_ends_at || null
+        trial_ends_at: user.trial_ends_at || null,
+        trial_expired: trialExpired
       }
     });
     

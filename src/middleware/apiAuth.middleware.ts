@@ -1,6 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { findUserByApiKey, findWebsiteByCode, getUserCreditBalance, suspendPlanCredits } from '../models/user.models.js';
-import sql from '../data/db.js';
+import { findUserByApiKey, findWebsiteByCode, getUserCreditBalance, reconcileTrialCredits } from '../models/user.models.js';
 
 export interface AuthenticatedRequest extends Request {
   user?: any;
@@ -72,28 +71,23 @@ export const validateCredits = (creditType: 'images' | 'content' | 'keywords', r
       // signup). When it ends, the TRIAL (included) credits are voided — but
       // PURCHASED top-up credits keep working (the user paid for those).
       // Upgrading to a paid plan changes plan_id, which bypasses this entirely.
-      if (req.user.trial_ends_at && new Date(req.user.trial_ends_at).getTime() < Date.now()) {
-        const planRows = await sql`
-          SELECT price_cents FROM subscription_plans WHERE id = ${req.user.plan_id} LIMIT 1
-        `;
-        const isFreePlan = !planRows[0] || Number(planRows[0].price_cents) === 0;
-        if (isFreePlan) {
-          // Lazily void any leftover trial credits (idempotent; logs the void in
-          // credit_transactions on the first pass, no-ops afterwards). After this,
-          // the generated `amount` column reflects purchased credits only.
-          await suspendPlanCredits(req.user.id, 'Trial expired');
-
-          const purchasedBalance = await getUserCreditBalance(req.user.id, creditType);
-          if (purchasedBalance < requiredAmount) {
-            return res.status(402).json({
-              success: false,
-              error: 'Your free trial has ended. Upgrade your plan or buy credits to continue generating content.',
-              code: 'TRIAL_EXPIRED',
-            });
-          }
-          // Purchased credits cover the request — allow it through.
-          return next();
+      //
+      // reconcileTrialCredits uses the *effective* trial end (created_at + TRIAL_DAYS
+      // when trial_ends_at was never set), so a missing timestamp can't slip past the
+      // gate. It voids the plan credits and returns true iff this is a free-plan account
+      // with an expired trial; after it runs, `amount` reflects purchased credits only.
+      const trialExpired = await reconcileTrialCredits(req.user);
+      if (trialExpired) {
+        const purchasedBalance = await getUserCreditBalance(req.user.id, creditType);
+        if (purchasedBalance < requiredAmount) {
+          return res.status(402).json({
+            success: false,
+            error: 'Your free trial has ended. Upgrade your plan or buy credits to continue generating content.',
+            code: 'TRIAL_EXPIRED',
+          });
         }
+        // Purchased credits cover the request — allow it through.
+        return next();
       }
 
       const balance = await getUserCreditBalance(req.user.id, creditType);

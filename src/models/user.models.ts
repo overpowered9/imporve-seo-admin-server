@@ -359,6 +359,66 @@ export const suspendPlanCredits = async (user_id: number, reason = 'Subscription
   });
 };
 
+/**
+ * Effective trial end for a user: the explicit `trial_ends_at`, or — when that was never
+ * set — `created_at + TRIAL_DAYS` as a fallback. Returns null only when neither is known.
+ * The fallback closes the hole where a NULL `trial_ends_at` would otherwise bypass every
+ * trial check (a null timestamp is not "no trial", it's a trial whose end we must infer).
+ */
+export const effectiveTrialEnd = (
+  user: { trial_ends_at?: Date | null; created_at?: Date | null }
+): Date | null => {
+  if (user.trial_ends_at) return new Date(user.trial_ends_at);
+  if (user.created_at) {
+    const d = new Date(user.created_at);
+    d.setDate(d.getDate() + TRIAL_DAYS);
+    return d;
+  }
+  return null;
+};
+
+/** True when the user's free-trial window has elapsed (uses effectiveTrialEnd). */
+export const isTrialExpired = (
+  user: { trial_ends_at?: Date | null; created_at?: Date | null }
+): boolean => {
+  const end = effectiveTrialEnd(user);
+  return !!end && end.getTime() < Date.now();
+};
+
+/** Is this a free ($0) plan? A missing/unknown plan is treated as free (fail-safe). */
+export const isFreePlanId = async (plan_id?: number | null): Promise<boolean> => {
+  if (!plan_id) return true;
+  const rows = await sql`SELECT price_cents FROM subscription_plans WHERE id = ${plan_id} LIMIT 1`;
+  return !rows[0] || Number(rows[0].price_cents) === 0;
+};
+
+/**
+ * Reconcile a user's credits against their trial state. When a free-plan account's trial has
+ * expired, void the PLAN (trial) credits so every READ reflects the truth immediately — not
+ * only after a generation attempt. Purchased top-ups are always preserved (the user paid).
+ *
+ * Idempotent and cheap to call on hot read paths: it only writes when there is something left
+ * to void, so repeated status polls after the first reconcile are read-only.
+ *
+ * Returns true when the account is a free-plan user whose trial has expired (i.e. plan credits
+ * are now void), so callers can surface a `trial_expired` flag without recomputing it.
+ */
+export const reconcileTrialCredits = async (
+  user: { id: number; plan_id?: number | null; trial_ends_at?: Date | null; created_at?: Date | null }
+): Promise<boolean> => {
+  if (!isTrialExpired(user)) return false;
+  if (!(await isFreePlanId(user.plan_id))) return false;
+  const pending = await sql`
+    SELECT 1 FROM credit_balances
+    WHERE user_id = ${user.id} AND included_remaining > 0
+    LIMIT 1
+  `;
+  if (pending.length > 0) {
+    await suspendPlanCredits(user.id, 'Trial expired');
+  }
+  return true;
+};
+
 export const getUserSubscription = async (user_id: number) => {
   const result = await sql`
     SELECT 
