@@ -43,9 +43,10 @@ export interface ContentBlueprint {
 
 // ----- niche → POV (resolved server-side, dropdown removed from UI) -----
 const LOCAL_SERVICE_NICHES = new Set([
-  'hvac', 'plumbing', 'electrical', 'roofing', 'landscaping', 'dental', 'medical',
-  'legal', 'personal_injury_law', 'family_law', 'realestate', 'real_estate', 'mortgage',
-  'restaurant', 'fitness', 'beauty', 'salon', 'spa', 'pet', 'pet_services', 'vet',
+  'hvac', 'plumbing', 'electrical', 'roofing', 'contractor', 'landscaping', 'home_services',
+  'dental', 'medical', 'wellness', 'legal', 'legal_services', 'personal_injury_law', 'family_law',
+  'realestate', 'real_estate', 'mortgage', 'accounting', 'education', 'restaurant', 'fitness',
+  'beauty', 'salon', 'spa', 'pet', 'pet_services', 'vet', 'auto_repair',
 ]);
 const PERSONAL_NICHES = new Set(['general_blog', 'blog', 'personal_blog']);
 
