@@ -1098,27 +1098,51 @@ router.post('/generatekeyword', validateApiAccess, validateCredits('keywords', 1
     const {
       seed_keyword,
       niche,
-      count = 50,
-      include_search_volume = false
+      count = 30
     } = req.body;
 
-    if (!seed_keyword) {
+    if (!seed_keyword || !String(seed_keyword).trim()) {
       return res.status(400).json({
         success: false,
         error: 'seed_keyword is required'
       });
     }
 
-    console.log(`🔍 Starting keyword generation for: "${seed_keyword}"`);
+    const seed = String(seed_keyword).trim();
+    const keywordCount = Math.min(Math.max(parseInt(count, 10) || 30, 1), 50);
 
-    // TODO: Replace with actual keyword research service
-    // For now, return mock response
-    const keywords = Array.from({ length: count }, (_, i) => ({
-      keyword: `${seed_keyword} ${['guide', 'tips', 'tutorial', 'benefits', 'examples', 'best practices', 'tools', 'strategies', 'techniques', 'ideas'][i % 10]} ${i + 1}`,
-      search_volume: include_search_volume ? Math.floor(Math.random() * 10000) + 100 : undefined,
-      difficulty: include_search_volume ? Math.floor(Math.random() * 100) : undefined,
-      cpc: include_search_volume ? (Math.random() * 5).toFixed(2) : undefined
-    }));
+    console.log(`🔍 Starting keyword generation for: "${seed}" (count=${keywordCount})`);
+
+    const nicheLine = niche ? `\nNiche/industry context: ${niche}` : '';
+    const prompt = `You are an SEO keyword research assistant. Generate exactly ${keywordCount} long-tail keyword variations that real people type into search engines for the seed keyword below. Mix informational, commercial and question-style search intents. Keep each keyword between 2 and 8 words.${nicheLine}
+
+Seed keyword: ${seed}
+
+Output rules: one keyword per line, lowercase, no numbering, no bullets, no quotes, no explanations or headings — just the keywords.`;
+
+    const raw = await chat([{ role: 'user', content: prompt }]);
+
+    // Parse one-per-line output defensively: strip bullets/numbering the model
+    // may add despite instructions, drop blanks, dedupe, cap at requested count.
+    const seen = new Set<string>();
+    const keywords: string[] = [];
+    for (const line of raw.split('\n')) {
+      const kw = line.replace(/^\s*(?:[-•*]|\d+[.)])\s*/, '').replace(/["'‘’“”]/g, '').trim();
+      const key = kw.toLowerCase();
+      if (kw && !seen.has(key)) {
+        seen.add(key);
+        keywords.push(kw);
+      }
+      if (keywords.length >= keywordCount) break;
+    }
+
+    if (keywords.length === 0) {
+      // No usable output — fail without deducting credits.
+      return res.status(500).json({
+        success: false,
+        error: 'Keyword generation returned no results. Please try again.'
+      });
+    }
 
     const userId = req.user.id;
     const websiteId = req.website?.id || null;
@@ -1139,17 +1163,16 @@ router.post('/generatekeyword', validateApiAccess, validateCredits('keywords', 1
         'keywords',
         'success',
         ${JSON.stringify({
-          seed_keyword,
+          seed_keyword: seed,
           niche,
-          count,
-          include_search_volume
+          count: keywordCount
         })},
         ${JSON.stringify({
           keywords,
           total_count: keywords.length
         })},
         ${JSON.stringify({
-          provider: 'keyword-research-api',
+          provider: 'openai-chat',
           generation_time: Date.now()
         })}
       )
@@ -1159,7 +1182,7 @@ router.post('/generatekeyword', validateApiAccess, validateCredits('keywords', 1
     const generationId = generationRecord[0].id;
 
     // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION (with website_id and generation_id)
-    const truncatedKeyword = seed_keyword.substring(0, 200);
+    const truncatedKeyword = seed.substring(0, 200);
     await deductCredits(
       userId,
       'keywords',
@@ -1176,10 +1199,9 @@ router.post('/generatekeyword', validateApiAccess, validateCredits('keywords', 1
       success: true,
       data: {
         generation_id: generationId,
-        seed_keyword,
+        seed_keyword: seed,
         keywords,
-        total_count: keywords.length,
-        message: '🚧 Mock response - Keyword research service to be integrated'
+        total_count: keywords.length
       }
     });
 
@@ -1195,9 +1217,11 @@ router.post('/generatekeyword', validateApiAccess, validateCredits('keywords', 1
 /**
  * Deduct Keyword Credits Only (for plugin-generated keywords)
  * POST /api/v1/generate/generatekeywordded
- * 
+ *
  * This endpoint only deducts keyword credits without generating anything.
- * Used when the WordPress plugin generates keywords on its own but needs to track credit usage.
+ * LEGACY: current plugin versions generate keywords server-side via /generatekeyword
+ * (which deducts atomically). Kept for older plugin installs that still scrape
+ * Google Suggest in the browser and report usage here.
  */
 router.post('/generatekeywordded', validateApiAccess, validateCredits('keywords', 1), async (req: AuthenticatedRequest, res: Response) => {
   try {
