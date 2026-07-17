@@ -15,7 +15,8 @@ import {
   getUserSubscription,
   updateUserName,
   regenerateApiKey,
-  reconcileTrialCredits
+  reconcileTrialCredits,
+  effectiveTrialEnd
 } from '../models/user.models.js';
 
 const router = express.Router();
@@ -45,6 +46,25 @@ router.get('/status', validateApiAccess, async (req, res) => {
     // Get user subscription/plan details
     const subscription = await getUserSubscription(user.id);
 
+    // Per-type plan-vs-purchased breakdown, so clients (the plugin's connection panel)
+    // can explain a balance instead of showing a bare number.
+    const detailFor = (t: 'images' | 'content' | 'keywords') => {
+      const c = credits.find(cr => cr.credit_type === t);
+      return {
+        total: c?.amount ?? 0,
+        plan_remaining: c?.included_remaining ?? 0,
+        purchased_remaining: c?.purchased_remaining ?? 0,
+        allotment: c?.included_allotment ?? 0,
+      };
+    };
+
+    // Trial window (effective end falls back to created_at + TRIAL_DAYS when unset).
+    const trialEnd = effectiveTrialEnd(user);
+    const daysRemaining = trialEnd
+      ? Math.max(0, Math.ceil((trialEnd.getTime() - Date.now()) / 86_400_000))
+      : null;
+    const isPaid = !!subscription;
+
     res.json({
       success: true,
       user: user.name || user.email,
@@ -54,6 +74,23 @@ router.get('/status', validateApiAccess, async (req, res) => {
         images: credits.find(c => c.credit_type === 'images')?.amount || 0,
         content: credits.find(c => c.credit_type === 'content')?.amount || 0,
         keywords: credits.find(c => c.credit_type === 'keywords')?.amount || 0
+      },
+      credit_details: {
+        images: detailFor('images'),
+        content: detailFor('content'),
+        keywords: detailFor('keywords'),
+      },
+      plan: {
+        name: isPaid ? subscription.plan_name : 'Free',
+        slug: isPaid ? subscription.plan_slug : 'free',
+        is_paid: isPaid,
+        is_free: !isPaid,
+      },
+      trial: {
+        active: !isPaid && !trialExpired && !!trialEnd,
+        expired: trialExpired,
+        ends_at: trialEnd ? trialEnd.toISOString() : null,
+        days_remaining: daysRemaining,
       },
       trial_expired: trialExpired,
       subscription: subscription || null,
@@ -245,8 +282,14 @@ router.delete('/websites/:website_id', async (req, res) => {
 router.get('/credits/:user_id', async (req, res) => {
   try {
     const user_id = parseInt(req.params.user_id);
+
+    // Void any expired trial (plan) credits before reading, so the dashboard tiles
+    // reflect the post-expiry balance immediately (plan credits 0, purchased kept).
+    const user = await getUserWithPlan(user_id);
+    if (user) await reconcileTrialCredits(user as any);
+
     const credits = await getUserCreditBalances(user_id);
-    
+
     res.json({
       success: true,
       data: credits
