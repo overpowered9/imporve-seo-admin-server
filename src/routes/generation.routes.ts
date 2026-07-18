@@ -10,6 +10,7 @@ import { deductCredits } from '../models/user.models.js';
 import sql from '../data/db.js';
 import { FluxAIService } from '../services/fluxai.service.js';
 import { chat } from '../services/openai.js';
+import { enforceMetaLength, META_BOUNDS } from '../services/meta-length.js';
 
 const router = Router();
 
@@ -1347,7 +1348,7 @@ router.post('/auxiliary', validateApiAccess, async (req: AuthenticatedRequest, r
         prompt = `Create an SEO optimized meta title based on the blog post title \`${title || ''}\` and the keyword \`${seed_keyword}\`. Max length of title should be 50-60 characters including spaces.`;
         break;
       case 'meta_description':
-        prompt = `Create an SEO optimized meta description. Max length of description should be 70-80 characters including spaces. Meta description is based on the blog post title \`${title || ''}\`, the keyword \`${seed_keyword}\` and the blog post content i.e. ${content || ''}.`;
+        prompt = `Create an SEO optimized meta description. Length of the description MUST be 150-160 characters including spaces (never exceed 160). Meta description is based on the blog post title \`${title || ''}\`, the keyword \`${seed_keyword}\` and the blog post content i.e. ${content || ''}.`;
         break;
       case 'audience_data':
         prompt = `Assume someone enters the keyword ${seed_keyword} into a search engine. Analyze the following characteristics: 1. [demographic information] 2. [tone preferences] 3. [reading level preference] 4. [emotional needs/pain points]. This information will be used to create content that is specifically appealing to such people. Do not give content recommendations yet. As an output, write just information for characteristics without any explanation or introduction.`;
@@ -1380,6 +1381,24 @@ Audience data: {${audience_data || ''}}`;
     // Strip quote characters — GPT routinely wraps outputs in quotes and that
     // bleeds into rendered SEO tags / context blocks downstream.
     text = text.replace(/["'‘’“”]/g, '').trim();
+
+    // Enforce SEO meta length budgets server-side (title 50-60, description 150-160):
+    // re-run the prompt when the model drifts out of range, hard-cap to max as a last resort.
+    if (type === 'meta_title' || type === 'meta_description') {
+      const kind = type; // narrowed to 'meta_title' | 'meta_description'
+      const { min, max } = META_BOUNDS[kind];
+      text = await enforceMetaLength({
+        kind,
+        current: text,
+        regenerate: async () => {
+          const strict = `${prompt}\n\nThe result MUST be STRICTLY between ${min} and ${max} characters including spaces (never exceed ${max}). Output ONLY the ${kind === 'meta_title' ? 'meta title' : 'meta description'} text, with no quotes or explanation.`;
+          const retry = await chat([{ role: 'user', content: strict }]);
+          return retry.replace(/["'‘’“”]/g, '').trim();
+        },
+        onAttempt: ({ attempt, candidate, accepted }) =>
+          console.log(`ℹ️ auxiliary ${kind} retry ${attempt} — ${candidate.trim().length} chars, accepted=${accepted}`),
+      });
+    }
 
     res.json({
       success: true,

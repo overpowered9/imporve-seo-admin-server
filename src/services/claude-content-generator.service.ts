@@ -5,13 +5,14 @@
  *  1. Intelligence JSON  — audience psychology / voice / real customer FAQ questions (1 Claude call).
  *  2. Structure blueprint — per-article variable skeleton (no AI, seeded).
  *  3. Single-pass article — whole piece in one pass (continuous burstiness) + a structured trailer
- *     carrying meta_title, meta_description (140–155), and the FAQ pairs.
+ *     carrying meta_title (50–60), meta_description (150–160), and the FAQ pairs.
  *  4. Optional humanization — a de-tell editor pass.
  *  5. Assembly — FAQPage JSON-LD + CTA, no uniform section wrappers.
  */
 
 import { claudeText, claudeJSON, parseJsonLoose, ClaudeUsage } from './claude.service.js';
 import { PromptManagementService } from './prompt-management.service.js';
+import { enforceMetaLength, META_BOUNDS, MetaKind } from './meta-length.js';
 import { postProcessArticle } from './content-postprocess.js';
 import { config } from '../config/config.js';
 import {
@@ -138,7 +139,7 @@ formatting accent, closing style) — it never removes a section. Missing any se
    like "Overview" or "Introduction"). Use <h3> sub-points only where they genuinely help. Apply the
    blueprint's formatting accent. Weave in the business/niche details and the audience's real phrases, and
    put the blueprint's local-proof angle in one of these sections.
-4. KEY TAKEAWAYS — "<h2>Key takeaways</h2>" then ONE <ul> of 3 to 5 concrete, specific bullet points
+4. KEY TAKEAWAYS — "<h2>Key Takeaways</h2>" then ONE <ul> of 3 to 5 concrete, specific bullet points
    (no filler, no restating the intro).
 5. CONCLUSION — one <h2> with a natural, specific heading (NEVER just the word "Conclusion", and never
    begin a sentence with "In conclusion"). Apply the blueprint's closing move.
@@ -157,7 +158,7 @@ OUTPUT CONTRACT (follow precisely):
 - After the article, output a line containing exactly: ${TRAILER_DELIM}
 - Then ONE JSON object: {"meta_title": "...", "meta_description": "...", "faq": [{"question":"...","answer":"..."}]}
   - meta_title: 50-60 characters, sentence case, keyword included naturally, no pipes/slashes.
-  - meta_description: 140-155 characters, addresses the pain then the outcome, soft CTA, sounds human.
+  - meta_description: 150-160 characters, addresses the pain then the outcome, soft CTA, sounds human.
   - faq: the SAME 3 questions and answers that appear in the FAQ section.
 Output nothing after the JSON object.`;
 
@@ -323,6 +324,32 @@ Return JSON exactly in this shape:
     timings.meta_recovery = Date.now() - tr;
   }
 
+  // Enforce the meta length budgets (title 50-60, description 150-160). When a field is
+  // out of range we re-run its own prompt a few times and keep the first compliant result;
+  // enforceMetaLength hard-caps to the max as a last resort so we never emit an over-length tag.
+  {
+    const tl = Date.now();
+    const [fixedTitle, fixedDesc] = await Promise.all([
+      enforceMetaLength({
+        kind: 'meta_title',
+        current: meta.meta_title,
+        regenerate: (attempt) => regenerateMetaField('meta_title', article, params, usage, attempt),
+        onAttempt: ({ attempt, candidate, accepted }) =>
+          console.log(`ℹ️ v2 meta_title retry ${attempt} — ${candidate.trim().length} chars, accepted=${accepted}`),
+      }),
+      enforceMetaLength({
+        kind: 'meta_description',
+        current: meta.meta_description,
+        regenerate: (attempt) => regenerateMetaField('meta_description', article, params, usage, attempt),
+        onAttempt: ({ attempt, candidate, accepted }) =>
+          console.log(`ℹ️ v2 meta_description retry ${attempt} — ${candidate.trim().length} chars, accepted=${accepted}`),
+      }),
+    ]);
+    meta.meta_title = fixedTitle;
+    meta.meta_description = fixedDesc;
+    timings.meta_length = Date.now() - tl;
+  }
+
   // ---- Phase 5: assembly + deterministic post-processing ----
   // Defensive fixes (markdown→HTML, anchor repair, em-dash guard, whitespace cleanup, code-built TOC
   // with matching ids, email/URL linkification). See content-postprocess.ts.
@@ -453,7 +480,7 @@ async function recoverMeta(
     const plain = article.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 4000);
     const user = `From the article below, output ONLY JSON:
 {"meta_title": "50-60 chars, sentence case, includes the keyword naturally, no pipes/slashes",
- "meta_description": "140-155 chars, pain then outcome, soft CTA, human voice",
+ "meta_description": "150-160 chars, pain then outcome, soft CTA, human voice",
  "faq": [{"question": "...", "answer": "35-50 words"}]}
 The faq MUST be the same 3 Q/A that already appear in the article.
 Keyword: ${params.seed_keyword}
@@ -481,6 +508,40 @@ ${plain}`;
     console.warn('⚠️ v2 meta recovery failed, returning partial meta:', e);
     return partial;
   }
+}
+
+/**
+ * Re-prompt a single meta field to a strict character budget, sourced from the finished
+ * article. Used by enforceMetaLength when the trailer/recovered value is out of range.
+ */
+async function regenerateMetaField(
+  kind: MetaKind,
+  article: string,
+  params: GenerateV2Params,
+  usage: Record<string, ClaudeUsage>,
+  attempt: number
+): Promise<string> {
+  const plain = article.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 4000);
+  const isTitle = kind === 'meta_title';
+  const { min, max } = META_BOUNDS[kind];
+  const style = isTitle
+    ? 'sentence case, include the keyword naturally, no pipes or slashes'
+    : "address the reader's pain then the outcome, with a soft CTA, in a human voice";
+  const user = `Rewrite ONLY the ${isTitle ? 'meta title' : 'meta description'} for the article below.
+HARD REQUIREMENT: the result MUST be between ${min} and ${max} characters, counting every character including spaces. Closer to ${max} is better than under ${min}. Never exceed ${max}.
+Style: ${style}.
+Return ONLY JSON: {"${kind}": "..."}
+Keyword: ${params.seed_keyword}
+
+Article:
+${plain}`;
+  const r = await claudeJSON<Record<string, string>>({
+    system: 'You write SEO metadata to an exact character budget. Return ONLY valid JSON, no prose, no fences.',
+    user,
+    maxTokens: 300,
+  });
+  usage[`meta_len_${kind}_${attempt}`] = r.usage;
+  return (r.data?.[kind] || '').trim();
 }
 
 function buildFaqSchema(faq: FaqPair[]): Record<string, unknown> {
