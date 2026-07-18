@@ -122,12 +122,25 @@ function stripParensAroundLinks(html: string): string {
   return html.replace(/\(\s*(<a\b[^>]*>[\s\S]*?<\/a>)\s*\)/gi, '$1');
 }
 
+/**
+ * Force known section headings to their canonical casing. The article-writer prompt is DB-tunable and
+ * the model can vary capitalization, so we normalize here deterministically. Runs before the TOC build
+ * so the table-of-contents entry inherits the corrected text. Attributes (e.g. ids) are preserved.
+ */
+function normalizeSectionHeadings(html: string): string {
+  return html.replace(
+    /<h2(\s[^>]*)?>\s*key takeaways\s*<\/h2>/gi,
+    (_m, attrs) => `<h2${attrs || ''}>Key Takeaways</h2>`
+  );
+}
+
 /** Full post-processing pipeline. Order matters — see comments. */
 export function postProcessArticle(html: string): string {
   html = convertMarkdownToHtml(html); // stray markdown → HTML (before TOC, so headings are <h2>)
   html = fixMalformedAnchors(html);
   html = html.replace(/\s*—\s*/g, ', '); // em-dash guard (keeps en-dashes in "$180–$350")
   html = cleanupWhitespace(html); // remove the now-empty "<p>, </p>" etc.
+  html = normalizeSectionHeadings(html); // canonical heading casing (before TOC, so it inherits it)
   html = injectTableOfContents(html); // build TOC + heading ids
   html = linkifyContacts(html); // emails + URLs → anchors
   html = stripParensAroundLinks(html);
