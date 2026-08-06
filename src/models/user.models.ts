@@ -304,7 +304,40 @@ export const addPurchasedCredits = async (
  * the positive difference to the user's included balance right now (prorated upgrade bump).
  * Purchased credits are untouched.
  */
-export const upgradeIncludedCredits = async (user_id: number, newPlan: any, reason = 'Plan upgrade'): Promise<void> => {
+/**
+ * Raise the included allotment to a new (higher) plan and grant the difference.
+ *
+ * @param prorationFactor  Fraction of the billing period still unused, 0..1.
+ *   Defaults to 1 (grant the whole difference).
+ *
+ * ── Why the grant is prorated but the allotment is not (bug 5) ──────────────
+ * These are two different numbers and conflating them is the trap:
+ *
+ *   included_allotment  = what the plan is WORTH PER CYCLE. Always the new
+ *                         plan's full figure, so the next monthly refill (and
+ *                         every "X of Y used" display) is correct.
+ *   included_remaining  = what the user can spend RIGHT NOW. Upgrading with
+ *                         four days left in the cycle should not hand over a
+ *                         full month of extra credits for four days of paid
+ *                         time — the customer was only charged a prorated
+ *                         amount for those days, so they receive a matching
+ *                         prorated share of the credit difference.
+ *
+ * Granting the full difference mid-cycle is an arbitrage: upgrade on the last
+ * day of the cycle, pay a day's proration, collect a month of credits, then
+ * downgrade. The proration factor closes that.
+ */
+export const upgradeIncludedCredits = async (
+  user_id: number,
+  newPlan: any,
+  reason = 'Plan upgrade',
+  prorationFactor: number = 1
+): Promise<void> => {
+  // Guard the factor — a bad cycle date must never invert or inflate a grant.
+  const factor = Number.isFinite(prorationFactor)
+    ? Math.min(1, Math.max(0, prorationFactor))
+    : 1;
+
   await sql.begin(async sql => {
     for (const creditType of CREDIT_TYPES) {
       const newAllotment = planAllotment(newPlan, creditType);
@@ -314,11 +347,20 @@ export const upgradeIncludedCredits = async (user_id: number, newPlan: any, reas
         LIMIT 1
       `;
       const oldAllotment = rows.length > 0 ? Number(rows[0].included_allotment) : 0;
-      const bump = Math.max(0, newAllotment - oldAllotment);
+      const fullDifference = Math.max(0, newAllotment - oldAllotment);
+
+      // OLD (always the full difference, regardless of when in the cycle):
+      // const bump = Math.max(0, newAllotment - oldAllotment);
+      //
+      // Round rather than floor so a genuine upgrade never grants 0 credits
+      // near the end of a cycle; a paid upgrade should always give something.
+      const bump = fullDifference > 0
+        ? Math.max(1, Math.round(fullDifference * factor))
+        : 0;
 
       await sql`
         INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
-        VALUES (${user_id}, ${creditType}, ${newAllotment}, ${newAllotment}, 0, NOW())
+        VALUES (${user_id}, ${creditType}, ${bump}, ${newAllotment}, 0, NOW())
         ON CONFLICT (user_id, credit_type)
         DO UPDATE SET
           included_allotment = ${newAllotment},
@@ -326,13 +368,39 @@ export const upgradeIncludedCredits = async (user_id: number, newPlan: any, reas
           updated_at = NOW()
       `;
       if (bump > 0) {
+        // Record what was actually granted AND why it differs from the headline
+        // plan difference, so support can explain a bill without re-deriving it.
+        const detail = factor < 1
+          ? `${reason} (prorated: ${bump} of ${fullDifference} for the remainder of the billing period)`
+          : reason;
         await sql`
           INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
-          VALUES (${user_id}, ${creditType}, ${bump}, ${reason})
+          VALUES (${user_id}, ${creditType}, ${bump}, ${detail})
         `;
       }
     }
   });
+};
+
+/**
+ * Fraction of the current billing period still unused, as 0..1.
+ *
+ * Falls back to 1 (treat as a full period) whenever the dates are missing or
+ * nonsensical — an upgrade must never silently grant nothing because a
+ * timestamp was null.
+ */
+export const remainingCycleFraction = (
+  cycleStart: Date | string | null | undefined,
+  cycleEnd: Date | string | null | undefined
+): number => {
+  if (!cycleStart || !cycleEnd) return 1;
+  const start = new Date(cycleStart).getTime();
+  const end = new Date(cycleEnd).getTime();
+  const now = Date.now();
+  if (Number.isNaN(start) || Number.isNaN(end) || end <= start) return 1;
+  if (now >= end) return 0;
+  if (now <= start) return 1;
+  return (end - now) / (end - start);
 };
 
 /**
@@ -467,12 +535,28 @@ export const changePlan = async (
   if (immediate) {
     // UPGRADE: Immediate effect + raise included allotment / grant the difference now.
     await sql.begin(async sql => {
-      // Update subscription
+      // Update subscription.
+      //
+      // BUG 10 — clear any scheduled cancellation. Choosing a new plan is an
+      // unambiguous "I am staying", so leaving cancel_at_period_end set is
+      // simply wrong data, and it is what kept the CMS's "Cancellation
+      // Scheduled" banner on screen after a resubscribe. Also clears
+      // pending_plan_id, since an immediate change supersedes any downgrade
+      // that was queued for the end of the period.
+      //
+      // OLD:
+      //   UPDATE subscriptions
+      //   SET previous_plan_id = plan_id, plan_id = ${new_plan_id}
+      //   WHERE user_id = ${user_id}
       await sql`
         UPDATE subscriptions
         SET
           previous_plan_id = plan_id,
-          plan_id = ${new_plan_id}
+          plan_id = ${new_plan_id},
+          status = 'active',
+          cancel_at_period_end = FALSE,
+          pending_plan_id = NULL,
+          pending_plan_effective_date = NULL
         WHERE user_id = ${user_id}
       `;
 
@@ -484,17 +568,29 @@ export const changePlan = async (
       `;
     });
 
-    // Raise the included allotment to the new plan and grant the upgrade difference.
+    // Raise the included allotment to the new plan and grant the upgrade
+    // difference, PRORATED to the unused part of the current cycle so the
+    // credits granted match the prorated amount actually charged (bug 5).
     // Purchased (top-up) credits are preserved. Runs in its own transaction.
     const newPlan = await sql`SELECT * FROM subscription_plans WHERE id = ${new_plan_id}`;
     if (newPlan.length > 0) {
-      await upgradeIncludedCredits(user_id, newPlan[0], 'Plan upgrade credit bonus');
+      const cycleRows = await sql`
+        SELECT cycle_started_at FROM credit_balances
+        WHERE user_id = ${user_id}
+        ORDER BY cycle_started_at DESC
+        LIMIT 1
+      `;
+      const factor = remainingCycleFraction(
+        cycleRows[0]?.cycle_started_at,
+        currentSub.next_billing_date
+      );
+      await upgradeIncludedCredits(user_id, newPlan[0], 'Plan upgrade credit bonus', factor);
     }
   } else {
     // DOWNGRADE: Schedule for next billing date
     await sql`
       UPDATE subscriptions
-      SET 
+      SET
         pending_plan_id = ${new_plan_id},
         pending_plan_effective_date = next_billing_date,
         status = 'pending_downgrade'

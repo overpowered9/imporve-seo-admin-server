@@ -600,6 +600,119 @@ View Your Project: ${projectUrl}
     };
   },
 
+  // ── Billing emails (bug 11) ───────────────────────────────────────────────
+  // These did not exist. credits.md guessed the missing upgrade/cancellation
+  // emails were an environment artifact (Stripe webhooks not reaching a local
+  // site), but there were no billing templates and no send calls anywhere in
+  // the Stripe layer — so no email would have gone out on production either.
+  //
+  // Money emails are deliberately plain: a receipt-style summary with the exact
+  // figures, no marketing. A billing email that buries the amount is the thing
+  // people open a support ticket about.
+
+  /** Sent after a successful plan change. `amountLine` is pre-formatted money. */
+  subscriptionUpgraded: (
+    firstName: string,
+    planName: string,
+    amountLine: string,
+    nextBillingDate: string,
+    creditsSummary: string,
+    billingUrl: string,
+  ) => ({
+    subject: `Your ImproveSEO plan is now ${planName}`,
+    html: `
+      <!DOCTYPE html>
+      <html>
+      <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2c3e50; margin: 0; padding: 0; background: #f5f7fa; }
+          .wrapper { background: #f5f7fa; padding: 22px; }
+          .container { max-width: 560px; margin: 0 auto; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+          .header { background: linear-gradient(135deg, #1c7293 0%, #2ec5b6 100%); padding: 36px 30px; text-align: center; }
+          .header h1 { margin: 0; color: #fff; font-size: 22px; font-weight: 700; }
+          .content { padding: 32px 30px; }
+          .content p { margin: 0 0 14px; font-size: 15px; color: #333; }
+          .facts { background: #f0f7f9; border-radius: 8px; padding: 16px 18px; margin: 18px 0; }
+          .facts p { margin: 6px 0; font-size: 14px; color: #1c7293; }
+          .cta { text-align: center; margin: 26px 0 6px; }
+          .cta a { display: inline-block; background: #1c7293; color: #fff !important; text-decoration: none; padding: 13px 30px; border-radius: 8px; font-weight: 700; font-size: 15px; }
+          .footer { background: #f8f9fa; padding: 22px; text-align: center; border-top: 1px solid #eee; }
+          .footer p { margin: 3px 0; font-size: 11px; color: #9aa0a6; }
+        </style>
+      </head>
+      <body><div class="wrapper"><div class="container">
+        <div class="header"><h1>Your plan has been updated</h1></div>
+        <div class="content">
+          <p>Hi ${firstName},</p>
+          <p>You're now on the <strong>${planName}</strong> plan.</p>
+          <div class="facts">
+            <p><strong>Charged today:</strong> ${amountLine}</p>
+            <p><strong>Credits added:</strong> ${creditsSummary}</p>
+            <p><strong>Next billing date:</strong> ${nextBillingDate}</p>
+          </div>
+          <p>Your new credits are available right now.</p>
+          <div class="cta"><a href="${billingUrl}">View Billing</a></div>
+        </div>
+        <div class="footer">
+          <p>This is an automated billing notification from ImproveSEO.</p>
+          <p>© 2026 ImproveSEO. All rights reserved.</p>
+        </div>
+      </div></div></body>
+      </html>
+    `,
+    text: `Hi ${firstName},\n\nYou're now on the ${planName} plan.\n\nCharged today: ${amountLine}\nCredits added: ${creditsSummary}\nNext billing date: ${nextBillingDate}\n\nYour new credits are available right now.\n\nView billing: ${billingUrl}\n\n© 2026 ImproveSEO`,
+  }),
+
+  /** Sent when a subscription is set to cancel at period end. */
+  subscriptionCancelled: (
+    firstName: string,
+    planName: string,
+    accessUntil: string,
+    billingUrl: string,
+  ) => ({
+    subject: 'Your ImproveSEO subscription has been cancelled',
+    html: `
+      <!DOCTYPE html>
+      <html>
+      <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2c3e50; margin: 0; padding: 0; background: #f5f7fa; }
+          .wrapper { background: #f5f7fa; padding: 22px; }
+          .container { max-width: 560px; margin: 0 auto; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+          .header { background: #64748b; padding: 36px 30px; text-align: center; }
+          .header h1 { margin: 0; color: #fff; font-size: 22px; font-weight: 700; }
+          .content { padding: 32px 30px; }
+          .content p { margin: 0 0 14px; font-size: 15px; color: #333; }
+          .facts { background: #f4f5f7; border-radius: 8px; padding: 16px 18px; margin: 18px 0; }
+          .facts p { margin: 6px 0; font-size: 14px; color: #475569; }
+          .cta { text-align: center; margin: 26px 0 6px; }
+          .cta a { display: inline-block; background: #1c7293; color: #fff !important; text-decoration: none; padding: 13px 30px; border-radius: 8px; font-weight: 700; font-size: 15px; }
+          .footer { background: #f8f9fa; padding: 22px; text-align: center; border-top: 1px solid #eee; }
+          .footer p { margin: 3px 0; font-size: 11px; color: #9aa0a6; }
+        </style>
+      </head>
+      <body><div class="wrapper"><div class="container">
+        <div class="header"><h1>Subscription cancelled</h1></div>
+        <div class="content">
+          <p>Hi ${firstName},</p>
+          <p>Your <strong>${planName}</strong> subscription has been cancelled. You have not been charged again.</p>
+          <div class="facts">
+            <p><strong>Access continues until:</strong> ${accessUntil}</p>
+            <p>After that date your account moves to the free tier. Any credits you purchased separately remain yours.</p>
+          </div>
+          <p>Changed your mind? You can resubscribe at any time and pick up where you left off.</p>
+          <div class="cta"><a href="${billingUrl}">Manage Subscription</a></div>
+        </div>
+        <div class="footer">
+          <p>This is an automated billing notification from ImproveSEO.</p>
+          <p>© 2026 ImproveSEO. All rights reserved.</p>
+        </div>
+      </div></div></body>
+      </html>
+    `,
+    text: `Hi ${firstName},\n\nYour ${planName} subscription has been cancelled. You have not been charged again.\n\nAccess continues until: ${accessUntil}\nAfter that date your account moves to the free tier. Any credits you purchased separately remain yours.\n\nChanged your mind? You can resubscribe at any time:\n${billingUrl}\n\n© 2026 ImproveSEO`,
+  }),
+
   bulkTaskCompleted: (userName: string, taskName: string, totalGenerated: number, totalFailed: number, websiteDomain: string, projectUrl: string) => {
     const totalTasks = totalGenerated + totalFailed;
     const allFailed = totalGenerated === 0 && totalFailed > 0;
