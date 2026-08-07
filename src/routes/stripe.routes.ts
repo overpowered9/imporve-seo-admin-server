@@ -16,6 +16,7 @@ import {
   suspendPlanCredits,
   getFreePlanId
 } from '../models/user.models.js';
+import { sendEmail, emailTemplates } from '../services/email.service.js';
 
 const router = express.Router();
 
@@ -32,6 +33,55 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
 const withSessionId = (url: string): string => {
   const sep = url.includes('?') ? '&' : '?';
   return `${url}${sep}session_id={CHECKOUT_SESSION_ID}`;
+};
+
+/** Where billing emails send the user back to. */
+const CMS_BILLING_URL = `${process.env.CMS_BASE_URL || 'https://account.improveseoplugin.com'}/credits`;
+
+const firstNameOf = (name?: string | null, email?: string | null): string =>
+  (name || '').trim().split(/\s+/)[0] || (email || '').split('@')[0] || 'there';
+
+const formatCents = (cents: number, currency = 'usd'): string => {
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: currency.toUpperCase(),
+    }).format((cents || 0) / 100);
+  } catch (_) {
+    return `${((cents || 0) / 100).toFixed(2)} ${currency.toUpperCase()}`;
+  }
+};
+
+/**
+ * Send a billing email without ever letting it break the billing operation.
+ *
+ * A failed/slow Mailgun call must not turn a SUCCESSFUL upgrade into an error
+ * response — the money has already moved. Failures are logged and swallowed.
+ * (sendEmail already no-ops with a warning when Mailgun is unconfigured, which
+ * is why nothing arrives in local development.)
+ */
+const sendBillingEmail = async (
+  userId: number,
+  build: (firstName: string) => { subject: string; html: string; text?: string }
+): Promise<void> => {
+  // ── FLAG: BILLING_EMAILS_ENABLED ─────────────────────────────────────────
+  // These emails have never been sent — Mailgun is unconfigured in local dev,
+  // so sendEmail no-ops there and the templates have never been seen by a real
+  // mail client. Off = the previous behaviour: no billing email at all.
+  //
+  // Gated here, in the one helper every caller goes through, so no call site
+  // can bypass it. Turn on after previewing both templates (upgrade and
+  // cancellation) against a real inbox.
+  if (String(process.env.BILLING_EMAILS_ENABLED || '').toLowerCase() !== 'true') return;
+  try {
+    const rows = await sql`SELECT email, name FROM users WHERE id = ${userId} LIMIT 1`;
+    const user = rows[0] as any;
+    if (!user?.email) return;
+    const tpl = build(firstNameOf(user.name, user.email));
+    await sendEmail({ to: user.email, subject: tpl.subject, html: tpl.html, text: tpl.text });
+  } catch (err) {
+    console.error(`⚠️ Billing email failed for user ${userId} (billing itself was unaffected):`, err);
+  }
 };
 
 /**
@@ -130,6 +180,78 @@ const applyCreditTopupOnce = async (session: Stripe.Checkout.Session): Promise<b
 
   console.log(`✅ Applied top-up of ${quantity} ${creditType} credits to user ${userId} (session ${session.id})`);
   return true;
+};
+
+/**
+ * Guarantee the customer has a default payment method, if they have any card
+ * at all. Returns the id of the default in force afterwards, or null when the
+ * customer genuinely has no cards.
+ *
+ * WHY THIS EXISTS (bug 3: "after adding a card, upgrade errors 'no default
+ * payment method chosen'").
+ *
+ * Setting the first card as default was previously done ONLY in the
+ * `setup_intent.succeeded` webhook. Two ways that fails the user:
+ *
+ *   1. TIMING — the user adds a card, is redirected straight back, and clicks
+ *      upgrade before the webhook lands. The upgrade endpoint sees no default
+ *      and refuses. The card is right there; the error is a race, not a fact.
+ *   2. COVERAGE — the webhook only acted when `paymentMethods.data.length === 1`.
+ *      A customer with two cards and no default (e.g. their old default was
+ *      detached) could never satisfy the check, and no amount of retrying
+ *      helped.
+ *
+ * So this is called SYNCHRONOUSLY on the paths that need a default — and still
+ * from the webhook. Like activateSubscriptionInDb above, running both is safe:
+ * it is idempotent and converges on the same end state.
+ *
+ * Never overrides an existing default — a deliberate choice by the user (or a
+ * previous charge) outranks "whatever happens to be first in the list".
+ */
+const ensureDefaultPaymentMethod = async (
+  customerId: string,
+  preferredPaymentMethodId?: string
+): Promise<string | null> => {
+  const customer = await stripe.customers.retrieve(customerId) as Stripe.Customer;
+
+  // Already set — respect it.
+  const existing = customer.invoice_settings?.default_payment_method;
+  if (existing) return typeof existing === 'string' ? existing : existing.id;
+
+  const cards = await stripe.paymentMethods.list({ customer: customerId, type: 'card' });
+  if (cards.data.length === 0) return null;
+
+  // Prefer the card we were just handed (the one the user actually added);
+  // otherwise fall back to the most recently created one.
+  const chosen =
+    (preferredPaymentMethodId && cards.data.find((pm) => pm.id === preferredPaymentMethodId)?.id)
+    || cards.data.slice().sort((a, b) => (b.created || 0) - (a.created || 0))[0].id;
+
+  await stripe.customers.update(customerId, {
+    invoice_settings: { default_payment_method: chosen },
+  });
+  console.log(`✅ Auto-set default payment method ${chosen} for customer ${customerId}`);
+  return chosen;
+};
+
+/**
+ * Point a subscription at the customer's default payment method.
+ *
+ * A customer-level default does not retroactively apply to a subscription that
+ * was created with its own `default_payment_method`, so a renewal can still be
+ * attempted against a stale card. Clearing the subscription-level override
+ * makes it inherit the customer default, which is the one the user manages in
+ * Settings.
+ */
+const alignSubscriptionPaymentMethod = async (subscriptionId: string): Promise<void> => {
+  try {
+    await stripe.subscriptions.update(subscriptionId, {
+      default_payment_method: '',
+    });
+  } catch (err) {
+    // Non-fatal: the charge will still fall back to the customer default.
+    console.warn(`⚠️ Could not align subscription ${subscriptionId} payment method:`, err);
+  }
 };
 
 // Validation schemas
@@ -620,22 +742,20 @@ router.post('/webhook', async (req: Request, res: Response) => {
           const customerId = setupIntent.customer as string;
           const paymentMethodId = setupIntent.payment_method as string;
 
-          // Check if this is the first payment method for the customer
-          const paymentMethods = await stripe.paymentMethods.list({
-            customer: customerId,
-            type: 'card'
-          });
-
-          // If this is the first (or only) payment method, set it as default
-          if (paymentMethods.data.length === 1) {
-            await stripe.customers.update(customerId, {
-              invoice_settings: {
-                default_payment_method: paymentMethodId
-              }
-            });
-
-            console.log(`✅ Set payment method ${paymentMethodId} as default for customer ${customerId} (first card)`);
-          }
+          // BUG 3 — delegate to the shared helper, which also runs synchronously
+          // on the upgrade path so the user is never blocked waiting on this
+          // webhook. The old inline version only acted when the customer had
+          // EXACTLY one card, so someone holding two cards and no default could
+          // never get one set.
+          //
+          // OLD:
+          //   const paymentMethods = await stripe.paymentMethods.list({ customer: customerId, type: 'card' });
+          //   if (paymentMethods.data.length === 1) {
+          //     await stripe.customers.update(customerId, {
+          //       invoice_settings: { default_payment_method: paymentMethodId }
+          //     });
+          //   }
+          await ensureDefaultPaymentMethod(customerId, paymentMethodId);
         }
         break;
       }
@@ -857,15 +977,28 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
       });
     }
 
-    // Check if customer has a default payment method set
-    const customer = await stripe.customers.retrieve(user.stripe_customer_id) as Stripe.Customer;
-    const defaultPaymentMethod = customer.invoice_settings?.default_payment_method;
+    // BUG 3 — the user has at least one card at this point (checked above), so
+    // requiring them to go and nominate a default was a dead end that produced
+    // "no default payment method chosen" right after they had added a card.
+    // Promote one automatically and carry on; only bail if they truly have none.
+    //
+    // OLD:
+    //   const customer = await stripe.customers.retrieve(user.stripe_customer_id) as Stripe.Customer;
+    //   const defaultPaymentMethod = customer.invoice_settings?.default_payment_method;
+    //   if (!defaultPaymentMethod) {
+    //     return res.status(400).json({
+    //       success: false,
+    //       error: 'Please set a default payment method in Settings first',
+    //       requires_default_payment_method: true
+    //     });
+    //   }
+    const defaultPaymentMethod = await ensureDefaultPaymentMethod(user.stripe_customer_id);
 
     if (!defaultPaymentMethod) {
       return res.status(400).json({
         success: false,
-        error: 'Please set a default payment method in Settings first',
-        requires_default_payment_method: true
+        error: 'Please add a payment method in Settings first',
+        requires_payment_method: true
       });
     }
 
@@ -920,6 +1053,23 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
             subscription_id: subscription.id
           });
         }
+
+        // BUG 11 — first-subscription confirmation. Same template as an upgrade;
+        // here the charge IS the full plan price, so it can be stated exactly.
+        const creditsSummary = [
+          plan.content_credits ? `${plan.content_credits} content` : null,
+          plan.image_credits ? `${plan.image_credits} image` : null,
+          plan.keyword_credits ? `${plan.keyword_credits} keyword` : null,
+        ].filter(Boolean).join(', ') + ' credits per month';
+
+        await sendBillingEmail(user_id, (firstName) => emailTemplates.subscriptionUpgraded(
+          firstName,
+          plan.name,
+          formatCents(plan.price_cents, 'usd'),
+          new Date(nextBillingTimestamp * 1000).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+          creditsSummary,
+          CMS_BILLING_URL,
+        ));
 
         res.json({
           success: true,
@@ -1004,14 +1154,205 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
 });
 
 /**
+ * Preview what a plan change will cost, WITHOUT committing to it.
+ * POST /api/v1/stripe/preview-plan-change
+ *
+ * Bug 6: the prorated amount was only revealed in the post-confirm success
+ * message — the user committed to a charge before being told its size.
+ *
+ * ── Why a proration_date is returned, and why it matters ────────────────────
+ * Stripe computes proration relative to an instant. Preview at 10:00:00 and
+ * commit at 10:00:07 and the two amounts can differ, because a few more
+ * seconds of the old plan have been consumed. Showing one number and charging
+ * another — even by a cent — is exactly the kind of billing discrepancy that
+ * generates support tickets and chargebacks.
+ *
+ * So the preview pins the instant it priced and hands it back; /change-plan
+ * accepts that same timestamp and passes it to Stripe. The quote is then
+ * honoured exactly. This is Stripe's documented pattern for upgrade previews.
+ */
+router.post('/preview-plan-change', async (req: Request, res: Response) => {
+  try {
+    const { user_id, new_plan_id } = z.object({
+      user_id: z.number(),
+      new_plan_id: z.number()
+    }).parse(req.body);
+
+    const currentSub = await getUserSubscription(user_id);
+    const [currentPlanData, newPlanData] = await Promise.all([
+      currentSub ? sql`SELECT * FROM subscription_plans WHERE id = ${currentSub.plan_id}` : Promise.resolve([] as any[]),
+      sql`SELECT * FROM subscription_plans WHERE id = ${new_plan_id}`
+    ]);
+
+    if (newPlanData.length === 0) {
+      return res.status(404).json({ success: false, error: 'Plan not found' });
+    }
+    const newPlan = newPlanData[0];
+
+    // No existing subscription → this is a first subscription, not a change.
+    // The full plan price is what they'll pay; there is nothing to prorate.
+    if (!currentSub || !currentSub.stripe_subscription_id) {
+      return res.json({
+        success: true,
+        data: {
+          is_upgrade: true,
+          is_first_subscription: true,
+          prorated: false,
+          amount_due_cents: newPlan.price_cents,
+          currency: 'usd',
+          proration_date: null,
+          effective: 'immediate',
+          description: 'You will be charged the full plan price to start this subscription.',
+        }
+      });
+    }
+
+    const currentPlan = currentPlanData[0];
+    const isUpgrade = newPlan.price_cents > currentPlan.price_cents;
+
+    // BUG 10 — reactivation quote. Mirrors the same-plan-while-cancelling case
+    // in /change-plan so the dialog says "nothing to pay, your plan continues"
+    // rather than the misleading downgrade copy below.
+    if (new_plan_id === currentSub.plan_id && currentSub.cancel_at_period_end) {
+      return res.json({
+        success: true,
+        data: {
+          is_upgrade: false,
+          is_reactivation: true,
+          is_first_subscription: false,
+          prorated: false,
+          amount_due_cents: 0,
+          currency: 'usd',
+          proration_date: null,
+          effective: 'immediate',
+          next_billing_date: currentSub.next_billing_date,
+          new_plan: newPlan.name,
+          description: 'Your cancellation will be reversed and your plan continues as normal. Nothing is charged today.',
+        }
+      });
+    }
+
+    // Downgrades are scheduled, not prorated (proration_behavior 'none' on the
+    // commit path) — so nothing is owed today. Say so explicitly rather than
+    // previewing a charge that will not happen.
+    if (!isUpgrade) {
+      return res.json({
+        success: true,
+        data: {
+          is_upgrade: false,
+          is_first_subscription: false,
+          prorated: false,
+          amount_due_cents: 0,
+          currency: 'usd',
+          proration_date: null,
+          effective: 'period_end',
+          effective_date: currentSub.next_billing_date,
+          description: 'No charge today. Your new plan starts at the end of the current billing period.',
+        }
+      });
+    }
+
+    // Same precondition the commit path enforces — fail here rather than
+    // showing a quote for a change that /change-plan will then refuse.
+    if (!newPlan.stripe_price_id) {
+      return res.status(500).json({
+        success: false,
+        error: 'Stripe Price ID not configured for the selected plan. Please contact support.'
+      });
+    }
+
+    const stripeSubscription = await stripe.subscriptions.retrieve(currentSub.stripe_subscription_id);
+    const itemId = stripeSubscription.items.data[0]?.id;
+    if (!itemId) {
+      return res.status(500).json({ success: false, error: 'Subscription has no billable items' });
+    }
+
+    // The instant we are pricing against. Returned to the caller and replayed
+    // on commit so the quote is binding.
+    const prorationDate = Math.floor(Date.now() / 1000);
+
+    const preview = await stripe.invoices.createPreview({
+      customer: stripeSubscription.customer as string,
+      subscription: currentSub.stripe_subscription_id,
+      subscription_details: {
+        items: [{ id: itemId, price: newPlan.stripe_price_id }],
+        proration_behavior: 'create_prorations',
+        proration_date: prorationDate,
+      },
+    });
+
+    // Only the proration line items are due NOW. The rest of the previewed
+    // invoice is the next cycle's recurring charge, which must NOT be presented
+    // as part of today's amount — that would massively overstate it.
+    //
+    // NOTE: on this API version (2025-10-29.clover) `proration` is NOT a
+    // top-level field on the line item — it lives under
+    // `parent.invoice_item_details` / `parent.subscription_item_details`.
+    // Reading `line.proration` yields undefined for every line, which would
+    // filter out everything and quote $0.00 for every upgrade. The top-level
+    // read is kept as a fallback for older API versions.
+    const isProrationLine = (line: any): boolean => {
+      const parent = line?.parent;
+      if (parent) {
+        if (parent.invoice_item_details?.proration) return true;
+        if (parent.subscription_item_details?.proration) return true;
+        // Parent present but neither detail flags a proration → not one.
+        if (parent.invoice_item_details || parent.subscription_item_details) return false;
+      }
+      return !!line?.proration; // pre-2025 shape
+    };
+
+    const prorationLines = preview.lines.data.filter(isProrationLine);
+    const amountDueNow = prorationLines.reduce((sum: number, line: any) => sum + (line.amount || 0), 0);
+
+    res.json({
+      success: true,
+      data: {
+        is_upgrade: true,
+        is_first_subscription: false,
+        prorated: true,
+        // Net of the credit for unused time on the old plan and the charge for
+        // the new one. Can be negative (a credit) on unusual cycle positions.
+        amount_due_cents: amountDueNow,
+        currency: preview.currency || 'usd',
+        proration_date: prorationDate,
+        effective: 'immediate',
+        next_billing_date: currentSub.next_billing_date,
+        current_plan: currentPlan?.name || null,
+        new_plan: newPlan.name,
+        description: amountDueNow > 0
+          ? 'You will be charged this prorated amount now, covering the rest of the current billing period. Your credits are topped up straight away.'
+          : 'No charge is due now — the unused portion of your current plan covers the change.',
+        lines: prorationLines.map((line: any) => ({
+          description: line.description,
+          amount_cents: line.amount,
+        })),
+      }
+    });
+
+  } catch (error) {
+    console.error('Preview plan change error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to preview plan change'
+    });
+  }
+});
+
+/**
  * Change subscription plan (upgrade or downgrade)
  * POST /api/v1/stripe/change-plan
  */
 router.post('/change-plan', async (req: Request, res: Response) => {
   try {
-    const { user_id, new_plan_id } = z.object({
+    // `proration_date` is the timestamp returned by /preview-plan-change. When
+    // present it is replayed to Stripe so the customer is charged exactly the
+    // amount they were quoted (bug 6). Optional — a caller that skips the
+    // preview still works, it just prices at "now".
+    const { user_id, new_plan_id, proration_date } = z.object({
       user_id: z.number(),
-      new_plan_id: z.number()
+      new_plan_id: z.number(),
+      proration_date: z.number().int().positive().optional()
     }).parse(req.body);
 
     // Get current subscription
@@ -1043,6 +1384,41 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     const newPlan = newPlanData[0];
     const isUpgrade = newPlan.price_cents > currentPlan.price_cents;
 
+    // BUG 10 — REACTIVATION. Re-picking the plan you are already on while a
+    // cancellation is scheduled is the most natural way to "resubscribe", and
+    // it was the one path that silently did the wrong thing: same price means
+    // isUpgrade === false, so it fell into the DOWNGRADE branch, queued a
+    // pointless pending_plan change, and never cleared cancel_at_period_end —
+    // leaving the "Cancellation Scheduled" banner up forever.
+    //
+    // Treat it as what the user means: keep the subscription running. No
+    // proration, no credit grant — nothing about the plan is changing.
+    if (new_plan_id === currentSub.plan_id && currentSub.cancel_at_period_end) {
+      if (currentSub.stripe_subscription_id) {
+        await stripe.subscriptions.update(currentSub.stripe_subscription_id, {
+          cancel_at_period_end: false,
+        });
+      }
+      await sql`
+        UPDATE subscriptions
+        SET    cancel_at_period_end = FALSE,
+               cancelled_at = NULL,
+               status = 'active'
+        WHERE  user_id = ${user_id}
+      `;
+
+      console.log(`✅ Reactivated cancelled subscription for user ${user_id} (${newPlan.name})`);
+
+      return res.json({
+        success: true,
+        message: `Your ${newPlan.name} subscription has been reactivated. Billing continues as normal — you were not charged again today.`,
+        immediate: true,
+        reactivated: true,
+        effective_date: new Date().toISOString(),
+        new_plan: newPlan.name,
+      });
+    }
+
     // Validate that Stripe Price IDs are configured
     if (!newPlan.stripe_price_id) {
       return res.status(500).json({
@@ -1066,14 +1442,44 @@ router.post('/change-plan', async (req: Request, res: Response) => {
           throw new Error('No subscription items found');
         }
 
-        // Update subscription with new price
+        // Update subscription with new price.
+        //
+        // proration_date (bug 6): replaying the timestamp the user was quoted
+        // at guarantees Stripe charges the amount shown in the confirm dialog.
+        // Without it Stripe prices at "now", which drifts from the preview by
+        // however long the user spent reading it.
+        //
+        // cancel_at_period_end (bug 10): a user who cancelled and then picked a
+        // new plan is plainly not cancelling any more. Clearing it here is what
+        // makes the stale "Cancellation Scheduled" banner go away for real —
+        // the CMS reads this state back, so it cannot be fixed frontend-side.
+        //
+        // OLD:
+        //   await stripe.subscriptions.update(currentSub.stripe_subscription_id, {
+        //     items: [{ id: stripeSubscription.items.data[0].id, price: newPlan.stripe_price_id }],
+        //     proration_behavior: isUpgrade ? 'create_prorations' : 'none',
+        //     billing_cycle_anchor: 'unchanged'
+        //   });
         await stripe.subscriptions.update(currentSub.stripe_subscription_id, {
           items: [{
             id: stripeSubscription.items.data[0].id,
             price: newPlan.stripe_price_id, // ✅ Change the price
           }],
           proration_behavior: isUpgrade ? 'create_prorations' : 'none',
-          billing_cycle_anchor: 'unchanged' // Keep same billing date
+          billing_cycle_anchor: 'unchanged', // Keep same billing date
+          cancel_at_period_end: false,
+          // ── FLAG: BILLING_PRORATION_DATE_ENABLED ─────────────────────────
+          // Replaying the quoted timestamp is what makes the preview binding,
+          // but Stripe REJECTS a proration_date outside the current period —
+          // which would turn a stale confirm dialog into a failed upgrade.
+          // Off = Stripe prices at "now", exactly as it did before this work.
+          // The customer may then be charged a few seconds' difference from
+          // the quote; that is the safer failure while this is unverified.
+          ...(isUpgrade
+              && proration_date
+              && String(process.env.BILLING_PRORATION_DATE_ENABLED || '').toLowerCase() === 'true'
+                ? { proration_date }
+                : {}),
         });
 
         console.log(`✅ Stripe subscription updated successfully`);
@@ -1100,6 +1506,31 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     // Update database (only after Stripe succeeds)
     await changePlan(user_id, new_plan_id, isUpgrade);
     console.log(`✅ Database updated successfully`);
+
+    // BUG 11 — notify the customer that their plan (and their bill) changed.
+    // Awaited so a synchronous failure is logged in-request, but sendBillingEmail
+    // never throws, so it cannot turn a completed upgrade into an error.
+    if (isUpgrade) {
+      const creditsSummary = [
+        newPlan.content_credits ? `${newPlan.content_credits} content` : null,
+        newPlan.image_credits ? `${newPlan.image_credits} image` : null,
+        newPlan.keyword_credits ? `${newPlan.keyword_credits} keyword` : null,
+      ].filter(Boolean).join(', ') + ' credits per month';
+
+      await sendBillingEmail(user_id, (firstName) => emailTemplates.subscriptionUpgraded(
+        firstName,
+        newPlan.name,
+        // The prorated invoice is raised asynchronously by Stripe, so quoting a
+        // precise figure here risks contradicting the real invoice. Point at
+        // the receipt instead of inventing a number.
+        'A prorated amount for the remainder of this billing period',
+        currentSub.next_billing_date
+          ? new Date(currentSub.next_billing_date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+          : 'your next billing date',
+        creditsSummary,
+        CMS_BILLING_URL,
+      ));
+    }
 
     res.json({
       success: true,
@@ -1234,6 +1665,19 @@ router.post('/cancel-subscription', async (req: Request, res: Response) => {
     // Mark in database
     await cancelSubscription(user_id);
 
+    // BUG 11 — confirm the cancellation in writing, with the date access ends.
+    // This is the email customers most expect and its absence reads as "did my
+    // cancellation actually go through?".
+    const accessUntil = subscription.next_billing_date
+      ? new Date(subscription.next_billing_date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+      : 'the end of your current billing period';
+    await sendBillingEmail(user_id, (firstName) => emailTemplates.subscriptionCancelled(
+      firstName,
+      subscription.plan_name || 'your',
+      accessUntil,
+      CMS_BILLING_URL,
+    ));
+
     res.json({
       success: true,
       message: `Subscription will be cancelled on ${subscription.next_billing_date}. You can continue using your credits until then.`,
@@ -1247,6 +1691,118 @@ router.post('/cancel-subscription', async (req: Request, res: Response) => {
     res.status(400).json({
       success: false,
       error: error instanceof Error ? error.message : 'Failed to cancel subscription'
+    });
+  }
+});
+
+/**
+ * Billing history — what the CMS "Recent Transactions" list shows.
+ * GET /api/v1/stripe/billing-history/:user_id?limit=20
+ *
+ * Bug 7: the list was permanently empty even after a credit purchase and two
+ * plan upgrades, because NOTHING SERVED IT — there was no user-facing endpoint
+ * at all, only an admin one. The CMS rendered a hardcoded empty state.
+ *
+ * Two sources are merged, because "transactions" means two different things to
+ * a user and they expect to see both:
+ *
+ *   MONEY  — Stripe invoices. The authoritative record of what was charged,
+ *            including prorated upgrade invoices, with a receipt link.
+ *   CREDITS— credit_transactions rows that are NOT generation debits. These
+ *            cover purchases and plan grants.
+ *
+ * The discriminator for that second set is `generation_id IS NULL`: every
+ * consumption debit is written by deductCredits with a generation_id attached,
+ * while purchases/grants/refills are written without one. Filtering on the
+ * reason text instead would silently break the moment a reason string is
+ * reworded.
+ *
+ * Stripe is queried best-effort: if it is unreachable or the user has no
+ * customer record, the credit rows are still returned rather than failing the
+ * whole list.
+ */
+router.get('/billing-history/:user_id', async (req: Request, res: Response) => {
+  try {
+    const userId = parseInt(req.params.user_id);
+    if (Number.isNaN(userId)) {
+      return res.status(400).json({ success: false, error: 'Invalid user id' });
+    }
+    const limit = Math.min(parseInt(String(req.query.limit || '20')) || 20, 100);
+
+    const userRows = await sql`SELECT stripe_customer_id FROM users WHERE id = ${userId} LIMIT 1`;
+    if (userRows.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    const customerId = userRows[0].stripe_customer_id as string | null;
+
+    // ── Credit-side events (purchases, plan grants, refills, suspensions) ──
+    const creditRows = await sql`
+      SELECT id, credit_type, delta, reason, created_at
+      FROM   credit_transactions
+      WHERE  user_id = ${userId}
+        AND  generation_id IS NULL
+      ORDER  BY created_at DESC
+      LIMIT  ${limit}
+    `;
+
+    const creditEvents = (creditRows as any[]).map((r) => ({
+      id: `credit_${r.id}`,
+      type: 'credit' as const,
+      date: r.created_at,
+      description: r.reason || 'Credit adjustment',
+      credit_type: r.credit_type,
+      credit_delta: Number(r.delta),
+      amount_cents: null,
+      currency: null,
+      status: 'completed',
+      receipt_url: null,
+    }));
+
+    // ── Money-side events (Stripe invoices) ──
+    let invoiceEvents: any[] = [];
+    if (customerId) {
+      try {
+        const invoices = await stripe.invoices.list({ customer: customerId, limit });
+        invoiceEvents = invoices.data.map((inv) => ({
+          id: `invoice_${inv.id}`,
+          type: 'invoice' as const,
+          date: new Date((inv.created || 0) * 1000).toISOString(),
+          description:
+            inv.lines?.data?.[0]?.description
+            || (inv.billing_reason === 'subscription_update' ? 'Plan change (prorated)' : 'Subscription charge'),
+          credit_type: null,
+          credit_delta: null,
+          amount_cents: inv.amount_paid ?? inv.amount_due ?? 0,
+          currency: inv.currency || 'usd',
+          status: inv.status || 'unknown',
+          receipt_url: inv.hosted_invoice_url || inv.invoice_pdf || null,
+        }));
+      } catch (stripeErr) {
+        // Degrade to credit-only history rather than 500-ing the whole list.
+        console.warn('⚠️ Billing history: Stripe invoice fetch failed:', stripeErr);
+      }
+    }
+
+    const events = [...invoiceEvents, ...creditEvents]
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+      .slice(0, limit);
+
+    res.json({
+      success: true,
+      data: events,
+      // Lets the CMS distinguish "no billing activity yet" from "we could not
+      // reach Stripe", which are very different things to tell a paying user.
+      meta: {
+        stripe_available: !!customerId && invoiceEvents.length >= 0,
+        has_stripe_customer: !!customerId,
+      },
+    });
+
+  } catch (error) {
+    console.error('Billing history error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to fetch billing history'
     });
   }
 });
@@ -1270,13 +1826,19 @@ router.get('/payment-methods/:user_id', async (req: Request, res: Response) => {
 
     const customerId = userResult[0].stripe_customer_id;
 
+    // BUG 3 — self-heal on read: if the customer has cards but no default (the
+    // webhook never landed, or their old default was detached), promote one now
+    // so Settings shows a default and the upgrade path can't fail. Idempotent
+    // and a no-op when a default already exists.
+    await ensureDefaultPaymentMethod(customerId);
+
     // Get payment methods from Stripe
     const paymentMethods = await stripe.paymentMethods.list({
       customer: customerId,
       type: 'card'
     });
 
-    // Get default payment method
+    // Get default payment method (re-read AFTER the heal above)
     const customer = await stripe.customers.retrieve(customerId) as Stripe.Customer;
     const defaultPaymentMethodId = customer.invoice_settings?.default_payment_method;
 
@@ -1363,6 +1925,105 @@ router.post('/create-setup-session', async (req: Request, res: Response) => {
 });
 
 /**
+ * Create a SetupIntent for collecting a card IN-PAGE via Stripe Elements.
+ * POST /api/v1/stripe/create-setup-intent
+ *
+ * Backend half of bug 4 (inline card entry at upgrade). The frontend Elements
+ * work is scheduled separately — credits.md flags it as the larger piece — but
+ * this endpoint is the whole server-side requirement, so that follow-up is
+ * purely a CMS change.
+ *
+ * Differs from /create-setup-session, which returns a hosted Checkout URL and
+ * therefore navigates the user away from the page. This returns a
+ * client_secret to confirm in place.
+ *
+ * usage: 'off_session' so the saved card can be charged for future renewals
+ * without the customer present — a card saved on-session only would fail at
+ * the next automatic renewal.
+ */
+router.post('/create-setup-intent', async (req: Request, res: Response) => {
+  try {
+    const { user_id } = z.object({ user_id: z.number() }).parse(req.body);
+
+    const userResult = await sql`SELECT email, stripe_customer_id FROM users WHERE id = ${user_id}`;
+    if (userResult.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const user = userResult[0];
+    let customerId = user.stripe_customer_id as string | null;
+
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        metadata: { user_id: user_id.toString() },
+      });
+      customerId = customer.id;
+      await sql`UPDATE users SET stripe_customer_id = ${customerId} WHERE id = ${user_id}`;
+    }
+
+    const setupIntent = await stripe.setupIntents.create({
+      customer: customerId,
+      payment_method_types: ['card'],
+      usage: 'off_session',
+      metadata: { user_id: user_id.toString() },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        client_secret: setupIntent.client_secret,
+        customer_id: customerId,
+      },
+    });
+
+  } catch (error) {
+    console.error('Create setup intent error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to create setup intent'
+    });
+  }
+});
+
+/**
+ * Ensure the customer has a default payment method.
+ * POST /api/v1/stripe/ensure-default-payment-method
+ *
+ * Called by the CMS the moment the user returns from adding a card
+ * (?setup=success), so the default is in place immediately instead of whenever
+ * the setup_intent.succeeded webhook happens to arrive. Idempotent.
+ */
+router.post('/ensure-default-payment-method', async (req: Request, res: Response) => {
+  try {
+    const { user_id } = z.object({ user_id: z.number() }).parse(req.body);
+
+    const userResult = await sql`SELECT stripe_customer_id FROM users WHERE id = ${user_id}`;
+    if (userResult.length === 0 || !userResult[0].stripe_customer_id) {
+      return res.json({ success: true, data: { default_payment_method: null } });
+    }
+
+    const customerId = userResult[0].stripe_customer_id as string;
+    const defaultPm = await ensureDefaultPaymentMethod(customerId);
+
+    // Keep the live subscription (if any) pointed at the customer default.
+    const sub = await getUserSubscription(user_id);
+    if (defaultPm && sub?.stripe_subscription_id) {
+      await alignSubscriptionPaymentMethod(sub.stripe_subscription_id);
+    }
+
+    res.json({ success: true, data: { default_payment_method: defaultPm } });
+
+  } catch (error) {
+    console.error('Ensure default payment method error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to set a default payment method'
+    });
+  }
+});
+
+/**
  * Remove payment method
  * DELETE /api/v1/stripe/payment-method/:user_id/:payment_method_id
  */
@@ -1380,8 +2041,27 @@ router.delete('/payment-method/:user_id/:payment_method_id', async (req: Request
       });
     }
 
+    const customerId = userResult[0].stripe_customer_id as string;
+
+    // Ownership check. Without this, any authenticated caller could detach an
+    // arbitrary payment method id belonging to another customer — the handler
+    // previously looked up the user only to prove they existed, then detached
+    // whatever id was in the URL.
+    const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
+    if (pm.customer !== customerId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Not authorized to remove this payment method'
+      });
+    }
+
     // Detach payment method from customer
     await stripe.paymentMethods.detach(paymentMethodId);
+
+    // BUG 3 (same class) — removing the DEFAULT card left the customer with
+    // cards but no default, which is exactly the state that made upgrades fail.
+    // Promote a replacement immediately.
+    await ensureDefaultPaymentMethod(customerId);
 
     res.json({
       success: true,
