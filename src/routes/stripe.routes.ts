@@ -64,6 +64,15 @@ const sendBillingEmail = async (
   userId: number,
   build: (firstName: string) => { subject: string; html: string; text?: string }
 ): Promise<void> => {
+  // ── FLAG: BILLING_EMAILS_ENABLED ─────────────────────────────────────────
+  // These emails have never been sent — Mailgun is unconfigured in local dev,
+  // so sendEmail no-ops there and the templates have never been seen by a real
+  // mail client. Off = the previous behaviour: no billing email at all.
+  //
+  // Gated here, in the one helper every caller goes through, so no call site
+  // can bypass it. Turn on after previewing both templates (upgrade and
+  // cancellation) against a real inbox.
+  if (String(process.env.BILLING_EMAILS_ENABLED || '').toLowerCase() !== 'true') return;
   try {
     const rows = await sql`SELECT email, name FROM users WHERE id = ${userId} LIMIT 1`;
     const user = rows[0] as any;
@@ -1459,7 +1468,18 @@ router.post('/change-plan', async (req: Request, res: Response) => {
           proration_behavior: isUpgrade ? 'create_prorations' : 'none',
           billing_cycle_anchor: 'unchanged', // Keep same billing date
           cancel_at_period_end: false,
-          ...(isUpgrade && proration_date ? { proration_date } : {}),
+          // ── FLAG: BILLING_PRORATION_DATE_ENABLED ─────────────────────────
+          // Replaying the quoted timestamp is what makes the preview binding,
+          // but Stripe REJECTS a proration_date outside the current period —
+          // which would turn a stale confirm dialog into a failed upgrade.
+          // Off = Stripe prices at "now", exactly as it did before this work.
+          // The customer may then be charged a few seconds' difference from
+          // the quote; that is the safer failure while this is unverified.
+          ...(isUpgrade
+              && proration_date
+              && String(process.env.BILLING_PRORATION_DATE_ENABLED || '').toLowerCase() === 'true'
+                ? { proration_date }
+                : {}),
         });
 
         console.log(`✅ Stripe subscription updated successfully`);

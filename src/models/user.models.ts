@@ -580,10 +580,18 @@ export const changePlan = async (
         ORDER BY cycle_started_at DESC
         LIMIT 1
       `;
-      const factor = remainingCycleFraction(
-        cycleRows[0]?.cycle_started_at,
-        currentSub.next_billing_date
-      );
+      // ── FLAG: BILLING_PRORATED_CREDITS_ENABLED ───────────────────────────
+      // Prorating the grant changes how many credits a paying customer
+      // receives, so it stays OFF until it has been verified against a real
+      // billing cycle. Off = the previous behaviour exactly: the full plan
+      // difference, granted regardless of cycle position.
+      //
+      // Turn it on only after confirming, on a test account mid-cycle, that
+      // the credits granted line up with the prorated amount charged.
+      const prorateCredits = String(process.env.BILLING_PRORATED_CREDITS_ENABLED || '').toLowerCase() === 'true';
+      const factor = prorateCredits
+        ? remainingCycleFraction(cycleRows[0]?.cycle_started_at, currentSub.next_billing_date)
+        : 1;
       await upgradeIncludedCredits(user_id, newPlan[0], 'Plan upgrade credit bonus', factor);
     }
   } else {
