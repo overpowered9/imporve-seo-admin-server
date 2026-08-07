@@ -517,7 +517,19 @@ router.get('/address/:user_id', async (req, res) => {
         has_address: !!(r.address_line1 && r.address_city && r.address_country),
       },
     });
-  } catch (error) {
+  } catch (error: any) {
+    // 42703 = undefined_column: migration 003 has not run on this database yet.
+    // Deploys and migrations race in most setups, so the code must tolerate
+    // running ahead of the schema rather than 500-ing at every caller. Report
+    // "no address on file" — which is true — and flag it as unavailable so the
+    // client can stay quiet instead of prompting for something it cannot save.
+    if (error?.code === '42703') {
+      console.warn('[address] address columns missing — run `npm run migrate:address`. Reporting no address.');
+      return res.json({
+        success: true,
+        data: { has_address: false, available: false },
+      });
+    }
     console.error('Get address error:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch address' });
   }
@@ -552,6 +564,17 @@ router.put('/address/:user_id', async (req, res) => {
         success: false,
         error: 'Please check the address fields',
         details: error.errors.map((e) => ({ path: e.path.join('.'), message: e.message })),
+      });
+    }
+    // Same missing-schema case as the GET above. A save genuinely cannot
+    // succeed here, so this stays an error — but a specific, actionable one
+    // rather than a generic 500 that looks like the user's fault.
+    if ((error as any)?.code === '42703') {
+      console.warn('[address] address columns missing — run `npm run migrate:address`.');
+      return res.status(503).json({
+        success: false,
+        error: 'Address storage is not available yet. Please try again later.',
+        code: 'ADDRESS_STORAGE_UNAVAILABLE',
       });
     }
     console.error('Save address error:', error instanceof Error ? error.message : 'unknown');
