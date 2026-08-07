@@ -11,6 +11,7 @@
     "seed": "tsx src/scripts/seedFixedTemplates.ts",
     "seed:content-v2": "tsx src/scripts/seed-content-v2-prompts.ts",
     "migrate:notifications": "tsx src/migrations/002-user-notifications.ts",
+    "migrate:address": "tsx src/migrations/003-user-address.ts",
     "lint": "eslint ."
   },
   "dependencies": {

@@ -463,6 +463,102 @@ router.get('/website-stats/:user_id', async (req, res) => {
 });
 
 // Update user profile (name)
+/**
+ * Address for tax purposes (task3.md 4.2).
+ * GET  /api/v1/users/address/:user_id
+ * PUT  /api/v1/users/address/:user_id
+ *
+ * Kept as its own endpoint rather than folded into the profile PATCH so the
+ * onboarding prompt and the Settings form share one contract, and so the
+ * "has the user given us an address yet?" read is a single cheap query.
+ *
+ * PII: these fields are returned ONLY here, for the user's own record. They are
+ * deliberately absent from /users/by-email and /users/status, so no
+ * plugin-facing or session-bootstrap response ever carries a postal address.
+ * Nothing here is logged — note the catch blocks log the error, never req.body.
+ */
+const addressSchema = z.object({
+  line1: z.string().trim().min(1).max(200),
+  line2: z.string().trim().max(200).optional().nullable(),
+  city: z.string().trim().min(1).max(120),
+  // Optional: many countries (e.g. most of the EU) have no state/province.
+  state: z.string().trim().max(120).optional().nullable(),
+  // Optional for the same reason — a handful of countries have no postal code
+  // at all. Validating a US-shaped ZIP globally would lock those users out.
+  postal_code: z.string().trim().max(32).optional().nullable(),
+  country: z.string().trim().length(2).regex(/^[A-Za-z]{2}$/),
+});
+
+router.get('/address/:user_id', async (req, res) => {
+  try {
+    const user_id = parseInt(req.params.user_id);
+    if (Number.isNaN(user_id)) {
+      return res.status(400).json({ success: false, error: 'Invalid user id' });
+    }
+    const rows = await sql`
+      SELECT address_line1, address_line2, address_city, address_state,
+             address_postal_code, address_country, address_updated_at
+      FROM   users WHERE id = ${user_id} LIMIT 1
+    `;
+    if (!rows[0]) return res.status(404).json({ success: false, error: 'User not found' });
+    const r = rows[0] as any;
+    res.json({
+      success: true,
+      data: {
+        line1: r.address_line1,
+        line2: r.address_line2,
+        city: r.address_city,
+        state: r.address_state,
+        postal_code: r.address_postal_code,
+        country: r.address_country,
+        updated_at: r.address_updated_at,
+        // The single flag the UI prompts on, so the client never has to
+        // re-derive "is this complete?" and get it subtly different.
+        has_address: !!(r.address_line1 && r.address_city && r.address_country),
+      },
+    });
+  } catch (error) {
+    console.error('Get address error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch address' });
+  }
+});
+
+router.put('/address/:user_id', async (req, res) => {
+  try {
+    const user_id = parseInt(req.params.user_id);
+    if (Number.isNaN(user_id)) {
+      return res.status(400).json({ success: false, error: 'Invalid user id' });
+    }
+    const a = addressSchema.parse(req.body);
+    const rows = await sql`
+      UPDATE users
+      SET    address_line1       = ${a.line1},
+             address_line2       = ${a.line2 || null},
+             address_city        = ${a.city},
+             address_state       = ${a.state || null},
+             address_postal_code = ${a.postal_code || null},
+             address_country     = ${a.country.toUpperCase()},
+             address_updated_at  = NOW(),
+             updated_at          = NOW()
+      WHERE  id = ${user_id}
+      RETURNING id
+    `;
+    if (!rows[0]) return res.status(404).json({ success: false, error: 'User not found' });
+    res.json({ success: true, message: 'Address saved' });
+  } catch (error) {
+    // Log the failure, never the payload — it contains a postal address.
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please check the address fields',
+        details: error.errors.map((e) => ({ path: e.path.join('.'), message: e.message })),
+      });
+    }
+    console.error('Save address error:', error instanceof Error ? error.message : 'unknown');
+    res.status(500).json({ success: false, error: 'Failed to save address' });
+  }
+});
+
 router.patch('/profile/:user_id', async (req, res) => {
   try {
     const user_id = parseInt(req.params.user_id);
