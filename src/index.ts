@@ -9,6 +9,7 @@ import adminPromptRoutes from './routes/admin/prompts.routes.js';
 import generationsRoutes from './routes/generations.routes.js';
 import { testConnection } from './data/db.js';
 import { startTrialEmailScheduler } from './services/trial-emails.service.js';
+import { startLifecycleEmailScheduler } from './services/lifecycle-emails.service.js';
 
 dotenv.config();
 
@@ -81,6 +82,11 @@ async function startServer() {
 
     // Start the trial-email drip scheduler (no-op unless TRIAL_EMAILS_ENABLED=true)
     startTrialEmailScheduler();
+
+    // Credit-expiry + inactivity notifications (bugs 16/17).
+    // No-op unless LIFECYCLE_EMAILS_ENABLED=true, so this changes nothing until
+    // the copy is final and it is deliberately switched on.
+    startLifecycleEmailScheduler();
 
     // Start Express server
     const server = app.listen(port, () => {

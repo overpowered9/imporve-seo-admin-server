@@ -713,6 +713,131 @@ View Your Project: ${projectUrl}
     text: `Hi ${firstName},\n\nYour ${planName} subscription has been cancelled. You have not been charged again.\n\nAccess continues until: ${accessUntil}\nAfter that date your account moves to the free tier. Any credits you purchased separately remain yours.\n\nChanged your mind? You can resubscribe at any time:\n${billingUrl}\n\n© 2026 ImproveSEO`,
   }),
 
+  // ── Lifecycle notifications (round 2, bugs 16 & 17) ───────────────────────
+  //
+  // ⚠️ PLACEHOLDER COPY — the client marked the wording "coming soon".
+  // Everything else is finished: the triggers, the scheduling, the dedupe
+  // guards and every dynamic value below are wired and working. To ship the
+  // real wording, edit ONLY the marked strings in these two templates; no
+  // trigger logic needs to change.
+  //
+  // The dynamic data available to the copywriter is already interpolated:
+  // first name, per-type credit numbers, the total, the "pieces of content"
+  // translation, and the relevant date.
+
+  /** Credits approaching their cycle reset. */
+  creditsExpiringSoon: (
+    firstName: string,
+    daysUntilReset: number,
+    credits: { content: number; images: number; keywords: number; total: number },
+    piecesRemaining: number,
+    resetDate: string,
+    dashboardUrl: string,
+  ) => ({
+    // ⚠️ PLACEHOLDER SUBJECT
+    subject: `Your ImproveSEO credits reset in ${daysUntilReset} ${daysUntilReset === 1 ? 'day' : 'days'}`,
+    html: `
+      <!DOCTYPE html>
+      <html>
+      <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2c3e50; margin: 0; padding: 0; background: #f5f7fa; }
+          .wrapper { background: #f5f7fa; padding: 22px; }
+          .container { max-width: 560px; margin: 0 auto; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+          .header { background: linear-gradient(135deg, #1c7293 0%, #2ec5b6 100%); padding: 36px 30px; text-align: center; }
+          .header h1 { margin: 0; color: #fff; font-size: 22px; font-weight: 700; }
+          .content { padding: 32px 30px; }
+          .content p { margin: 0 0 14px; font-size: 15px; color: #333; }
+          .facts { background: #f0f7f9; border-radius: 8px; padding: 16px 18px; margin: 18px 0; }
+          .facts p { margin: 6px 0; font-size: 14px; color: #1c7293; }
+          .cta { text-align: center; margin: 26px 0 6px; }
+          .cta a { display: inline-block; background: #1c7293; color: #fff !important; text-decoration: none; padding: 13px 30px; border-radius: 8px; font-weight: 700; font-size: 15px; }
+          .footer { background: #f8f9fa; padding: 22px; text-align: center; border-top: 1px solid #eee; }
+          .footer p { margin: 3px 0; font-size: 11px; color: #9aa0a6; }
+        </style>
+      </head>
+      <body><div class="wrapper"><div class="container">
+        <div class="header"><h1>Your credits reset soon</h1></div>
+        <div class="content">
+          <!-- ⚠️ PLACEHOLDER COPY BELOW — replace with final wording -->
+          <p>Hi ${firstName},</p>
+          <p>Your plan credits reset on <strong>${resetDate}</strong>, in ${daysUntilReset} ${daysUntilReset === 1 ? 'day' : 'days'}. Unused plan credits don't roll over, so it's worth putting them to work first.</p>
+          <div class="facts">
+            <p><strong>Content:</strong> ${credits.content}</p>
+            <p><strong>Images:</strong> ${credits.images}</p>
+            <p><strong>Keywords:</strong> ${credits.keywords}</p>
+            <p><strong>That's roughly ${piecesRemaining} ${piecesRemaining === 1 ? 'piece' : 'pieces'} of SEO content with AI images.</strong></p>
+          </div>
+          <p>Any credits you purchased separately are unaffected — those stay in your account.</p>
+          <!-- ⚠️ END PLACEHOLDER COPY -->
+          <div class="cta"><a href="${dashboardUrl}">Generate Content</a></div>
+        </div>
+        <div class="footer">
+          <p>You're receiving this because you have an active ImproveSEO account.</p>
+          <p>© 2026 ImproveSEO. All rights reserved.</p>
+        </div>
+      </div></div></body>
+      </html>
+    `,
+    text: `Hi ${firstName},\n\nYour plan credits reset on ${resetDate}, in ${daysUntilReset} day(s). Unused plan credits don't roll over, so it's worth putting them to work first.\n\nContent: ${credits.content}\nImages: ${credits.images}\nKeywords: ${credits.keywords}\nThat's roughly ${piecesRemaining} piece(s) of SEO content with AI images.\n\nAny credits you purchased separately are unaffected.\n\nGenerate content: ${dashboardUrl}\n\n© 2026 ImproveSEO`,
+  }),
+
+  /** No activity for a while; includes what they still have available. */
+  inactivityWithCredits: (
+    firstName: string,
+    daysInactive: number,
+    credits: { content: number; images: number; keywords: number; total: number },
+    piecesRemaining: number,
+    dashboardUrl: string,
+  ) => ({
+    // ⚠️ PLACEHOLDER SUBJECT
+    subject: 'Your ImproveSEO credits are waiting',
+    html: `
+      <!DOCTYPE html>
+      <html>
+      <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #2c3e50; margin: 0; padding: 0; background: #f5f7fa; }
+          .wrapper { background: #f5f7fa; padding: 22px; }
+          .container { max-width: 560px; margin: 0 auto; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+          .header { background: linear-gradient(135deg, #1c7293 0%, #2ec5b6 100%); padding: 36px 30px; text-align: center; }
+          .header h1 { margin: 0; color: #fff; font-size: 22px; font-weight: 700; }
+          .content { padding: 32px 30px; }
+          .content p { margin: 0 0 14px; font-size: 15px; color: #333; }
+          .facts { background: #f0f7f9; border-radius: 8px; padding: 16px 18px; margin: 18px 0; }
+          .facts p { margin: 6px 0; font-size: 14px; color: #1c7293; }
+          .cta { text-align: center; margin: 26px 0 6px; }
+          .cta a { display: inline-block; background: #1c7293; color: #fff !important; text-decoration: none; padding: 13px 30px; border-radius: 8px; font-weight: 700; font-size: 15px; }
+          .footer { background: #f8f9fa; padding: 22px; text-align: center; border-top: 1px solid #eee; }
+          .footer p { margin: 3px 0; font-size: 11px; color: #9aa0a6; }
+        </style>
+      </head>
+      <body><div class="wrapper"><div class="container">
+        <div class="header"><h1>Your credits are still here</h1></div>
+        <div class="content">
+          <!-- ⚠️ PLACEHOLDER COPY BELOW — replace with final wording -->
+          <p>Hi ${firstName},</p>
+          <p>It's been about ${daysInactive} days since you last generated anything. Your credits are still sitting in your account, ready to use.</p>
+          <div class="facts">
+            <p><strong>Content:</strong> ${credits.content}</p>
+            <p><strong>Images:</strong> ${credits.images}</p>
+            <p><strong>Keywords:</strong> ${credits.keywords}</p>
+            <p><strong>That's roughly ${piecesRemaining} ${piecesRemaining === 1 ? 'piece' : 'pieces'} of SEO content with AI images.</strong></p>
+          </div>
+          <p>Picking one service and one location you'd like to rank for is usually enough to get a page out in a few minutes.</p>
+          <!-- ⚠️ END PLACEHOLDER COPY -->
+          <div class="cta"><a href="${dashboardUrl}">Create a Page</a></div>
+        </div>
+        <div class="footer">
+          <p>You're receiving this because you have an active ImproveSEO account.</p>
+          <p>© 2026 ImproveSEO. All rights reserved.</p>
+        </div>
+      </div></div></body>
+      </html>
+    `,
+    text: `Hi ${firstName},\n\nIt's been about ${daysInactive} days since you last generated anything. Your credits are still sitting in your account, ready to use.\n\nContent: ${credits.content}\nImages: ${credits.images}\nKeywords: ${credits.keywords}\nThat's roughly ${piecesRemaining} piece(s) of SEO content with AI images.\n\nPicking one service and one location you'd like to rank for is usually enough to get a page out in a few minutes.\n\nCreate a page: ${dashboardUrl}\n\n© 2026 ImproveSEO`,
+  }),
+
   bulkTaskCompleted: (userName: string, taskName: string, totalGenerated: number, totalFailed: number, websiteDomain: string, projectUrl: string) => {
     const totalTasks = totalGenerated + totalFailed;
     const allFailed = totalGenerated === 0 && totalFailed > 0;

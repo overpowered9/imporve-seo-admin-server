@@ -1,5 +1,6 @@
 import express from 'express';
 import { z } from 'zod';
+import sql from '../data/db.js';
 import { validateApiAccess } from '../middleware/apiAuth.middleware.js';
 import { 
   findUserByEmail,
@@ -275,6 +276,82 @@ router.delete('/websites/:website_id', async (req, res) => {
       success: false,
       error: 'Failed to delete website'
     });
+  }
+});
+
+/**
+ * Real credit CONSUMPTION per type.
+ * GET /api/v1/users/credit-usage/:user_id
+ *
+ * Bug 12: the dashboard showed "0 credits used" after several projects had
+ * been run. It derived usage arithmetically as
+ * `included_allotment - included_remaining`, which silently collapses to 0
+ * whenever `included_allotment` is 0 — true for balance rows created before the
+ * bucket columns existed, and whenever the plan lookup it fell back to didn't
+ * resolve. It also ignored anything paid for out of PURCHASED credits entirely,
+ * so a user spending top-ups always read as 0 used.
+ *
+ * This counts what actually happened instead. `credit_transactions` rows with a
+ * `generation_id` are consumption events written by deductCredits — one row per
+ * generation, whichever bucket paid for it. Grants, refills, purchases and
+ * trial suspensions have no generation_id and are excluded, so an expiry sweep
+ * can never be mistaken for usage.
+ *
+ * Returns both:
+ *   cycle    — since cycle_started_at, what "X of Y used" should reconcile with
+ *   lifetime — all time, so a brand-new cycle doesn't imply the user never generated
+ */
+router.get('/credit-usage/:user_id', async (req, res) => {
+  try {
+    const user_id = parseInt(req.params.user_id);
+    if (Number.isNaN(user_id)) {
+      return res.status(400).json({ success: false, error: 'Invalid user id' });
+    }
+
+    // One cycle start per user; balances are refilled together, so the newest
+    // cycle_started_at is the current cycle for every type.
+    const cycleRows = await sql`
+      SELECT MAX(cycle_started_at) AS cycle_started_at
+      FROM   credit_balances
+      WHERE  user_id = ${user_id}
+    `;
+    const cycleStart = (cycleRows[0] as any)?.cycle_started_at || null;
+
+    // delta is negative for debits; negate to report a positive "used" count.
+    const rows = await sql`
+      SELECT credit_type,
+             COALESCE(SUM(-delta) FILTER (
+               WHERE ${cycleStart}::timestamptz IS NULL OR created_at >= ${cycleStart}::timestamptz
+             ), 0)::int AS used_cycle,
+             COALESCE(SUM(-delta), 0)::int AS used_lifetime
+      FROM   credit_transactions
+      WHERE  user_id = ${user_id}
+        AND  delta < 0
+        AND  generation_id IS NOT NULL
+      GROUP  BY credit_type
+    `;
+
+    const empty = { content: 0, images: 0, keywords: 0 };
+    const cycle: Record<string, number> = { ...empty };
+    const lifetime: Record<string, number> = { ...empty };
+    for (const r of rows as any[]) {
+      if (r.credit_type in cycle) {
+        cycle[r.credit_type] = Number(r.used_cycle) || 0;
+        lifetime[r.credit_type] = Number(r.used_lifetime) || 0;
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        cycle,
+        lifetime,
+        cycle_started_at: cycleStart,
+      },
+    });
+  } catch (error) {
+    console.error('Get credit usage error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch credit usage' });
   }
 });
 
