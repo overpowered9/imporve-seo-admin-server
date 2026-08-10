@@ -24,7 +24,8 @@
     "backfill:payment-defaults": "tsx src/scripts/backfill-default-payment-methods.ts",
     "backfill:transactions": "tsx src/scripts/backfill-billing-transactions.ts",
     "backfill:cancellation-flags": "tsx src/scripts/backfill-stale-cancellations.ts",
-    "migrations:print": "tsx src/scripts/print-migrations.ts"
+    "migrations:print": "tsx src/scripts/print-migrations.ts",
+    "monitor:ledger-gaps": "tsx src/scripts/check-ledger-gaps.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",

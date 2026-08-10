@@ -10,6 +10,8 @@ import generationsRoutes from './routes/generations.routes.js';
 import { testConnection } from './data/db.js';
 import { startTrialEmailScheduler } from './services/trial-emails.service.js';
 import { startLifecycleEmailScheduler } from './services/lifecycle-emails.service.js';
+import { startLedgerMonitor } from './services/billing/ledger-monitor.js';
+import sql from './data/db.js';
 
 dotenv.config();
 
@@ -87,6 +89,11 @@ async function startServer() {
     // No-op unless LIFECYCLE_EMAILS_ENABLED=true, so this changes nothing until
     // the copy is final and it is deliberately switched on.
     startLifecycleEmailScheduler();
+
+    // BILL-004 — alert when a billing event completes without a ledger row.
+    // No-op unless LEDGER_MONITOR_ENABLED=true, so it cannot start alarming
+    // before the backfill has run.
+    startLedgerMonitor(sql);
 
     // Start Express server
     const server = app.listen(port, () => {

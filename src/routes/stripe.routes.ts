@@ -24,6 +24,11 @@ import {
   type DefaultPaymentMethod,
 } from '../services/billing/payment-methods.js';
 import {
+  recordTransaction,
+  transactionsFromInvoice,
+  readLedger,
+} from '../services/billing/transactions.js';
+import {
   previewUpgrade,
   recordDisclosure,
   settleDisclosure,
@@ -225,6 +230,22 @@ const applyCreditTopupOnce = async (session: Stripe.Checkout.Session): Promise<b
   // Add to the PURCHASED bucket so these credits persist across billing cycles
   // and are never wiped by a monthly refill.
   await addPurchasedCredits(userId, creditType, quantity, 'Credit purchase via Stripe');
+
+  // BILL-004 — the manual credit purchase from the ticket's reproduction, which
+  // previously left no trace in any billing record. Keyed on the SESSION, the
+  // same claim this function already holds, so the webhook and /verify-session
+  // cannot produce two rows.
+  await recordTransaction(sql, {
+    userId,
+    type: 'credit_purchase',
+    description: `${quantity} ${creditType} credits`,
+    amountCents: typeof session.amount_total === 'number' ? session.amount_total : null,
+    currency: session.currency || 'usd',
+    providerEventId: claimId,
+    providerObjectId: session.id,
+    creditType,
+    creditDelta: quantity,
+  });
 
   await sql`
     UPDATE stripe_webhook_events
@@ -719,6 +740,15 @@ router.post('/webhook', async (req: Request, res: Response) => {
               await refillPlanCredits(user_id, planResult[0], 'Monthly plan credits refill');
               console.log(`✅ Monthly plan credits refilled for user ${user_id} (invoice paid)`);
             }
+
+            // BILL-004 — the authoritative money record. An upgrade invoice
+            // yields one row per proration line so the credit for unused time
+            // and the charge for the new plan appear as separate, labelled
+            // entries rather than a single net figure the customer cannot
+            // reconcile against their statement.
+            for (const txn of transactionsFromInvoice(invoice, user_id, plan_id)) {
+              await recordTransaction(sql, txn);
+            }
           }
         }
         break;
@@ -747,8 +777,20 @@ router.post('/webhook', async (req: Request, res: Response) => {
             // Purchased top-ups are preserved — the user paid for those separately.
             await suspendPlanCredits(userId, 'Payment failed');
 
+            // BILL-004 — a failed payment is a billable event the customer
+            // needs to see; it explains why their credits stopped.
+            await recordTransaction(sql, {
+              userId,
+              type: 'payment_failed',
+              description: 'Payment failed — subscription suspended',
+              amountCents: (invoice as any).amount_due ?? null,
+              currency: invoice.currency || 'usd',
+              status: 'failed',
+              providerEventId: `invoice_failed:${invoice.id}`,
+              providerObjectId: invoice.id as string,
+            });
+
             console.warn(`⚠️ Payment failed for user ${userId} - subscription suspended, plan credits revoked`);
-            // TODO: Send email notification to user
           }
         }
         break;
@@ -1790,29 +1832,26 @@ router.post('/cancel-subscription', async (req: Request, res: Response) => {
 
 /**
  * Billing history — what the CMS "Recent Transactions" list shows.
- * GET /api/v1/stripe/billing-history/:user_id?limit=20
+ * GET /api/v1/stripe/billing-history/:user_id?limit=20&cursor=...
  *
- * Bug 7: the list was permanently empty even after a credit purchase and two
- * plan upgrades, because NOTHING SERVED IT — there was no user-facing endpoint
- * at all, only an admin one. The CMS rendered a hardcoded empty state.
+ * BILL-004. This now reads OUR ledger (billing_transactions) rather than
+ * assembling a view from live Stripe invoices at request time.
  *
- * Two sources are merged, because "transactions" means two different things to
- * a user and they expect to see both:
+ * The previous version merged Stripe invoices with credit_transactions rows on
+ * every request. That was a reasonable stopgap for an endpoint that did not
+ * exist at all, but it is not a billing history:
  *
- *   MONEY  — Stripe invoices. The authoritative record of what was charged,
- *            including prorated upgrade invoices, with a receipt link.
- *   CREDITS— credit_transactions rows that are NOT generation debits. These
- *            cover purchases and plan grants.
+ *   • It cannot be read when Stripe is slow or unreachable.
+ *   • It cannot be paginated coherently — two sources, two orderings, sliced
+ *     after merging, so "page 2" is not the continuation of page 1.
+ *   • Its labels come from a free-text `reason` column, so rewording a string
+ *     silently rewrites history.
+ *   • It could not answer "did this event produce a record?", because there
+ *     was no record to look for.
  *
- * The discriminator for that second set is `generation_id IS NULL`: every
- * consumption debit is written by deductCredits with a generation_id attached,
- * while purchases/grants/refills are written without one. Filtering on the
- * reason text instead would silently break the moment a reason string is
- * reworded.
- *
- * Stripe is queried best-effort: if it is unreachable or the user has no
- * customer record, the credit rows are still returned rather than failing the
- * whole list.
+ * The ledger is written by both the webhook and the request path, upserting on
+ * the provider event id, so whichever arrives first wins and the other is a
+ * no-op. See services/billing/transactions.ts.
  */
 router.get('/billing-history/:user_id', async (req: Request, res: Response) => {
   try {
@@ -1820,82 +1859,29 @@ router.get('/billing-history/:user_id', async (req: Request, res: Response) => {
     if (Number.isNaN(userId)) {
       return res.status(400).json({ success: false, error: 'Invalid user id' });
     }
+
     const limit = Math.min(parseInt(String(req.query.limit || '20')) || 20, 100);
+    const cursor = req.query.cursor ? String(req.query.cursor) : null;
 
-    const userRows = await sql`SELECT stripe_customer_id FROM users WHERE id = ${userId} LIMIT 1`;
-    if (userRows.length === 0) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-    const customerId = userRows[0].stripe_customer_id as string | null;
-
-    // ── Credit-side events (purchases, plan grants, refills, suspensions) ──
-    const creditRows = await sql`
-      SELECT id, credit_type, delta, reason, created_at
-      FROM   credit_transactions
-      WHERE  user_id = ${userId}
-        AND  generation_id IS NULL
-      ORDER  BY created_at DESC
-      LIMIT  ${limit}
-    `;
-
-    const creditEvents = (creditRows as any[]).map((r) => ({
-      id: `credit_${r.id}`,
-      type: 'credit' as const,
-      date: r.created_at,
-      description: r.reason || 'Credit adjustment',
-      credit_type: r.credit_type,
-      credit_delta: Number(r.delta),
-      amount_cents: null,
-      currency: null,
-      status: 'completed',
-      receipt_url: null,
-    }));
-
-    // ── Money-side events (Stripe invoices) ──
-    let invoiceEvents: any[] = [];
-    if (customerId) {
-      try {
-        const invoices = await stripe.invoices.list({ customer: customerId, limit });
-        invoiceEvents = invoices.data.map((inv) => ({
-          id: `invoice_${inv.id}`,
-          type: 'invoice' as const,
-          date: new Date((inv.created || 0) * 1000).toISOString(),
-          description:
-            inv.lines?.data?.[0]?.description
-            || (inv.billing_reason === 'subscription_update' ? 'Plan change (prorated)' : 'Subscription charge'),
-          credit_type: null,
-          credit_delta: null,
-          amount_cents: inv.amount_paid ?? inv.amount_due ?? 0,
-          currency: inv.currency || 'usd',
-          status: inv.status || 'unknown',
-          receipt_url: inv.hosted_invoice_url || inv.invoice_pdf || null,
-        }));
-      } catch (stripeErr) {
-        // Degrade to credit-only history rather than 500-ing the whole list.
-        console.warn('⚠️ Billing history: Stripe invoice fetch failed:', stripeErr);
-      }
-    }
-
-    const events = [...invoiceEvents, ...creditEvents]
-      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
-      .slice(0, limit);
+    const page = await readLedger(sql, userId, { limit, cursor });
 
     res.json({
       success: true,
-      data: events,
-      // Lets the CMS distinguish "no billing activity yet" from "we could not
-      // reach Stripe", which are very different things to tell a paying user.
+      data: page.events,
       meta: {
-        stripe_available: !!customerId && invoiceEvents.length >= 0,
-        has_stripe_customer: !!customerId,
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        // Lets the CMS distinguish "no billing activity yet" from a failure —
+        // very different things to tell a paying customer.
+        source: 'ledger',
       },
     });
 
   } catch (error) {
     console.error('Billing history error:', error);
-    res.status(400).json({
+    res.status(500).json({
       success: false,
-      error: error instanceof Error ? error.message : 'Failed to fetch billing history'
+      error: 'We could not load your billing history. Please try again in a moment.'
     });
   }
 });
