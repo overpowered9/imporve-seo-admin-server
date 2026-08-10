@@ -24,6 +24,10 @@ import {
   type DefaultPaymentMethod,
 } from '../services/billing/payment-methods.js';
 import {
+  clearScheduledCancellation,
+  releaseOrphanedSchedules,
+} from '../services/billing/subscription-state.js';
+import {
   recordTransaction,
   transactionsFromInvoice,
   readLedger,
@@ -189,6 +193,12 @@ const activateSubscriptionInDb = async (params: {
     // Reset the plan (included) credits; purchased top-ups are preserved.
     await refillPlanCredits(userId, planResult[0], 'Subscription activated');
   }
+
+  // BILL-005 — a NEW subscription is the clearest possible statement that the
+  // customer is not leaving. The UPSERT above already clears
+  // cancel_at_period_end in our row; this clears the provider-side schedule
+  // that would otherwise cancel them again later.
+  await releaseOrphanedSchedules(stripe, stripeCustomerId);
 };
 
 /**
@@ -1472,20 +1482,23 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     // Treat it as what the user means: keep the subscription running. No
     // proration, no credit grant — nothing about the plan is changing.
     if (new_plan_id === currentSub.plan_id && currentSub.cancel_at_period_end) {
-      if (currentSub.stripe_subscription_id) {
-        await stripe.subscriptions.update(currentSub.stripe_subscription_id, {
-          cancel_at_period_end: false,
-        });
-      }
-      await sql`
-        UPDATE subscriptions
-        SET    cancel_at_period_end = FALSE,
-               cancelled_at = NULL,
-               status = 'active'
-        WHERE  user_id = ${user_id}
-      `;
+      // BILL-005 — clears the flag on the subscription AND releases any leftover
+      // schedule object. A schedule survives a subscriptions.update, and one
+      // carrying a cancellation will still end the subscription weeks later,
+      // with the customer having every reason to think they resubscribed.
+      const { releasedSchedules } = await clearScheduledCancellation(
+        { sql, stripe },
+        {
+          userId: user_id,
+          stripeSubscriptionId: currentSub.stripe_subscription_id,
+          stripeCustomerId: currentSub.stripe_customer_id,
+        },
+      );
 
-      console.log(`✅ Reactivated cancelled subscription for user ${user_id} (${newPlan.name})`);
+      console.log(
+        `✅ Reactivated cancelled subscription for user ${user_id} (${newPlan.name})` +
+        (releasedSchedules.length ? ` — released ${releasedSchedules.length} orphaned schedule(s)` : ''),
+      );
 
       return res.json({
         success: true,
@@ -1587,6 +1600,14 @@ router.post('/change-plan', async (req: Request, res: Response) => {
         }, idempotencyKeyFor('change-plan', user_id, idempotency_key));
 
         console.log(`✅ Stripe subscription updated successfully`);
+
+        // BILL-005 — choosing a plan is an unambiguous "I am staying", so any
+        // schedule left over from an earlier cancellation must go too. The
+        // update above clears cancel_at_period_end but does NOT touch a
+        // schedule object, which is the silent failure this ticket names.
+        if (currentSub.stripe_customer_id) {
+          await releaseOrphanedSchedules(stripe, currentSub.stripe_customer_id);
+        }
 
         // BILL-003 — close out the disclosure with what Stripe ACTUALLY billed,
         // and shout if it differs from what the customer was shown by more than
