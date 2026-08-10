@@ -17,6 +17,12 @@ import {
   getFreePlanId
 } from '../models/user.models.js';
 import { sendEmail, emailTemplates } from '../services/email.service.js';
+import {
+  ensureDefaultPaymentMethod as ensureDefaultPaymentMethodFor,
+  getLocalDefaultPaymentMethod,
+  describePaymentError,
+  type DefaultPaymentMethod,
+} from '../services/billing/payment-methods.js';
 
 const router = express.Router();
 
@@ -24,6 +30,23 @@ const router = express.Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
   apiVersion: '2025-10-29.clover'
 });
+
+/**
+ * The dependencies the billing service modules take explicitly.
+ *
+ * Passing them in rather than importing them there is what makes that logic
+ * testable: the tests hand it a fake Postgres and a fake Stripe and assert on
+ * the resulting state. This object is the single place the real ones are bound.
+ */
+const billingDeps = { sql, stripe };
+
+/** Convenience wrapper so call sites read the same as they did before. */
+const ensureDefaultPaymentMethod = (
+  userId: number,
+  customerId: string,
+  preferredPaymentMethodId?: string | null,
+): Promise<DefaultPaymentMethod | null> =>
+  ensureDefaultPaymentMethodFor(billingDeps, userId, customerId, preferredPaymentMethodId);
 
 /**
  * Append the Stripe checkout session id to a success URL using the correct
@@ -183,56 +206,22 @@ const applyCreditTopupOnce = async (session: Stripe.Checkout.Session): Promise<b
 };
 
 /**
- * Guarantee the customer has a default payment method, if they have any card
- * at all. Returns the id of the default in force afterwards, or null when the
- * customer genuinely has no cards.
+ * BILL-001 — the promotion logic now lives in services/billing/payment-methods.ts.
  *
- * WHY THIS EXISTS (bug 3: "after adding a card, upgrade errors 'no default
- * payment method chosen'").
+ * It moved for two reasons, both of which the ticket forces:
  *
- * Setting the first card as default was previously done ONLY in the
- * `setup_intent.succeeded` webhook. Two ways that fails the user:
+ *   • It has to write OUR database as well as Stripe's, atomically, and roll
+ *     back cleanly when either side fails. That is real logic with real failure
+ *     modes, and it needs tests; logic embedded in a route handler that
+ *     constructs its own Stripe client at module load cannot be given a fake.
+ *   • It has to be safe under two concurrent "add card" requests. Proving that
+ *     requires driving two callers at once against a lock, which again means
+ *     injectable dependencies.
  *
- *   1. TIMING — the user adds a card, is redirected straight back, and clicks
- *      upgrade before the webhook lands. The upgrade endpoint sees no default
- *      and refuses. The card is right there; the error is a race, not a fact.
- *   2. COVERAGE — the webhook only acted when `paymentMethods.data.length === 1`.
- *      A customer with two cards and no default (e.g. their old default was
- *      detached) could never satisfy the check, and no amount of retrying
- *      helped.
- *
- * So this is called SYNCHRONOUSLY on the paths that need a default — and still
- * from the webhook. Like activateSubscriptionInDb above, running both is safe:
- * it is idempotent and converges on the same end state.
- *
- * Never overrides an existing default — a deliberate choice by the user (or a
- * previous charge) outranks "whatever happens to be first in the list".
+ * The version that lived here read Stripe, decided, and wrote Stripe — with no
+ * local record and no serialisation. See the module for what each of the
+ * ticket's four root-cause hypotheses turned out to be.
  */
-const ensureDefaultPaymentMethod = async (
-  customerId: string,
-  preferredPaymentMethodId?: string
-): Promise<string | null> => {
-  const customer = await stripe.customers.retrieve(customerId) as Stripe.Customer;
-
-  // Already set — respect it.
-  const existing = customer.invoice_settings?.default_payment_method;
-  if (existing) return typeof existing === 'string' ? existing : existing.id;
-
-  const cards = await stripe.paymentMethods.list({ customer: customerId, type: 'card' });
-  if (cards.data.length === 0) return null;
-
-  // Prefer the card we were just handed (the one the user actually added);
-  // otherwise fall back to the most recently created one.
-  const chosen =
-    (preferredPaymentMethodId && cards.data.find((pm) => pm.id === preferredPaymentMethodId)?.id)
-    || cards.data.slice().sort((a, b) => (b.created || 0) - (a.created || 0))[0].id;
-
-  await stripe.customers.update(customerId, {
-    invoice_settings: { default_payment_method: chosen },
-  });
-  console.log(`✅ Auto-set default payment method ${chosen} for customer ${customerId}`);
-  return chosen;
-};
 
 /**
  * Point a subscription at the customer's default payment method.
@@ -742,20 +731,27 @@ router.post('/webhook', async (req: Request, res: Response) => {
           const customerId = setupIntent.customer as string;
           const paymentMethodId = setupIntent.payment_method as string;
 
-          // BUG 3 — delegate to the shared helper, which also runs synchronously
-          // on the upgrade path so the user is never blocked waiting on this
-          // webhook. The old inline version only acted when the customer had
-          // EXACTLY one card, so someone holding two cards and no default could
-          // never get one set.
+          // BILL-001 — delegate to the shared helper, which also runs
+          // synchronously on the upgrade path so the user is never blocked
+          // waiting on this webhook. The original inline version only acted
+          // when the customer had EXACTLY one card, so someone holding two
+          // cards and no default could never get one set.
           //
-          // OLD:
-          //   const paymentMethods = await stripe.paymentMethods.list({ customer: customerId, type: 'card' });
-          //   if (paymentMethods.data.length === 1) {
-          //     await stripe.customers.update(customerId, {
-          //       invoice_settings: { default_payment_method: paymentMethodId }
-          //     });
-          //   }
-          await ensureDefaultPaymentMethod(customerId, paymentMethodId);
+          // The helper needs our user id, not just the Stripe customer id,
+          // because it writes the local record too. A setup intent that we
+          // cannot attribute to a user is logged rather than ignored silently:
+          // it means a customer exists in Stripe with no matching row here,
+          // which is a reconciliation problem worth seeing.
+          const owner = await sql`
+            SELECT id FROM users WHERE stripe_customer_id = ${customerId} LIMIT 1
+          `;
+          if (owner.length > 0) {
+            await ensureDefaultPaymentMethod(owner[0].id, customerId, paymentMethodId);
+          } else {
+            console.warn(
+              `⚠️ setup_intent.succeeded for customer ${customerId} with no matching user row — default not recorded locally.`,
+            );
+          }
         }
         break;
       }
@@ -992,12 +988,12 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
     //       requires_default_payment_method: true
     //     });
     //   }
-    const defaultPaymentMethod = await ensureDefaultPaymentMethod(user.stripe_customer_id);
+    const defaultPaymentMethod = await ensureDefaultPaymentMethod(user_id, user.stripe_customer_id);
 
     if (!defaultPaymentMethod) {
       return res.status(400).json({
         success: false,
-        error: 'Please add a payment method in Settings first',
+        error: 'Add a card to start this subscription.',
         requires_payment_method: true
       });
     }
@@ -1427,6 +1423,32 @@ router.post('/change-plan', async (req: Request, res: Response) => {
       });
     }
 
+    // BILL-001 — an UPGRADE raises a prorated invoice immediately, so it needs a
+    // chargeable card exactly as much as a first subscription does. This path
+    // never checked. A subscriber whose default card had been detached (or who
+    // had cards but no default, the original bug) reached
+    // subscriptions.update, which failed at invoice time and surfaced as a raw
+    // Stripe message under a 500 — reading as our fault, and offering the user
+    // nothing to do about it.
+    //
+    // Downgrades are exempt: proration_behavior is 'none' and nothing is
+    // charged today, so demanding a card would block a user trying to reduce
+    // their spend, which is the worst possible moment to do it.
+    if (isUpgrade) {
+      const customerRow = await sql`SELECT stripe_customer_id FROM users WHERE id = ${user_id}`;
+      const customerId = customerRow[0]?.stripe_customer_id as string | undefined;
+      const defaultPm = customerId
+        ? await ensureDefaultPaymentMethod(user_id, customerId)
+        : null;
+      if (!defaultPm) {
+        return res.status(400).json({
+          success: false,
+          error: 'Add a card to complete this upgrade.',
+          requires_payment_method: true,
+        });
+      }
+    }
+
     // Update Stripe subscription if exists
     if (currentSub.stripe_subscription_id) {
       try {
@@ -1492,13 +1514,24 @@ router.post('/change-plan', async (req: Request, res: Response) => {
 
       } catch (stripeError) {
         console.error('❌ Stripe update error:', stripeError);
-        
-        // Rollback - don't update database if Stripe fails
+
+        // BILL-001 — a declined card is not a server error. This used to return
+        // 500 with `Stripe error: <raw message>`, which told the customer their
+        // upgrade had broken rather than that their bank had said no, and gave
+        // them nothing to do next. Card problems are now reported the same way
+        // they are on the first-subscription path: 402, a specific message, and
+        // a flag telling the CMS to keep the user in the flow with the card
+        // form open.
+        const friendly = describePaymentError(stripeError);
+        if (friendly) {
+          return res.status(friendly.status).json({ success: false, ...friendly });
+        }
+
+        // Genuinely our problem or Stripe's. Nothing was written to our
+        // database, so the customer's plan is unchanged.
         return res.status(500).json({
           success: false,
-          error: stripeError instanceof Error 
-            ? `Stripe error: ${stripeError.message}` 
-            : 'Failed to update Stripe subscription'
+          error: 'We could not complete the plan change. Nothing was charged. Please try again, or contact support if it keeps happening.',
         });
       }
     }
@@ -1826,11 +1859,12 @@ router.get('/payment-methods/:user_id', async (req: Request, res: Response) => {
 
     const customerId = userResult[0].stripe_customer_id;
 
-    // BUG 3 — self-heal on read: if the customer has cards but no default (the
-    // webhook never landed, or their old default was detached), promote one now
-    // so Settings shows a default and the upgrade path can't fail. Idempotent
-    // and a no-op when a default already exists.
-    await ensureDefaultPaymentMethod(customerId);
+    // BILL-001 — self-heal on read: if the customer has cards but no default
+    // (the webhook never landed, or their old default was detached), promote
+    // one now so Settings shows a default and the upgrade path can't fail.
+    // Idempotent, and its fast path does no writes and takes no lock when both
+    // sides already agree — which is the case on almost every read.
+    await ensureDefaultPaymentMethod(userId, customerId);
 
     // Get payment methods from Stripe
     const paymentMethods = await stripe.paymentMethods.list({
@@ -2004,7 +2038,7 @@ router.post('/ensure-default-payment-method', async (req: Request, res: Response
     }
 
     const customerId = userResult[0].stripe_customer_id as string;
-    const defaultPm = await ensureDefaultPaymentMethod(customerId);
+    const defaultPm = await ensureDefaultPaymentMethod(user_id, customerId);
 
     // Keep the live subscription (if any) pointed at the customer default.
     const sub = await getUserSubscription(user_id);
@@ -2058,10 +2092,11 @@ router.delete('/payment-method/:user_id/:payment_method_id', async (req: Request
     // Detach payment method from customer
     await stripe.paymentMethods.detach(paymentMethodId);
 
-    // BUG 3 (same class) — removing the DEFAULT card left the customer with
+    // BILL-001 (same class) — removing the DEFAULT card left the customer with
     // cards but no default, which is exactly the state that made upgrades fail.
-    // Promote a replacement immediately.
-    await ensureDefaultPaymentMethod(customerId);
+    // Promote a replacement immediately, and clear the local record if that was
+    // their last card so nothing points at a detached payment method.
+    await ensureDefaultPaymentMethod(userId, customerId);
 
     res.json({
       success: true,
@@ -2097,18 +2132,63 @@ router.post('/set-default-payment-method', async (req: Request, res: Response) =
       });
     }
 
-    const customerId = userResult[0].stripe_customer_id;
+    const customerId = userResult[0].stripe_customer_id as string;
 
-    // Update customer's default payment method
+    // Ownership check, the same class of hole that was closed on DELETE. Without
+    // it a caller can nominate any payment method id; Stripe would reject an
+    // unattached one, but relying on the provider to enforce our authorisation
+    // is not an access-control model.
+    const pm = await stripe.paymentMethods.retrieve(payment_method_id);
+    if (pm.customer !== customerId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Not authorized to use this payment method'
+      });
+    }
+
+    // BILL-001 — write BOTH sides. This endpoint previously updated Stripe
+    // only, so a user choosing a card in Settings immediately put our record
+    // out of step with the provider: exactly the divergence the ticket is
+    // about, just arrived at deliberately instead of by a race.
+    //
+    // Stripe first here (unlike the promotion path) because this is an explicit
+    // user choice: if Stripe rejects it, there is nothing to record.
     await stripe.customers.update(customerId, {
       invoice_settings: {
         default_payment_method: payment_method_id
       }
     });
 
+    await sql`
+      UPDATE users
+      SET    default_payment_method_id = ${pm.id},
+             default_payment_method_brand = ${pm.card?.brand ?? null},
+             default_payment_method_last4 = ${pm.card?.last4 ?? null},
+             default_payment_method_exp_month = ${pm.card?.exp_month ?? null},
+             default_payment_method_exp_year = ${pm.card?.exp_year ?? null},
+             default_payment_method_set_at = NOW(),
+             updated_at = NOW()
+      WHERE  id = ${user_id}
+    `;
+
+    // A subscription created with its own default_payment_method does not
+    // inherit a later customer-level change, so a renewal could still be
+    // attempted against the card the user just replaced.
+    const sub = await getUserSubscription(user_id);
+    if (sub?.stripe_subscription_id) {
+      await alignSubscriptionPaymentMethod(sub.stripe_subscription_id);
+    }
+
     res.json({
       success: true,
-      message: 'Default payment method updated'
+      message: 'Default payment method updated',
+      data: {
+        default_payment_method: {
+          id: pm.id,
+          brand: pm.card?.brand ?? null,
+          last4: pm.card?.last4 ?? null,
+        },
+      },
     });
 
   } catch (error) {
