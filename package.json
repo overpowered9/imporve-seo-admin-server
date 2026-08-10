@@ -12,6 +12,10 @@
     "seed:content-v2": "tsx src/scripts/seed-content-v2-prompts.ts",
     "migrate:notifications": "tsx src/migrations/002-user-notifications.ts",
     "migrate:address": "tsx src/migrations/003-user-address.ts",
+    "migrate:billing-transactions": "tsx src/migrations/004-billing-transactions.ts",
+    "migrate:billing-disclosures": "tsx src/migrations/005-billing-disclosures.ts",
+    "migrate:payment-default": "tsx src/migrations/006-default-payment-method.ts",
+    "migrate:email-sends": "tsx src/migrations/007-email-sends.ts",
     "migrate:website-connect": "tsx src/migrations/008-website-last-connected.ts",
     "lint": "eslint .",
     "test": "node --import tsx --test --test-reporter=spec \"src/**/*.test.ts\"",
@@ -19,7 +23,8 @@
     "typecheck": "tsc -p tsconfig.test.json",
     "backfill:payment-defaults": "tsx src/scripts/backfill-default-payment-methods.ts",
     "backfill:transactions": "tsx src/scripts/backfill-billing-transactions.ts",
-    "backfill:cancellation-flags": "tsx src/scripts/backfill-stale-cancellations.ts"
+    "backfill:cancellation-flags": "tsx src/scripts/backfill-stale-cancellations.ts",
+    "migrations:print": "tsx src/scripts/print-migrations.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",
