@@ -23,6 +23,13 @@ import {
   describePaymentError,
   type DefaultPaymentMethod,
 } from '../services/billing/payment-methods.js';
+import {
+  previewUpgrade,
+  recordDisclosure,
+  settleDisclosure,
+  isProrationLine,
+  type ProrationQuote,
+} from '../services/billing/proration.js';
 
 const router = express.Router();
 
@@ -39,6 +46,30 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
  * the resulting state. This object is the single place the real ones are bound.
  */
 const billingDeps = { sql, stripe };
+
+/**
+ * Build the Stripe request options carrying an idempotency key. (BILL-002)
+ *
+ * Stripe deduplicates on this key for 24 hours, so a double-clicked confirm
+ * button, a retried request after a network timeout, and a user hammering the
+ * back button all resolve to ONE subscription and ONE charge.
+ *
+ * The key is NAMESPACED with the operation and our user id rather than passed
+ * through as the client sent it. A raw client-supplied key is a cross-account
+ * hazard: keys are unique per Stripe account, not per customer, so one user
+ * replaying another user's key would collide with that user's operation and
+ * receive its cached response. Namespacing makes collisions structurally
+ * impossible while keeping the client's retry semantics.
+ *
+ * Returns undefined when no key was supplied, which leaves Stripe's behaviour
+ * exactly as it was — the endpoint stays usable by callers that predate this.
+ */
+const idempotencyKeyFor = (
+  operation: string,
+  userId: number,
+  clientKey?: string,
+): { idempotencyKey: string } | undefined =>
+  clientKey ? { idempotencyKey: `${operation}:${userId}:${clientKey}` } : undefined;
 
 /** Convenience wrapper so call sites read the same as they did before. */
 const ensureDefaultPaymentMethod = (
@@ -912,9 +943,13 @@ router.get('/plans', async (req: Request, res: Response) => {
  */
 router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
   try {
-    const { user_id, plan_id } = z.object({
+    const { user_id, plan_id, idempotency_key } = z.object({
       user_id: z.number(),
-      plan_id: z.number()
+      plan_id: z.number(),
+      // BILL-002 — generated once per confirm action by the CMS and reused
+      // across retries, so a double-clicked button cannot create two
+      // subscriptions and two charges.
+      idempotency_key: z.string().min(8).max(200).optional()
     }).parse(req.body);
 
     // Get user and plan
@@ -1017,7 +1052,7 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
           plan_id: plan_id.toString(),
           upgrade_from_free: 'true'
         }
-      });
+      }, idempotencyKeyFor('subscribe', user_id, idempotency_key));
 
       console.log(`✅ Subscription created: ${subscription.id}, status: ${subscription.status}`);
 
@@ -1175,81 +1210,110 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
     }).parse(req.body);
 
     const currentSub = await getUserSubscription(user_id);
-    const [currentPlanData, newPlanData] = await Promise.all([
+    const [currentPlanData, newPlanData, defaultPm] = await Promise.all([
       currentSub ? sql`SELECT * FROM subscription_plans WHERE id = ${currentSub.plan_id}` : Promise.resolve([] as any[]),
-      sql`SELECT * FROM subscription_plans WHERE id = ${new_plan_id}`
+      sql`SELECT * FROM subscription_plans WHERE id = ${new_plan_id}`,
+      // BILL-003 — "the specific payment method that will be charged (brand +
+      // last four)" is part of the disclosure. Read locally rather than from
+      // Stripe so a slow provider degrades the detail, never blocks the quote.
+      getLocalDefaultPaymentMethod(sql, user_id),
     ]);
 
     if (newPlanData.length === 0) {
       return res.status(404).json({ success: false, error: 'Plan not found' });
     }
     const newPlan = newPlanData[0];
+    const currentPlan = currentPlanData[0] ?? null;
 
-    // No existing subscription → this is a first subscription, not a change.
-    // The full plan price is what they'll pay; there is nothing to prorate.
-    if (!currentSub || !currentSub.stripe_subscription_id) {
+    const paymentMethod = defaultPm
+      ? { brand: defaultPm.brand, last4: defaultPm.last4 }
+      : null;
+
+    /**
+     * Record the disclosure, then return it with its handle.
+     *
+     * Every exit from this endpoint goes through here, so there is no quote a
+     * customer can act on that we did not first write down. The handle comes
+     * back on confirm, which is what lets settleDisclosure compare what was
+     * shown against what was charged.
+     */
+    const serve = async (quote: ProrationQuote) => {
+      const disclosureId = await recordDisclosure(sql, {
+        userId: user_id,
+        fromPlanId: currentSub?.plan_id ?? null,
+        toPlanId: new_plan_id,
+        quote,
+      });
       return res.json({
         success: true,
-        data: {
-          is_upgrade: true,
-          is_first_subscription: true,
-          prorated: false,
-          amount_due_cents: newPlan.price_cents,
-          currency: 'usd',
-          proration_date: null,
-          effective: 'immediate',
-          description: 'You will be charged the full plan price to start this subscription.',
-        }
+        data: { ...quote, disclosure_id: disclosureId ?? undefined },
+      });
+    };
+
+    // ── First subscription: nothing to prorate, the full price is due ──────
+    if (!currentSub || !currentSub.stripe_subscription_id) {
+      return serve({
+        is_upgrade: true,
+        is_first_subscription: true,
+        prorated: false,
+        amount_due_cents: newPlan.price_cents,
+        currency: 'usd',
+        proration_date: null,
+        effective: 'immediate',
+        new_plan: newPlan.name,
+        next_amount_cents: newPlan.price_cents,
+        description: 'You will be charged the full plan price to start this subscription.',
+        lines: [{ description: `${newPlan.name} — first month`, amount_cents: newPlan.price_cents }],
+        payment_method: paymentMethod,
       });
     }
 
-    const currentPlan = currentPlanData[0];
     const isUpgrade = newPlan.price_cents > currentPlan.price_cents;
 
-    // BUG 10 — reactivation quote. Mirrors the same-plan-while-cancelling case
-    // in /change-plan so the dialog says "nothing to pay, your plan continues"
-    // rather than the misleading downgrade copy below.
+    // ── Reactivation: re-picking the plan you are already on while cancelling ──
     if (new_plan_id === currentSub.plan_id && currentSub.cancel_at_period_end) {
-      return res.json({
-        success: true,
-        data: {
-          is_upgrade: false,
-          is_reactivation: true,
-          is_first_subscription: false,
-          prorated: false,
-          amount_due_cents: 0,
-          currency: 'usd',
-          proration_date: null,
-          effective: 'immediate',
-          next_billing_date: currentSub.next_billing_date,
-          new_plan: newPlan.name,
-          description: 'Your cancellation will be reversed and your plan continues as normal. Nothing is charged today.',
-        }
+      return serve({
+        is_upgrade: false,
+        is_reactivation: true,
+        is_first_subscription: false,
+        prorated: false,
+        amount_due_cents: 0,
+        currency: 'usd',
+        proration_date: null,
+        effective: 'immediate',
+        next_billing_date: currentSub.next_billing_date,
+        next_amount_cents: newPlan.price_cents,
+        new_plan: newPlan.name,
+        current_plan: currentPlan?.name ?? null,
+        description: 'Your cancellation will be reversed and your plan continues as normal. Nothing is charged today.',
+        lines: [],
+        payment_method: paymentMethod,
       });
     }
 
-    // Downgrades are scheduled, not prorated (proration_behavior 'none' on the
-    // commit path) — so nothing is owed today. Say so explicitly rather than
-    // previewing a charge that will not happen.
+    // ── Downgrade: scheduled, not prorated, so nothing is owed today ───────
     if (!isUpgrade) {
-      return res.json({
-        success: true,
-        data: {
-          is_upgrade: false,
-          is_first_subscription: false,
-          prorated: false,
-          amount_due_cents: 0,
-          currency: 'usd',
-          proration_date: null,
-          effective: 'period_end',
-          effective_date: currentSub.next_billing_date,
-          description: 'No charge today. Your new plan starts at the end of the current billing period.',
-        }
+      return serve({
+        is_upgrade: false,
+        is_first_subscription: false,
+        prorated: false,
+        amount_due_cents: 0,
+        currency: 'usd',
+        proration_date: null,
+        effective: 'period_end',
+        effective_date: currentSub.next_billing_date,
+        next_billing_date: currentSub.next_billing_date,
+        next_amount_cents: newPlan.price_cents,
+        current_plan: currentPlan?.name ?? null,
+        new_plan: newPlan.name,
+        description: 'No charge today. Your new plan starts at the end of the current billing period.',
+        lines: [],
+        payment_method: paymentMethod,
       });
     }
 
     // Same precondition the commit path enforces — fail here rather than
-    // showing a quote for a change that /change-plan will then refuse.
+    // quoting a change that /change-plan will then refuse.
     if (!newPlan.stripe_price_id) {
       return res.status(500).json({
         success: false,
@@ -1263,74 +1327,44 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
       return res.status(500).json({ success: false, error: 'Subscription has no billable items' });
     }
 
-    // The instant we are pricing against. Returned to the caller and replayed
-    // on commit so the quote is binding.
-    const prorationDate = Math.floor(Date.now() / 1000);
-
-    const preview = await stripe.invoices.createPreview({
-      customer: stripeSubscription.customer as string,
-      subscription: currentSub.stripe_subscription_id,
-      subscription_details: {
-        items: [{ id: itemId, price: newPlan.stripe_price_id }],
-        proration_behavior: 'create_prorations',
-        proration_date: prorationDate,
-      },
+    // Every figure below comes from Stripe. See services/billing/proration.ts
+    // for why none of it is computed here.
+    const quote = await previewUpgrade(stripe, {
+      customerId: stripeSubscription.customer as string,
+      subscriptionId: currentSub.stripe_subscription_id,
+      subscriptionItemId: itemId,
+      newPriceId: newPlan.stripe_price_id,
     });
 
-    // Only the proration line items are due NOW. The rest of the previewed
-    // invoice is the next cycle's recurring charge, which must NOT be presented
-    // as part of today's amount — that would massively overstate it.
-    //
-    // NOTE: on this API version (2025-10-29.clover) `proration` is NOT a
-    // top-level field on the line item — it lives under
-    // `parent.invoice_item_details` / `parent.subscription_item_details`.
-    // Reading `line.proration` yields undefined for every line, which would
-    // filter out everything and quote $0.00 for every upgrade. The top-level
-    // read is kept as a fallback for older API versions.
-    const isProrationLine = (line: any): boolean => {
-      const parent = line?.parent;
-      if (parent) {
-        if (parent.invoice_item_details?.proration) return true;
-        if (parent.subscription_item_details?.proration) return true;
-        // Parent present but neither detail flags a proration → not one.
-        if (parent.invoice_item_details || parent.subscription_item_details) return false;
-      }
-      return !!line?.proration; // pre-2025 shape
-    };
-
-    const prorationLines = preview.lines.data.filter(isProrationLine);
-    const amountDueNow = prorationLines.reduce((sum: number, line: any) => sum + (line.amount || 0), 0);
-
-    res.json({
-      success: true,
-      data: {
-        is_upgrade: true,
-        is_first_subscription: false,
-        prorated: true,
-        // Net of the credit for unused time on the old plan and the charge for
-        // the new one. Can be negative (a credit) on unusual cycle positions.
-        amount_due_cents: amountDueNow,
-        currency: preview.currency || 'usd',
-        proration_date: prorationDate,
-        effective: 'immediate',
-        next_billing_date: currentSub.next_billing_date,
-        current_plan: currentPlan?.name || null,
-        new_plan: newPlan.name,
-        description: amountDueNow > 0
-          ? 'You will be charged this prorated amount now, covering the rest of the current billing period. Your credits are topped up straight away.'
-          : 'No charge is due now — the unused portion of your current plan covers the change.',
-        lines: prorationLines.map((line: any) => ({
-          description: line.description,
-          amount_cents: line.amount,
-        })),
-      }
+    return serve({
+      is_upgrade: true,
+      is_first_subscription: false,
+      prorated: true,
+      // Net of the credit for unused time on the old plan and the charge for
+      // the new one. Legitimately negative at some cycle positions.
+      amount_due_cents: quote.amountDueCents,
+      currency: quote.currency,
+      proration_date: quote.prorationDate,
+      effective: 'immediate',
+      next_billing_date: currentSub.next_billing_date,
+      next_amount_cents: newPlan.price_cents,
+      current_plan: currentPlan?.name ?? null,
+      new_plan: newPlan.name,
+      description: quote.amountDueCents > 0
+        ? 'You will be charged this prorated amount now, covering the rest of the current billing period. Your credits are topped up straight away.'
+        : 'No charge is due now — the unused portion of your current plan covers the change.',
+      lines: quote.lines,
+      payment_method: paymentMethod,
     });
 
   } catch (error) {
     console.error('Preview plan change error:', error);
+    // BILL-003 — the CMS BLOCKS confirmation on this failure, so the message
+    // has to explain that nothing has happened rather than sounding like a
+    // charge may have gone through.
     res.status(400).json({
       success: false,
-      error: error instanceof Error ? error.message : 'Failed to preview plan change'
+      error: 'We could not work out what this change will cost. Nothing has been charged. Please try again in a moment.'
     });
   }
 });
@@ -1345,10 +1379,16 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     // present it is replayed to Stripe so the customer is charged exactly the
     // amount they were quoted (bug 6). Optional — a caller that skips the
     // preview still works, it just prices at "now".
-    const { user_id, new_plan_id, proration_date } = z.object({
+    const { user_id, new_plan_id, proration_date, idempotency_key, disclosure_id } = z.object({
       user_id: z.number(),
       new_plan_id: z.number(),
-      proration_date: z.number().int().positive().optional()
+      proration_date: z.number().int().positive().optional(),
+      // BILL-002 — see idempotencyKeyFor. An upgrade raises a real invoice, so
+      // a double submit here charges twice without this.
+      idempotency_key: z.string().min(8).max(200).optional(),
+      // BILL-003 — the quote the customer accepted, so the charge can be
+      // reconciled against what they were shown.
+      disclosure_id: z.string().uuid().optional()
     }).parse(req.body);
 
     // Get current subscription
@@ -1502,10 +1542,30 @@ router.post('/change-plan', async (req: Request, res: Response) => {
               && String(process.env.BILLING_PRORATION_DATE_ENABLED || '').toLowerCase() === 'true'
                 ? { proration_date }
                 : {}),
-        });
+        }, idempotencyKeyFor('change-plan', user_id, idempotency_key));
 
         console.log(`✅ Stripe subscription updated successfully`);
-        
+
+        // BILL-003 — close out the disclosure with what Stripe ACTUALLY billed,
+        // and shout if it differs from what the customer was shown by more than
+        // rounding. The prorated invoice is raised as part of the update above,
+        // so the figure is available immediately rather than only via webhook.
+        if (disclosure_id && isUpgrade) {
+          try {
+            const upcoming = await stripe.invoices.createPreview({
+              customer: stripeSubscription.customer as string,
+              subscription: currentSub.stripe_subscription_id,
+            });
+            const chargedNow = (upcoming.lines?.data ?? [])
+              .filter(isProrationLine)
+              .reduce((sum: number, line: any) => sum + (line.amount || 0), 0);
+            await settleDisclosure(sql, disclosure_id, chargedNow);
+          } catch (settleErr) {
+            // Never fail a completed plan change over an audit write.
+            console.error('⚠️ Could not reconcile the disclosure after the change:', settleErr);
+          }
+        }
+
         if (isUpgrade) {
           console.log(`💳 Prorated charge will be created automatically by Stripe`);
         } else {
