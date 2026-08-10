@@ -75,4 +75,19 @@ add_stripe_price_id.sql
 *.sql
 /extra
 /src/scripts
+# …but the OPERATIONAL scripts must ship: the backfills are deliverables the
+# billing tickets require, and the CLI entry points are documented in
+# docs/BILLING_RUNBOOK.md as the way to run and pause these jobs. An on-call
+# runbook that references a script nobody else has is not a runbook.
+#
+# (The six scripts already tracked above this rule stay tracked because git
+# ignores .gitignore for files already in the index — which is why this was not
+# noticed sooner. New ones need an explicit negation.)
+!/src/scripts/print-migrations.ts
+!/src/scripts/backfill-default-payment-methods.ts
+!/src/scripts/backfill-billing-transactions.ts
+!/src/scripts/backfill-stale-cancellations.ts
+!/src/scripts/check-ledger-gaps.ts
+!/src/scripts/run-notification-jobs.ts
+!/src/scripts/drain-email-outbox.ts
 /claude reference

@@ -10,6 +10,14 @@ interface EmailOptions {
   from?: string;
   /** Set a Reply-To so replies reach a monitored inbox. */
   replyTo?: string;
+  /**
+   * List-Unsubscribe target for LIFECYCLE mail (BILL-008).
+   *
+   * Deliberately absent on transactional receipts: offering to unsubscribe from
+   * being told what you were charged is an offer we cannot honour, and mailbox
+   * providers treat the header as a promise.
+   */
+  listUnsubscribe?: string;
 }
 
 export const sendEmail = async (options: EmailOptions): Promise<boolean> => {
@@ -38,6 +46,12 @@ export const sendEmail = async (options: EmailOptions): Promise<boolean> => {
     }
     if (options.replyTo) {
       form.append('h:Reply-To', options.replyTo);
+    }
+    if (options.listUnsubscribe) {
+      // Both headers: One-Click is what Gmail and Yahoo require for bulk
+      // senders, and the plain header is the long-standing fallback.
+      form.append('h:List-Unsubscribe', `<${options.listUnsubscribe}>`);
+      form.append('h:List-Unsubscribe-Post', 'List-Unsubscribe=One-Click');
     }
 
     const response = await axios.post(
@@ -972,3 +986,247 @@ View Your Project: ${projectUrl}
     };
   }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Billing and lifecycle templates  (BILL-006, BILL-007, BILL-008)
+//
+// These take ONE payload object, captured from the billing event at enqueue
+// time. They do not query, compute or approximate anything: BILL-006 requires
+// that "all amounts, dates, and plan names come from the actual billing event
+// record". A template that reaches for current state can contradict the invoice
+// it is supposed to be confirming.
+//
+// Every one returns html AND text. A text part is not optional politeness — a
+// receipt that renders as an empty message in a plain-text client is a receipt
+// the customer did not get.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Shared shell. Plain, legible, and safe in clients that strip CSS. */
+const billingShell = (heading: string, bodyHtml: string, ctaLabel?: string, ctaUrl?: string): string => `
+  <!DOCTYPE html>
+  <html>
+  <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+  <body style="margin:0;padding:0;background:#f5f7fa;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">
+    <div style="padding:24px;">
+      <div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:10px;padding:32px;">
+        <h1 style="margin:0 0 20px;font-size:20px;color:#1a1a1a;">${heading}</h1>
+        ${bodyHtml}
+        ${ctaLabel && ctaUrl ? `<div style="text-align:center;margin:28px 0 8px;"><a href="${ctaUrl}" style="display:inline-block;background:#1C7C73;color:#ffffff;text-decoration:none;padding:13px 28px;border-radius:8px;font-weight:700;">${ctaLabel}</a></div>` : ''}
+      </div>
+      <div style="max-width:560px;margin:14px auto 0;text-align:center;color:#9aa0a6;font-size:11px;">
+        <p>© 2026 ImproveSEO</p>
+      </div>
+    </div>
+  </body>
+  </html>
+`;
+
+/** One "label: value" row. */
+const row = (label: string, value: string): string =>
+  `<tr><td style="padding:6px 0;color:#5a5f55;font-size:14px;">${label}</td>` +
+  `<td style="padding:6px 0;text-align:right;color:#1a1a1a;font-size:14px;font-weight:600;">${value}</td></tr>`;
+
+export interface PlanChangedPayload {
+  firstName: string;
+  oldPlan: string | null;
+  newPlan: string;
+  /** Pre-formatted by the enqueuer from the billing event. Never recomputed. */
+  amountCharged: string;
+  lines?: Array<{ description: string; amount: string }>;
+  nextAmount: string | null;
+  nextBillingDate: string | null;
+  /** Brand and last four ONLY. */
+  cardBrand: string | null;
+  cardLast4: string | null;
+  billingUrl: string;
+  timezone?: string | null;
+}
+
+export interface CancelledPayload {
+  firstName: string;
+  planName: string;
+  accessUntil: string;
+  creditsNote: string;
+  resubscribeUrl: string;
+  billingUrl: string;
+  timezone?: string | null;
+}
+
+export interface CreditExpiryPayload {
+  firstName: string;
+  expiringAmount: string;
+  expiryDate: string;
+  remainingAfter: string;
+  ctaUrl: string;
+  leadTimeLabel: string;
+}
+
+export interface InactivityPayload {
+  firstName: string;
+  creditBalance: string;
+  nearestExpiry: string | null;
+  planName: string;
+  ctaUrl: string;
+}
+
+export const billingEmailTemplates = {
+  /**
+   * Plan change / upgrade receipt. (BILL-006)
+   *
+   * The proration breakdown mirrors what BILL-003 showed before the click, so
+   * the receipt and the confirmation dialog cannot tell different stories.
+   */
+  billingPlanChanged: (p: PlanChangedPayload) => {
+    const tz = p.timezone ? ` (${p.timezone})` : '';
+    const card = p.cardLast4 ? `${(p.cardBrand || 'card').toUpperCase()} ending ${p.cardLast4}` : 'your card on file';
+
+    const lineRows = (p.lines ?? []).map((l) => row(l.description, l.amount)).join('');
+
+    const html = billingShell(
+      p.oldPlan ? `Your plan changed to ${p.newPlan}` : `Welcome to ${p.newPlan}`,
+      `<p style="font-size:15px;color:#333;">Hi ${p.firstName},</p>
+       <p style="font-size:15px;color:#333;">${p.oldPlan
+        ? `Your subscription has moved from <strong>${p.oldPlan}</strong> to <strong>${p.newPlan}</strong>.`
+        : `Your <strong>${p.newPlan}</strong> subscription is active.`}</p>
+       <table style="width:100%;border-collapse:collapse;margin:18px 0;border-top:1px solid #eee;">
+         ${lineRows}
+         ${row('<strong>Charged today</strong>', `<strong>${p.amountCharged}</strong>`)}
+         ${p.nextAmount && p.nextBillingDate ? row('Then', `${p.nextAmount} on ${p.nextBillingDate}${tz}`) : ''}
+         ${row('Payment method', card)}
+       </table>`,
+      'View billing history',
+      p.billingUrl,
+    );
+
+    const text = [
+      `Hi ${p.firstName},`,
+      '',
+      p.oldPlan
+        ? `Your subscription has moved from ${p.oldPlan} to ${p.newPlan}.`
+        : `Your ${p.newPlan} subscription is active.`,
+      '',
+      ...(p.lines ?? []).map((l) => `${l.description}: ${l.amount}`),
+      `Charged today: ${p.amountCharged}`,
+      ...(p.nextAmount && p.nextBillingDate ? [`Then ${p.nextAmount} on ${p.nextBillingDate}${tz}`] : []),
+      `Payment method: ${card}`,
+      '',
+      `View your billing history: ${p.billingUrl}`,
+      '',
+      '© 2026 ImproveSEO',
+    ].join('\n');
+
+    return {
+      subject: p.oldPlan ? `Your plan changed to ${p.newPlan}` : `Your ${p.newPlan} subscription is active`,
+      html,
+      text,
+    };
+  },
+
+  /** Cancellation confirmation. (BILL-006) */
+  billingCancelled: (p: CancelledPayload) => {
+    const tz = p.timezone ? ` (${p.timezone})` : '';
+
+    const html = billingShell(
+      'Your subscription is scheduled to end',
+      `<p style="font-size:15px;color:#333;">Hi ${p.firstName},</p>
+       <p style="font-size:15px;color:#333;">Your <strong>${p.planName}</strong> subscription has been cancelled.
+       You keep full access until <strong>${p.accessUntil}${tz}</strong>.</p>
+       <p style="font-size:15px;color:#333;">${p.creditsNote}</p>
+       <p style="font-size:15px;color:#333;">Changed your mind? You can reactivate any time before that date and nothing will be charged.</p>`,
+      'Reactivate my plan',
+      p.resubscribeUrl,
+    );
+
+    const text = [
+      `Hi ${p.firstName},`,
+      '',
+      `Your ${p.planName} subscription has been cancelled.`,
+      `You keep full access until ${p.accessUntil}${tz}.`,
+      '',
+      p.creditsNote,
+      '',
+      `Changed your mind? Reactivate any time before that date: ${p.resubscribeUrl}`,
+      `Billing history: ${p.billingUrl}`,
+      '',
+      '© 2026 ImproveSEO',
+    ].join('\n');
+
+    return { subject: `Your ${p.planName} subscription ends ${p.accessUntil}`, html, text };
+  },
+
+  /**
+   * ⚠️ PLACEHOLDER COPY — BILL-007. Final marketing wording is pending.
+   *
+   * FOR THE COPY OWNER: replace only the strings in this function. Every
+   * variable you can use is on the CreditExpiryPayload interface above, and all
+   * of them are already computed and passed in. No logic changes are required
+   * to swap this text — that is the point of the ticket.
+   */
+  creditsExpiringPlaceholder: (p: CreditExpiryPayload) => {
+    const html = billingShell(
+      '[PLACEHOLDER] Your credits expire soon',
+      `<p style="font-size:15px;color:#333;">Hi ${p.firstName},</p>
+       <p style="font-size:15px;color:#333;">[PLACEHOLDER COPY — awaiting final wording.]</p>
+       <table style="width:100%;border-collapse:collapse;margin:18px 0;border-top:1px solid #eee;">
+         ${row('Credits expiring', p.expiringAmount)}
+         ${row('Expiry date', p.expiryDate)}
+         ${row('Balance after expiry', p.remainingAfter)}
+       </table>`,
+      '[PLACEHOLDER CTA]',
+      p.ctaUrl,
+    );
+
+    const text = [
+      `Hi ${p.firstName},`,
+      '',
+      '[PLACEHOLDER COPY — awaiting final wording.]',
+      '',
+      `Credits expiring: ${p.expiringAmount}`,
+      `Expiry date: ${p.expiryDate}`,
+      `Balance after expiry: ${p.remainingAfter}`,
+      '',
+      `[PLACEHOLDER CTA]: ${p.ctaUrl}`,
+    ].join('\n');
+
+    return { subject: `[PLACEHOLDER] Your credits expire ${p.leadTimeLabel}`, html, text };
+  },
+
+  /**
+   * ⚠️ PLACEHOLDER COPY — BILL-008. See the note on creditsExpiringPlaceholder;
+   * the variables available are on InactivityPayload.
+   */
+  inactivityPlaceholder: (p: InactivityPayload) => {
+    const html = billingShell(
+      '[PLACEHOLDER] Your credits are waiting',
+      `<p style="font-size:15px;color:#333;">Hi ${p.firstName},</p>
+       <p style="font-size:15px;color:#333;">[PLACEHOLDER COPY — awaiting final wording.]</p>
+       <table style="width:100%;border-collapse:collapse;margin:18px 0;border-top:1px solid #eee;">
+         ${row('Available credits', p.creditBalance)}
+         ${row('Current plan', p.planName)}
+         ${p.nearestExpiry ? row('Next expiry', p.nearestExpiry) : ''}
+       </table>`,
+      '[PLACEHOLDER CTA]',
+      p.ctaUrl,
+    );
+
+    const text = [
+      `Hi ${p.firstName},`,
+      '',
+      '[PLACEHOLDER COPY — awaiting final wording.]',
+      '',
+      `Available credits: ${p.creditBalance}`,
+      `Current plan: ${p.planName}`,
+      ...(p.nearestExpiry ? [`Next expiry: ${p.nearestExpiry}`] : []),
+      '',
+      `[PLACEHOLDER CTA]: ${p.ctaUrl}`,
+    ].join('\n');
+
+    return { subject: '[PLACEHOLDER] Your ImproveSEO credits are waiting', html, text };
+  },
+};
+
+// NOTE: deliberately NOT merged into `emailTemplates` with Object.assign.
+// That would work at runtime but leaves the merged members invisible to the
+// type checker, so a typo in a template name would only surface as a
+// dead-lettered email in production. Callers import billingEmailTemplates
+// directly and get compile-time checking.
