@@ -167,15 +167,22 @@ let timer: NodeJS.Timeout | null = null;
 /**
  * Start the worker.
  *
- * Gated on BILLING_EMAILS_ENABLED, which already gated the inline sends this
- * replaces — so merging changes no behaviour until it is deliberately switched
- * on. Jobs still QUEUE while it is off, which is deliberate: turning it on then
- * delivers the backlog rather than starting from empty, and the queue is
- * itself the evidence of what would have been sent.
+ * ON BY DEFAULT. BILL-006's whole complaint is that no email is sent on upgrade
+ * or cancellation, so shipping the fix switched off would not resolve the
+ * ticket — it would relocate it. Set BILLING_EMAILS_ENABLED=false to stop
+ * delivery (jobs still queue, and are delivered when it is re-enabled).
+ *
+ * The two templates this delivers — upgrade and cancellation — have final copy.
+ * The PLACEHOLDER lifecycle templates are gated separately by
+ * LIFECYCLE_EMAILS_ENABLED, which stays off until the copy owner supplies text,
+ * so nothing with "[PLACEHOLDER]" in the subject line can reach a customer.
+ *
+ * If Mailgun is unconfigured, sendEmail already no-ops with a warning and the
+ * job is retried rather than lost, so an unset key degrades rather than breaks.
  */
 export function startEmailWorker(sql: SqlLike): void {
-  if (String(process.env.BILLING_EMAILS_ENABLED || '').toLowerCase() !== 'true') {
-    console.log('📭 Email worker disabled (set BILLING_EMAILS_ENABLED=true to enable). Jobs will queue.');
+  if (String(process.env.BILLING_EMAILS_ENABLED || 'true').toLowerCase() === 'false') {
+    console.log('📭 Email worker disabled (BILLING_EMAILS_ENABLED=false). Jobs will queue until re-enabled.');
     return;
   }
   if (timer) return;

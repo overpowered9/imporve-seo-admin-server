@@ -99,9 +99,10 @@ async function startServer() {
     // before the backfill has run.
     startLedgerMonitor(sql);
 
-    // BILL-006 — the outbox worker. Jobs QUEUE regardless; this only drains
-    // them, and only when BILLING_EMAILS_ENABLED=true. Turning it on later
-    // delivers the backlog rather than starting from empty.
+    // BILL-006 — the outbox worker, ON by default. The ticket's complaint is
+    // that no email is sent on upgrade or cancellation, so shipping it switched
+    // off would relocate the bug rather than fix it. Set
+    // BILLING_EMAILS_ENABLED=false to halt delivery; jobs keep queueing.
     startEmailWorker(sql);
 
     // Start Express server

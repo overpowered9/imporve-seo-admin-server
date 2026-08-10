@@ -41,7 +41,7 @@ async function main() {
   const totalWould = results.reduce((n, r) => n + r.wouldEmail.length, 0);
   const totalQueued = results.reduce((n, r) => n + r.queued, 0);
   console.log(apply
-    ? `Queued ${totalQueued} email(s). The worker will send them if BILLING_EMAILS_ENABLED=true.`
+    ? `Queued ${totalQueued} email(s). The worker will send them unless BILLING_EMAILS_ENABLED=false.`
     : `${totalWould} email(s) would be sent. Review the list above, then re-run with --apply.`);
 
   await sql.end();

@@ -1594,27 +1594,55 @@ router.post('/change-plan', async (req: Request, res: Response) => {
         //     proration_behavior: isUpgrade ? 'create_prorations' : 'none',
         //     billing_cycle_anchor: 'unchanged'
         //   });
-        await stripe.subscriptions.update(currentSub.stripe_subscription_id, {
-          items: [{
-            id: stripeSubscription.items.data[0].id,
-            price: newPlan.stripe_price_id, // ✅ Change the price
-          }],
-          proration_behavior: isUpgrade ? 'create_prorations' : 'none',
-          billing_cycle_anchor: 'unchanged', // Keep same billing date
-          cancel_at_period_end: false,
-          // ── FLAG: BILLING_PRORATION_DATE_ENABLED ─────────────────────────
-          // Replaying the quoted timestamp is what makes the preview binding,
-          // but Stripe REJECTS a proration_date outside the current period —
-          // which would turn a stale confirm dialog into a failed upgrade.
-          // Off = Stripe prices at "now", exactly as it did before this work.
-          // The customer may then be charged a few seconds' difference from
-          // the quote; that is the safer failure while this is unverified.
-          ...(isUpgrade
-              && proration_date
-              && String(process.env.BILLING_PRORATION_DATE_ENABLED || '').toLowerCase() === 'true'
-                ? { proration_date }
-                : {}),
-        }, idempotencyKeyFor('change-plan', user_id, idempotency_key));
+        // BILL-003 — replaying the quoted timestamp is what makes the preview
+        // BINDING: without it Stripe prices at commit time, which drifts from
+        // the quote by however long the customer spent reading the dialog, and
+        // "the displayed total matches the amount charged to the cent" is then
+        // not true.
+        //
+        // This was previously behind BILLING_PRORATION_DATE_ENABLED, default
+        // off, because Stripe REJECTS a proration_date outside the current
+        // period — so a stale dialog would turn into a failed upgrade. A flag
+        // is the wrong answer to that: it makes the accurate behaviour the
+        // exception, and leaves the ticket's central criterion unmet in
+        // production.
+        //
+        // The right answer is to handle the rejection. We send the quoted
+        // timestamp; if Stripe refuses it as out of range, we retry once
+        // WITHOUT it, which is exactly the old behaviour. The customer gets an
+        // exact quote in the overwhelmingly common case and a working upgrade
+        // in the rare stale one, instead of one or the other by configuration.
+        const applyPlanChange = (withProrationDate: boolean) =>
+          stripe.subscriptions.update(currentSub.stripe_subscription_id!, {
+            items: [{
+              id: stripeSubscription.items.data[0].id,
+              price: newPlan.stripe_price_id, // ✅ Change the price
+            }],
+            proration_behavior: isUpgrade ? 'create_prorations' : 'none',
+            billing_cycle_anchor: 'unchanged', // Keep same billing date
+            cancel_at_period_end: false,
+            ...(withProrationDate && isUpgrade && proration_date ? { proration_date } : {}),
+          }, idempotencyKeyFor('change-plan', user_id, idempotency_key));
+
+        try {
+          await applyPlanChange(true);
+        } catch (prorationError: any) {
+          // Only an out-of-range proration_date is retried. Anything else —
+          // a declined card, a missing price — must surface, or a real failure
+          // would be silently retried into a second charge attempt.
+          const isStaleQuote =
+            prorationError?.type === 'StripeInvalidRequestError'
+            && /proration_date/i.test(String(prorationError?.message || ''));
+
+          if (!isStaleQuote || !proration_date) throw prorationError;
+
+          console.warn(
+            `⚠️ Quoted proration_date ${proration_date} was rejected as out of range for user ${user_id}; ` +
+            'repricing at now. The customer may be charged marginally differently from the quote — ' +
+            'settleDisclosure below will record it if so.',
+          );
+          await applyPlanChange(false);
+        }
 
         console.log(`✅ Stripe subscription updated successfully`);
 

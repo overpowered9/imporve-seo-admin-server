@@ -231,3 +231,47 @@ describe('settleDisclosure', () => {
     assert.deepEqual(await settleDisclosure(sql, 'nope', 100), { mismatch: false, disclosedCents: null });
   });
 });
+
+/**
+ * BILL-003 — the stale-quote retry.
+ *
+ * Replaying the quoted proration_date is what makes the preview binding, but
+ * Stripe rejects one outside the current period. This was previously behind a
+ * flag defaulting to OFF, which left the ticket's central criterion unmet in
+ * production. Handling the rejection is what allows it to be on by default,
+ * so the classification of that error is now load-bearing.
+ */
+describe('stale proration_date classification', () => {
+  /**
+   * Mirrors the predicate in the /change-plan handler. Extracted here because
+   * getting it wrong in either direction is expensive: too broad, and a genuine
+   * decline is silently retried into a second charge attempt; too narrow, and a
+   * stale dialog is a failed upgrade.
+   */
+  const isStaleQuote = (err: any): boolean =>
+    err?.type === 'StripeInvalidRequestError'
+    && /proration_date/i.test(String(err?.message || ''));
+
+  test('an out-of-range proration_date IS retryable', () => {
+    assert.equal(isStaleQuote({
+      type: 'StripeInvalidRequestError',
+      message: 'proration_date must be within the current subscription period',
+    }), true);
+  });
+
+  test('a DECLINED CARD is not retried — that would attempt a second charge', () => {
+    assert.equal(isStaleQuote({ type: 'StripeCardError', code: 'card_declined', message: 'Your card was declined.' }), false);
+  });
+
+  test('an unrelated invalid request is not retried', () => {
+    assert.equal(isStaleQuote({
+      type: 'StripeInvalidRequestError',
+      message: 'No such price: price_nonexistent',
+    }), false);
+  });
+
+  test('a network error is not misread as a stale quote', () => {
+    assert.equal(isStaleQuote(new Error('socket hang up')), false);
+    assert.equal(isStaleQuote(null), false);
+  });
+});
