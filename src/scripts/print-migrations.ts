@@ -29,6 +29,7 @@ const migrations = [
   ['005 — billing_disclosures (BILL-003 pre-charge disclosure audit)', '../migrations/005-billing-disclosures.js'],
   ['006 — users.default_payment_method_* (BILL-001 local default)', '../migrations/006-default-payment-method.js'],
   ['007 — email_sends + suppression columns (BILL-006, BILL-008)', '../migrations/007-email-sends.js'],
+  ['008 — websites.last_connected_at (real plugin connection signal)', '../migrations/008-website-last-connected.js'],
 ] as const;
 
 const rule = '-- ' + '─'.repeat(72);
