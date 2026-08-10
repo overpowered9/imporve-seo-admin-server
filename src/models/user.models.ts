@@ -212,6 +212,43 @@ export const updateUserName = async (user_id: number, name: string): Promise<Use
 };
 
 /**
+ * Does this user have a billing address we could put on an invoice?
+ *
+ * Client decision: a billing address is mandatory, and without one the user
+ * cannot make a purchase. Enforced HERE rather than only in the CMS, because a
+ * button that is merely hidden is not an enforcement — the endpoint is what
+ * actually takes the money.
+ *
+ * "Has an address" uses the SAME three-column test as GET /users/address
+ * (line1 + city + country). Anything looser would let a half-filled row through
+ * and produce exactly the unusable invoice this is meant to prevent.
+ *
+ * ── FAILS OPEN, DELIBERATELY ────────────────────────────────────────────────
+ * Postgres 42703 means migration 003 has not run, so no user CAN have an
+ * address. Returning false there would block every purchase for every customer
+ * the moment this deploys ahead of the migration. An un-migrated database is
+ * our problem, not a reason to refuse someone's money, so the gate is skipped
+ * and the purchase proceeds.
+ */
+export const hasBillingAddress = async (user_id: number): Promise<boolean> => {
+  try {
+    const rows = await sql`
+      SELECT address_line1, address_city, address_country
+      FROM users WHERE id = ${user_id} LIMIT 1
+    `;
+    const r = (rows as any[])[0];
+    if (!r) return false;
+    return !!(r.address_line1 && r.address_city && r.address_country);
+  } catch (error: any) {
+    if (error?.code === '42703') {
+      console.warn('users address columns missing — migration 003 has not run; skipping the billing-address gate.');
+      return true;
+    }
+    throw error;
+  }
+};
+
+/**
  * Compose the display string from the parts. ONE definition, so `name` can
  * never drift from first_name/last_name depending on which caller wrote it.
  */
