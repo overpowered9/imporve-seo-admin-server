@@ -26,6 +26,11 @@ export interface Website {
   trial_used: boolean;
   deleted_at: Date | null;
   created_at: Date;
+  // Last time the plugin authenticated for this site (migration 008). NULL means
+  // it has never checked in. Drives the CMS "Active / Not Connected" chip.
+  // Optional because a database that has not run migration 008 yet simply will
+  // not return the column — see touchWebsiteConnection for the writer.
+  last_connected_at?: Date | null;
 }
 
 export interface CreditBalance {
@@ -799,7 +804,43 @@ export const getUserWebsites = async (user_id: number): Promise<Website[]> => {
     site_code: String(r.site_code),
     active: Boolean(r.active),
     created_at: r.created_at instanceof Date ? r.created_at : new Date(r.created_at),
+    // `SELECT *` above returns every column, but this mapper is an explicit
+    // allow-list, so a new column reaches the CMS only once it is named here.
+    // Pre-migration-008 databases have no such column and yield null, which the
+    // CMS reads as "never connected" and falls back to its generations signal.
+    last_connected_at: r.last_connected_at ?? null,
   })) as Website[];
+};
+
+/**
+ * Record that the plugin just authenticated successfully for this website.
+ *
+ * Called from validateApiAccess on every authenticated plugin request, so it is
+ * on the hot path for content generation. Two properties matter:
+ *
+ *  • THROTTLED IN SQL. The WHERE clause discards repeat writes inside a 5-minute
+ *    window, so a burst of generations costs one UPDATE rather than one per
+ *    request. Doing it in the statement (rather than an in-process cache) keeps
+ *    it correct across multiple server instances and needs no extra SELECT.
+ *
+ *  • NEVER THROWS. The caller does not await this, and a status-chip timestamp
+ *    is not worth failing a paid generation over. Postgres 42703
+ *    (undefined_column) is expected and silent whenever migration 008 has not
+ *    run yet — the same deploy-before-migrate tolerance the address endpoints
+ *    use — so shipping this code ahead of the migration is safe.
+ */
+export const touchWebsiteConnection = async (website_id: number): Promise<void> => {
+  try {
+    await sql`
+      UPDATE websites
+      SET last_connected_at = NOW()
+      WHERE id = ${website_id}
+        AND (last_connected_at IS NULL OR last_connected_at < NOW() - INTERVAL '5 minutes')
+    `;
+  } catch (error: any) {
+    if (error?.code === '42703') return; // migration 008 has not run yet
+    console.warn('Failed to stamp website connection (non-fatal):', error?.message ?? error);
+  }
 };
 
 

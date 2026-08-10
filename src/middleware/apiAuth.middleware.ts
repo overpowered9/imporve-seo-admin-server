@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { findUserByApiKey, findWebsiteByCode, getUserCreditBalance, reconcileTrialCredits } from '../models/user.models.js';
+import { findUserByApiKey, findWebsiteByCode, getUserCreditBalance, reconcileTrialCredits, touchWebsiteConnection } from '../models/user.models.js';
 
 export interface AuthenticatedRequest extends Request {
   user?: any;
@@ -43,10 +43,26 @@ export const validateApiAccess = async (req: AuthenticatedRequest, res: Response
       // You might want to enforce this check or just log it
     }
 
+    // ── Connection heartbeat ────────────────────────────────────────────────
+    // Reaching this line means the api_key resolved to a user AND the site_code
+    // resolved to a website that user owns — which is exactly what "the plugin
+    // has the API Key and Site Code saved correctly" means. The plugin's
+    // "Test Server Connection" button lands here via GET /users/status, so the
+    // CMS can flip a site to "Active" the moment setup succeeds instead of
+    // waiting for its first generation.
+    //
+    // Deliberately NOT awaited: this is bookkeeping for a status chip, and a
+    // slow or failed write must never delay or break a customer's content
+    // generation. touchWebsiteConnection swallows its own errors, including
+    // Postgres 42703 when migration 008 has not run yet (same tolerance the
+    // address endpoints use), so the catch here is only a backstop against an
+    // unexpected synchronous throw.
+    void touchWebsiteConnection(website.id);
+
     // Attach user and website to request
     req.user = user;
     req.website = website;
-    
+
     next();
   } catch (error) {
     console.error('API validation error:', error);
