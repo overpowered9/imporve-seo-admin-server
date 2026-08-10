@@ -25,7 +25,9 @@
     "backfill:transactions": "tsx src/scripts/backfill-billing-transactions.ts",
     "backfill:cancellation-flags": "tsx src/scripts/backfill-stale-cancellations.ts",
     "migrations:print": "tsx src/scripts/print-migrations.ts",
-    "monitor:ledger-gaps": "tsx src/scripts/check-ledger-gaps.ts"
+    "monitor:ledger-gaps": "tsx src/scripts/check-ledger-gaps.ts",
+    "notify": "tsx src/scripts/run-notification-jobs.ts",
+    "email:drain": "tsx src/scripts/drain-email-outbox.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",

@@ -9,7 +9,10 @@ import adminPromptRoutes from './routes/admin/prompts.routes.js';
 import generationsRoutes from './routes/generations.routes.js';
 import { testConnection } from './data/db.js';
 import { startTrialEmailScheduler } from './services/trial-emails.service.js';
-import { startLifecycleEmailScheduler } from './services/lifecycle-emails.service.js';
+// BILL-007/008 — replaces lifecycle-emails.service.ts, which sent inline and
+// had no dry-run, no lead-time config and no shared runner. That module is left
+// in place but is no longer started; see notification-jobs.ts.
+import { startNotificationScheduler } from './services/billing/notification-jobs.js';
 import { startLedgerMonitor } from './services/billing/ledger-monitor.js';
 import { startEmailWorker } from './services/billing/email-worker.js';
 import sql from './data/db.js';
@@ -86,10 +89,10 @@ async function startServer() {
     // Start the trial-email drip scheduler (no-op unless TRIAL_EMAILS_ENABLED=true)
     startTrialEmailScheduler();
 
-    // Credit-expiry + inactivity notifications (bugs 16/17).
+    // Credit-expiry + inactivity notifications (BILL-007, BILL-008).
     // No-op unless LIFECYCLE_EMAILS_ENABLED=true, so this changes nothing until
     // the copy is final and it is deliberately switched on.
-    startLifecycleEmailScheduler();
+    startNotificationScheduler(sql);
 
     // BILL-004 — alert when a billing event completes without a ledger row.
     // No-op unless LEDGER_MONITOR_ENABLED=true, so it cannot start alarming

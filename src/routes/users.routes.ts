@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { type Response as ExpressResponse } from 'express';
 import { z } from 'zod';
 import sql from '../data/db.js';
 import { validateApiAccess } from '../middleware/apiAuth.middleware.js';
@@ -632,6 +632,68 @@ router.post('/regenerate-api-key/:user_id', async (req, res) => {
       success: false,
       error: 'Failed to regenerate API key'
     });
+  }
+});
+
+/**
+ * One-click unsubscribe from lifecycle email.  (BILL-008)
+ *
+ * GET  /api/v1/users/unsubscribe?token=…   — for a browser link
+ * POST /api/v1/users/unsubscribe           — for List-Unsubscribe-Post
+ *
+ * DELIBERATELY UNAUTHENTICATED, and that is correct: an unsubscribe link that
+ * requires signing in is an unsubscribe link that does not work, and mailbox
+ * providers treat the One-Click header as a promise that a POST alone
+ * suffices. The token is unguessable, per-user, and grants exactly one power —
+ * to stop lifecycle mail. It cannot read or change anything else.
+ *
+ * Idempotent: unsubscribing twice is a success, not an error. A user who clicks
+ * the link again must not see a failure page.
+ *
+ * Note this suppresses LIFECYCLE mail only. Billing receipts continue, because
+ * a customer who is being charged has to be told — see suppressionReason.
+ */
+const handleUnsubscribe = async (token: string, res: ExpressResponse) => {
+  if (!token || token.length < 16) {
+    return res.status(400).json({ success: false, error: 'Invalid unsubscribe link.' });
+  }
+
+  const rows = await sql`
+    UPDATE users
+    SET    marketing_opt_out_at = COALESCE(marketing_opt_out_at, NOW())
+    WHERE  unsubscribe_token = ${token}
+    RETURNING id, email
+  `;
+
+  if (rows.length === 0) {
+    // Do not distinguish "no such token" from any other failure: the endpoint
+    // is unauthenticated, and a precise answer turns it into an oracle for
+    // probing valid tokens.
+    return res.status(400).json({ success: false, error: 'This unsubscribe link is no longer valid.' });
+  }
+
+  console.log(`[unsubscribe] user ${rows[0].id} opted out of lifecycle email`);
+  return res.json({
+    success: true,
+    message: 'You have been unsubscribed from product emails. You will still receive billing receipts.',
+  });
+};
+
+router.get('/unsubscribe', async (req, res) => {
+  try {
+    await handleUnsubscribe(String(req.query.token || ''), res);
+  } catch (error) {
+    console.error('Unsubscribe error:', error);
+    res.status(500).json({ success: false, error: 'Could not process the unsubscribe. Please contact support.' });
+  }
+});
+
+router.post('/unsubscribe', async (req, res) => {
+  try {
+    await handleUnsubscribe(String(req.body?.token || req.query.token || ''), res);
+  } catch (error) {
+    console.error('Unsubscribe error:', error);
+    res.status(500).json({ success: false, error: 'Could not process the unsubscribe. Please contact support.' });
   }
 });
 
