@@ -23,6 +23,7 @@ import {
   describePaymentError,
   type DefaultPaymentMethod,
 } from '../services/billing/payment-methods.js';
+import { enqueueEmail } from '../services/billing/email-outbox.js';
 import {
   clearScheduledCancellation,
   releaseOrphanedSchedules,
@@ -116,34 +117,43 @@ const formatCents = (cents: number, currency = 'usd'): string => {
 };
 
 /**
- * Send a billing email without ever letting it break the billing operation.
+ * Queue a billing email. (BILL-006)
  *
- * A failed/slow Mailgun call must not turn a SUCCESSFUL upgrade into an error
- * response — the money has already moved. Failures are logged and swallowed.
- * (sendEmail already no-ops with a warning when Mailgun is unconfigured, which
- * is why nothing arrives in local development.)
+ * REPLACES an inline sendEmail wrapped in try/catch. That satisfied "never fail
+ * the billing operation" by making a failed receipt indistinguishable from a
+ * delivered one: no record, no retry, and no way to answer "did this user get
+ * their receipt?".
+ *
+ * Now it writes a row to the outbox and returns. The worker sends it, retries
+ * with backoff, and dead-letters with an alert. Enqueueing is idempotent on
+ * (template, eventKey), so a replayed webhook cannot produce a second email —
+ * which is why call sites need no guard of their own.
+ *
+ * `eventKey` MUST identify the billing event, not the moment: keying on a
+ * timestamp would make every retry a new email.
  */
-const sendBillingEmail = async (
+const queueBillingEmail = async (
   userId: number,
-  build: (firstName: string) => { subject: string; html: string; text?: string }
+  template: string,
+  eventKey: string,
+  buildPayload: (firstName: string) => Record<string, unknown>,
+  category: 'transactional' | 'lifecycle' = 'transactional',
 ): Promise<void> => {
-  // ── FLAG: BILLING_EMAILS_ENABLED ─────────────────────────────────────────
-  // These emails have never been sent — Mailgun is unconfigured in local dev,
-  // so sendEmail no-ops there and the templates have never been seen by a real
-  // mail client. Off = the previous behaviour: no billing email at all.
-  //
-  // Gated here, in the one helper every caller goes through, so no call site
-  // can bypass it. Turn on after previewing both templates (upgrade and
-  // cancellation) against a real inbox.
-  if (String(process.env.BILLING_EMAILS_ENABLED || '').toLowerCase() !== 'true') return;
   try {
     const rows = await sql`SELECT email, name FROM users WHERE id = ${userId} LIMIT 1`;
     const user = rows[0] as any;
     if (!user?.email) return;
-    const tpl = build(firstNameOf(user.name, user.email));
-    await sendEmail({ to: user.email, subject: tpl.subject, html: tpl.html, text: tpl.text });
+    await enqueueEmail(sql, {
+      userId,
+      recipient: user.email,
+      template,
+      category,
+      eventKey,
+      payload: buildPayload(firstNameOf(user.name, user.email)),
+    });
   } catch (err) {
-    console.error(`⚠️ Billing email failed for user ${userId} (billing itself was unaffected):`, err);
+    // Queueing must never break billing; the money has already moved.
+    console.error(`⚠️ Could not queue ${template} for user ${userId}:`, err);
   }
 };
 
@@ -1137,22 +1147,29 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
           });
         }
 
-        // BUG 11 — first-subscription confirmation. Same template as an upgrade;
-        // here the charge IS the full plan price, so it can be stated exactly.
-        const creditsSummary = [
-          plan.content_credits ? `${plan.content_credits} content` : null,
-          plan.image_credits ? `${plan.image_credits} image` : null,
-          plan.keyword_credits ? `${plan.keyword_credits} keyword` : null,
-        ].filter(Boolean).join(', ') + ' credits per month';
-
-        await sendBillingEmail(user_id, (firstName) => emailTemplates.subscriptionUpgraded(
-          firstName,
-          plan.name,
-          formatCents(plan.price_cents, 'usd'),
-          new Date(nextBillingTimestamp * 1000).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
-          creditsSummary,
-          CMS_BILLING_URL,
-        ));
+        // BILL-006 — first-subscription receipt. Keyed on the SUBSCRIPTION id,
+        // so a retried request or a replayed webhook cannot send it twice.
+        // Every figure comes from the completed billing event, never recomputed
+        // in the template.
+        const defaultPmForReceipt = await getLocalDefaultPaymentMethod(sql, user_id);
+        await queueBillingEmail(
+          user_id,
+          'billing.upgrade',
+          `subscription_create:${subscription.id}`,
+          (firstName) => ({
+            firstName,
+            oldPlan: null,
+            newPlan: plan.name,
+            amountCharged: formatCents(plan.price_cents, 'usd'),
+            lines: [{ description: `${plan.name} — first month`, amount: formatCents(plan.price_cents, 'usd') }],
+            nextAmount: formatCents(plan.price_cents, 'usd'),
+            nextBillingDate: new Date(nextBillingTimestamp * 1000).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+            cardBrand: defaultPmForReceipt?.brand ?? null,
+            cardLast4: defaultPmForReceipt?.last4 ?? null,
+            billingUrl: CMS_BILLING_URL,
+            timezone: 'UTC',
+          }),
+        );
 
         res.json({
           success: true,
@@ -1663,29 +1680,49 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     await changePlan(user_id, new_plan_id, isUpgrade);
     console.log(`✅ Database updated successfully`);
 
-    // BUG 11 — notify the customer that their plan (and their bill) changed.
-    // Awaited so a synchronous failure is logged in-request, but sendBillingEmail
-    // never throws, so it cannot turn a completed upgrade into an error.
+    // BILL-006 — plan change receipt. Keyed on the disclosure the customer
+    // accepted when one exists (so the receipt is tied to the exact quote they
+    // agreed to), otherwise on the subscription plus the new plan.
+    //
+    // The amount is stated as the DISCLOSED total rather than a figure invented
+    // here: BILL-003 already recorded what the customer was shown, and a
+    // receipt that contradicts the confirmation dialog is worse than no
+    // receipt. Where no disclosure exists we say the charge is prorated and
+    // point at the invoice rather than guessing a number.
     if (isUpgrade) {
-      const creditsSummary = [
-        newPlan.content_credits ? `${newPlan.content_credits} content` : null,
-        newPlan.image_credits ? `${newPlan.image_credits} image` : null,
-        newPlan.keyword_credits ? `${newPlan.keyword_credits} keyword` : null,
-      ].filter(Boolean).join(', ') + ' credits per month';
+      const disclosed = disclosure_id
+        ? await sql`SELECT total_due_cents, currency, line_items FROM billing_disclosures WHERE disclosure_id = ${disclosure_id} LIMIT 1`
+        : [];
+      const d = disclosed[0] as any;
+      const pmForReceipt = await getLocalDefaultPaymentMethod(sql, user_id);
 
-      await sendBillingEmail(user_id, (firstName) => emailTemplates.subscriptionUpgraded(
-        firstName,
-        newPlan.name,
-        // The prorated invoice is raised asynchronously by Stripe, so quoting a
-        // precise figure here risks contradicting the real invoice. Point at
-        // the receipt instead of inventing a number.
-        'A prorated amount for the remainder of this billing period',
-        currentSub.next_billing_date
-          ? new Date(currentSub.next_billing_date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
-          : 'your next billing date',
-        creditsSummary,
-        CMS_BILLING_URL,
-      ));
+      await queueBillingEmail(
+        user_id,
+        'billing.upgrade',
+        disclosure_id
+          ? `plan_change:${disclosure_id}`
+          : `plan_change:${currentSub.stripe_subscription_id}:${new_plan_id}`,
+        (firstName) => ({
+          firstName,
+          oldPlan: currentPlan?.name ?? null,
+          newPlan: newPlan.name,
+          amountCharged: d
+            ? formatCents(Number(d.total_due_cents), d.currency || 'usd')
+            : 'A prorated amount for the remainder of this billing period',
+          lines: d?.line_items
+            ? (typeof d.line_items === 'string' ? JSON.parse(d.line_items) : d.line_items)
+              .map((l: any) => ({ description: l.description, amount: formatCents(l.amount_cents, d.currency || 'usd') }))
+            : [],
+          nextAmount: formatCents(newPlan.price_cents, 'usd'),
+          nextBillingDate: currentSub.next_billing_date
+            ? new Date(currentSub.next_billing_date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+            : null,
+          cardBrand: pmForReceipt?.brand ?? null,
+          cardLast4: pmForReceipt?.last4 ?? null,
+          billingUrl: CMS_BILLING_URL,
+          timezone: 'UTC',
+        }),
+      );
     }
 
     res.json({
@@ -1827,12 +1864,31 @@ router.post('/cancel-subscription', async (req: Request, res: Response) => {
     const accessUntil = subscription.next_billing_date
       ? new Date(subscription.next_billing_date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
       : 'the end of your current billing period';
-    await sendBillingEmail(user_id, (firstName) => emailTemplates.subscriptionCancelled(
-      firstName,
-      subscription.plan_name || 'your',
-      accessUntil,
-      CMS_BILLING_URL,
-    ));
+
+    // BILL-006 — cancellation confirmation, keyed on the subscription plus the
+    // period it ends, so cancelling twice in one period sends one email while a
+    // genuine later cancellation still sends its own.
+    const remainingCredits = await sql`
+      SELECT COALESCE(SUM(amount), 0)::int AS total FROM credit_balances WHERE user_id = ${user_id}
+    `;
+    const remaining = Number((remainingCredits[0] as any)?.total ?? 0);
+
+    await queueBillingEmail(
+      user_id,
+      'billing.cancellation',
+      `cancel:${subscription.stripe_subscription_id}:${subscription.next_billing_date ?? 'na'}`,
+      (firstName) => ({
+        firstName,
+        planName: subscription.plan_name || 'your',
+        accessUntil,
+        creditsNote: remaining > 0
+          ? `You have ${remaining.toLocaleString()} credits remaining. They stay usable until ${accessUntil}; any credits you purchased separately remain on your account afterwards.`
+          : 'You have no remaining credits on your account.',
+        resubscribeUrl: `${CMS_BILLING_URL}?view=plans`,
+        billingUrl: CMS_BILLING_URL,
+        timezone: 'UTC',
+      }),
+    );
 
     res.json({
       success: true,

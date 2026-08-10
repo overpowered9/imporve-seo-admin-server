@@ -11,6 +11,7 @@ import { testConnection } from './data/db.js';
 import { startTrialEmailScheduler } from './services/trial-emails.service.js';
 import { startLifecycleEmailScheduler } from './services/lifecycle-emails.service.js';
 import { startLedgerMonitor } from './services/billing/ledger-monitor.js';
+import { startEmailWorker } from './services/billing/email-worker.js';
 import sql from './data/db.js';
 
 dotenv.config();
@@ -94,6 +95,11 @@ async function startServer() {
     // No-op unless LEDGER_MONITOR_ENABLED=true, so it cannot start alarming
     // before the backfill has run.
     startLedgerMonitor(sql);
+
+    // BILL-006 — the outbox worker. Jobs QUEUE regardless; this only drains
+    // them, and only when BILLING_EMAILS_ENABLED=true. Turning it on later
+    // delivers the backlog rather than starting from empty.
+    startEmailWorker(sql);
 
     // Start Express server
     const server = app.listen(port, () => {
