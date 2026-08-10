@@ -4,7 +4,13 @@ import bcrypt from 'bcrypt';
 export interface User {
   id: number;
   email: string;
+  // Display string, DERIVED from the two parts below and kept in sync on every
+  // profile write. Existing readers (greeting, initials, tickets) use this.
   name?: string;
+  // Migration 009. Optional because a database that has not run it yet simply
+  // will not return these columns.
+  first_name?: string | null;
+  last_name?: string | null;
   api_key: string;
   plan_id?: number;
   created_at: Date;
@@ -203,6 +209,50 @@ export const updateUserName = async (user_id: number, name: string): Promise<Use
     RETURNING id, email, name, api_key, plan_id, created_at, updated_at
   `;
   return (result[0] as User) || null;
+};
+
+/**
+ * Compose the display string from the parts. ONE definition, so `name` can
+ * never drift from first_name/last_name depending on which caller wrote it.
+ */
+export const composeDisplayName = (first?: string | null, last?: string | null): string =>
+  [first, last].map(p => (p ?? '').trim()).filter(Boolean).join(' ');
+
+/**
+ * Update the profile name, storing the parts AND the composed display string.
+ *
+ * `name` is deliberately written from the parts rather than accepted separately:
+ * it is a derived field (migration 009), and every existing reader — dashboard
+ * greeting, avatar initials, tickets — goes on reading it untouched.
+ *
+ * PRE-MIGRATION TOLERANCE
+ * If migration 009 has not run, the first statement fails with Postgres 42703
+ * and we fall back to writing `name` alone. Saving your profile must not become
+ * a hard deploy-ordering dependency — the user still gets their name saved, just
+ * without the parts, and the next write after the migration stores them.
+ */
+export const updateUserProfileName = async (
+  user_id: number,
+  first_name: string,
+  last_name: string
+): Promise<User | null> => {
+  const name = composeDisplayName(first_name, last_name);
+  const first = first_name.trim() || null;
+  const last = last_name.trim() || null;
+
+  try {
+    const result = await sql`
+      UPDATE users
+      SET name = ${name}, first_name = ${first}, last_name = ${last}, updated_at = NOW()
+      WHERE id = ${user_id}
+      RETURNING id, email, name, first_name, last_name, api_key, plan_id, created_at, updated_at
+    `;
+    return (result[0] as User) || null;
+  } catch (error: any) {
+    if (error?.code !== '42703') throw error;
+    console.warn('users.first_name/last_name missing — migration 009 has not run; saving name only.');
+    return updateUserName(user_id, name);
+  }
 };
 
 // Regenerate API key

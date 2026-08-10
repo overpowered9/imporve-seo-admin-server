@@ -17,6 +17,7 @@
     "migrate:payment-default": "tsx src/migrations/006-default-payment-method.ts",
     "migrate:email-sends": "tsx src/migrations/007-email-sends.ts",
     "migrate:website-connect": "tsx src/migrations/008-website-last-connected.ts",
+    "migrate:name-parts": "tsx src/migrations/009-user-name-parts.ts",
     "lint": "eslint .",
     "test": "node --import tsx --test --test-reporter=spec \"src/**/*.test.ts\"",
     "test:watch": "node --import tsx --test --watch \"src/**/*.test.ts\"",

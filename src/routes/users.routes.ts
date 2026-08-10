@@ -15,6 +15,7 @@ import {
   deleteUserWebsite,
   getUserSubscription,
   updateUserName,
+  updateUserProfileName,
   regenerateApiKey,
   reconcileTrialCredits,
   effectiveTrialEnd
@@ -139,6 +140,11 @@ router.post('/by-email', async (req, res) => {
         id: user.id,
         email: user.email,
         name: user.name,
+        // Migration 009. `SELECT *` omits these on a database that has not run
+        // it yet, so they arrive as null and the CMS falls back to splitting
+        // `name` — the profile form still shows something sensible either way.
+        first_name: user.first_name ?? null,
+        last_name: user.last_name ?? null,
         api_key: user.api_key,
         plan_id: user.plan_id,
         plan_name: userWithPlan?.plan_name,
@@ -585,11 +591,32 @@ router.put('/address/:user_id', async (req, res) => {
 router.patch('/profile/:user_id', async (req, res) => {
   try {
     const user_id = parseInt(req.params.user_id);
-    const { name } = z.object({
-      name: z.string().min(2).max(100)
+    // The CMS now collects the parts (migration 009). `name` is still accepted
+    // so an older client — or anything else already calling this endpoint —
+    // keeps working; it is split on the first space, the same rule the backfill
+    // uses. Exactly one of the two forms must be supplied.
+    const body = z.object({
+      first_name: z.string().trim().min(1).max(50).optional(),
+      last_name: z.string().trim().max(50).optional(),
+      name: z.string().trim().min(2).max(100).optional(),
     }).parse(req.body);
 
-    const updated = await updateUserName(user_id, name);
+    let first = body.first_name ?? '';
+    let last = body.last_name ?? '';
+
+    if (!body.first_name) {
+      if (!body.name) {
+        return res.status(400).json({
+          success: false,
+          error: 'Provide first_name (and optionally last_name), or name.',
+        });
+      }
+      const spaceAt = body.name.indexOf(' ');
+      first = spaceAt === -1 ? body.name : body.name.slice(0, spaceAt);
+      last = spaceAt === -1 ? '' : body.name.slice(spaceAt + 1).trim();
+    }
+
+    const updated = await updateUserProfileName(user_id, first, last);
     if (!updated) {
       return res.status(404).json({
         success: false,
@@ -603,7 +630,11 @@ router.patch('/profile/:user_id', async (req, res) => {
       user: {
         id: updated.id,
         email: updated.email,
-        name: updated.name
+        name: updated.name,
+        // May be undefined pre-migration-009; the CMS falls back to splitting
+        // `name` in that case rather than blanking the fields.
+        first_name: updated.first_name ?? null,
+        last_name: updated.last_name ?? null
       }
     });
   } catch (error) {
