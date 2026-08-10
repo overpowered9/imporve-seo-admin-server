@@ -13,7 +13,13 @@
     "migrate:notifications": "tsx src/migrations/002-user-notifications.ts",
     "migrate:address": "tsx src/migrations/003-user-address.ts",
     "migrate:website-connect": "tsx src/migrations/008-website-last-connected.ts",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "test": "node --import tsx --test --test-reporter=spec \"src/**/*.test.ts\"",
+    "test:watch": "node --import tsx --test --watch \"src/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "backfill:payment-defaults": "tsx src/scripts/backfill-default-payment-methods.ts",
+    "backfill:transactions": "tsx src/scripts/backfill-billing-transactions.ts",
+    "backfill:cancellation-flags": "tsx src/scripts/backfill-stale-cancellations.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",

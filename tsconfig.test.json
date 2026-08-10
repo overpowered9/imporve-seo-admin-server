@@ -1,0 +1,11 @@
+{
+  // Type-checks EVERYTHING, tests included, without emitting.
+  // `npm run build` deliberately excludes tests so they never reach dist/;
+  // this config exists so that exclusion doesn't also mean they go unchecked.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

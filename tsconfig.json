@@ -13,5 +13,8 @@
     "types": ["node"]
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  // Tests and their fakes are excluded from the SHIPPED build only — they are
+  // still type-checked, by tsconfig.test.json (`npm run typecheck`). Compiling
+  // them into dist/ would ship test doubles to production.
+  "exclude": ["node_modules", "dist", "src/**/*.test.ts", "src/test/helpers/**"]
 }
