@@ -1,4 +1,8 @@
 *.md
+# …but the runbook must ship. It is the on-call procedure for the billing jobs
+# — how to dry-run, pause and verify them — and a runbook that exists only on
+# one laptop is not a runbook.
+!/docs/BILLING_RUNBOOK.md
 # Dependencies
 node_modules/
 .pnp/
