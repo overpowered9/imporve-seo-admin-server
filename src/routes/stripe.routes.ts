@@ -14,8 +14,37 @@ import {
   refillPlanCredits,
   addPurchasedCredits,
   suspendPlanCredits,
-  getFreePlanId
+  getFreePlanId,
+  hasBillingAddress
 } from '../models/user.models.js';
+
+/**
+ * Guard for the money-moving endpoints: no billing address, no purchase.
+ *
+ * Client decision — a billing address is mandatory, because without one we
+ * cannot calculate tax or issue a valid invoice for the sale.
+ *
+ * Returns true when it has ALREADY answered the request, so callers read as:
+ *   if (await blockedForMissingAddress(user_id, res)) return;
+ *
+ * The `code` is what the CMS keys off to show "add your address" rather than a
+ * generic failure, so it must stay stable.
+ *
+ * NOT applied to cancel/pause/resume, or to adding a card: none of them take
+ * money, and gating them would trap a user with no address inside a
+ * subscription they want out of.
+ */
+const BILLING_ADDRESS_REQUIRED = 'BILLING_ADDRESS_REQUIRED';
+
+async function blockedForMissingAddress(user_id: number, res: Response): Promise<boolean> {
+  if (await hasBillingAddress(user_id)) return false;
+  res.status(400).json({
+    success: false,
+    error: 'Add your billing address before making a purchase. We need it to calculate tax and issue a valid invoice.',
+    code: BILLING_ADDRESS_REQUIRED,
+  });
+  return true;
+}
 import { sendEmail, emailTemplates } from '../services/email.service.js';
 import {
   ensureDefaultPaymentMethod as ensureDefaultPaymentMethodFor,
@@ -345,6 +374,7 @@ const upgradeSchema = z.object({
 router.post('/create-checkout-session', async (req: Request, res: Response) => {
   try {
     const { user_id, price_id, success_url, cancel_url } = createCheckoutSessionSchema.parse(req.body);
+    if (await blockedForMissingAddress(user_id, res)) return;
 
     // Get user email
     const userResult = await sql`SELECT email FROM users WHERE id = ${user_id}`;
@@ -399,6 +429,7 @@ router.post('/create-checkout-session', async (req: Request, res: Response) => {
 router.post('/buy-credits', async (req: Request, res: Response) => {
   try {
     const { user_id, credit_type, quantity, success_url, cancel_url } = buyCreditSchema.parse(req.body);
+    if (await blockedForMissingAddress(user_id, res)) return;
 
     // Get user email
     const userResult = await sql`SELECT email FROM users WHERE id = ${user_id}`;
@@ -476,6 +507,7 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
 router.post('/upgrade-plan', async (req: Request, res: Response) => {
   try {
     const { user_id, new_plan_id, success_url, cancel_url } = upgradeSchema.parse(req.body);
+    if (await blockedForMissingAddress(user_id, res)) return;
 
     // Get user and current subscription
     const userResult = await sql`SELECT email FROM users WHERE id = ${user_id}`;
@@ -1014,6 +1046,9 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
       idempotency_key: z.string().min(8).max(200).optional()
     }).parse(req.body);
 
+    // First subscription is always a purchase.
+    if (await blockedForMissingAddress(user_id, res)) return;
+
     // Get user and plan
     const [userResult, planResult] = await Promise.all([
       sql`SELECT email, id, stripe_customer_id FROM users WHERE id = ${user_id}`,
@@ -1488,6 +1523,16 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     const currentPlan = currentPlanData[0];
     const newPlan = newPlanData[0];
     const isUpgrade = newPlan.price_cents > currentPlan.price_cents;
+
+    // Billing-address gate, applied to UPGRADES ONLY on this endpoint.
+    //
+    // An upgrade raises a real invoice immediately, so it is a purchase and
+    // needs an address. A downgrade does not charge — it queues a change for
+    // period end — and blocking it would stop a user without an address from
+    // REDUCING their spend, which is the wrong way round. Reactivation below is
+    // likewise not a new charge. Cancelling has its own endpoint and is never
+    // gated, so nobody can be trapped in a subscription.
+    if (isUpgrade && await blockedForMissingAddress(user_id, res)) return;
 
     // BUG 10 — REACTIVATION. Re-picking the plan you are already on while a
     // cancellation is scheduled is the most natural way to "resubscribe", and
