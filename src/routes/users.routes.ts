@@ -596,9 +596,17 @@ router.patch('/profile/:user_id', async (req, res) => {
     // keeps working; it is split on the first space, the same rule the backfill
     // uses. Exactly one of the two forms must be supplied.
     const body = z.object({
-      first_name: z.string().trim().min(1).max(50).optional(),
-      last_name: z.string().trim().max(50).optional(),
-      name: z.string().trim().min(2).max(100).optional(),
+      // 100 per part, matching the maxLength the CMS puts on the two inputs.
+      // These were 50, a bound the form could exceed but could not warn about:
+      // a 60-character first name typed into a field that happily accepted it
+      // came back as a Zod failure naming neither the field nor the real limit.
+      // The two numbers have to agree, and the form's is the looser one.
+      first_name: z.string().trim().min(1).max(100).optional(),
+      last_name: z.string().trim().max(100).optional(),
+      // Composed from the parts whenever they are supplied, so this bound now
+      // only constrains a legacy caller sending `name` on its own. Raised to
+      // 200 so it cannot reject a pair the two fields above would accept.
+      name: z.string().trim().min(2).max(200).optional(),
     }).parse(req.body);
 
     let first = body.first_name ?? '';
