@@ -2080,6 +2080,13 @@ router.get('/payment-methods/:user_id', async (req: Request, res: Response) => {
         last4: pm.card?.last4,
         exp_month: pm.card?.exp_month,
         exp_year: pm.card?.exp_year,
+        // 'apple_pay' | 'google_pay' | 'link' | … | null for a card keyed in
+        // directly. A wallet payment IS a card payment method here — Stripe
+        // saves the underlying card and the wallet is only how it was
+        // presented — so without this the list showed a bare
+        // "VISA •••• 4242" and the customer had no way to tell their Apple Pay
+        // card had been saved at all. That ambiguity is exactly what QA hit.
+        wallet: pm.card?.wallet?.type ?? null,
         is_default: pm.id === defaultPaymentMethodId
       }))
     });
