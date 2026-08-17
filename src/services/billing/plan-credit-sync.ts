@@ -17,16 +17,45 @@
  * credits" and "image credits" are the same balance seen from different labels. It keeps legacy
  * displays truthful (they show what the user actually has) rather than showing a third of it.
  *
- * Best-effort: a failure here must not stop the server booting. Prices still come from env, which
- * is already loaded and validated; only the legacy display columns would be stale.
+ * A transient failure here must not stop the server booting — prices come from env, so only the
+ * legacy display columns would go stale. The ONE exception is the plan-coverage check below, which
+ * is deliberately fatal: see the comment on it.
  */
 import sql from '../../data/db.js';
-import { grantForPlanSlug } from '../../config/credits.config.js';
+import { grantForPlanSlug, hasExplicitGrant } from '../../config/credits.config.js';
 
 export async function syncPlanCreditColumns(): Promise<number> {
   const plans = (await sql`
-    SELECT id, slug FROM subscription_plans
-  `) as unknown as Array<{ id: number; slug: string }>;
+    SELECT id, slug, price_cents FROM subscription_plans
+  `) as unknown as Array<{ id: number; slug: string; price_cents: number }>;
+
+  // ── Plan-coverage check ──────────────────────────────────────────────────────────────────────
+  // grantForPlanSlug() falls back to the FREE grant for an unrecognised slug, which keeps the
+  // service up when a plan row appears — but silently under-grants that plan's customers. That is
+  // exactly how ISEO_GRANT_{GROW,SCALE,ENTERPRISE} shipped against a database whose slugs were
+  // free/basic/starter/pro: only 'free' matched, and every paying customer would have been seeded
+  // with the free allotment.
+  //
+  // A PAID plan with no explicit grant is therefore treated the same way as a missing price:
+  // refuse to start. Under-charging a paying customer's allotment is a money bug, and a loud
+  // failure at boot is far cheaper than discovering it after a migration has reset balances.
+  // Zero-price plans only warn — falling back to the free grant IS correct for them.
+  const uncovered = plans.filter((p) => !hasExplicitGrant(p.slug));
+  const uncoveredPaid = uncovered.filter((p) => Number(p.price_cents) > 0);
+
+  if (uncoveredPaid.length > 0) {
+    const lines = uncoveredPaid
+      .map((p) => `  - plan "${p.slug}" (${p.price_cents} cents) needs ISEO_GRANT_${p.slug.toUpperCase()}`)
+      .join('\n');
+    throw new Error(
+      `Paid subscription plan(s) have no ISEO credit grant configured — refusing to start.\n${lines}\n` +
+        `Without these, those customers would be seeded with the FREE grant. Add the variable(s) and redeploy.`,
+    );
+  }
+
+  for (const p of uncovered) {
+    console.warn(`⚠️  Plan "${p.slug}" has no ISEO_GRANT_${p.slug.toUpperCase()} — using the free grant (price is 0, so this is expected).`);
+  }
 
   let updated = 0;
   for (const plan of plans) {
@@ -43,12 +72,21 @@ export async function syncPlanCreditColumns(): Promise<number> {
   return updated;
 }
 
-/** Boot hook. Never throws — logs and moves on. */
+/**
+ * Boot hook. Throws ONLY when a paid plan has no configured grant (see syncPlanCreditColumns);
+ * every other failure is logged and tolerated.
+ */
 export async function startPlanCreditSync(): Promise<void> {
   try {
     const n = await syncPlanCreditColumns();
     console.log(`💳 Synced env credit grants into ${n} subscription plan row(s).`);
   } catch (err) {
+    // A coverage failure is deliberate and must reach the caller so boot aborts — swallowing it
+    // would defeat the check. Anything else (a transient DB error) only leaves the legacy display
+    // columns stale, which must not stop the server: pricing comes from env, not those columns.
+    if (err instanceof Error && err.message.includes('no ISEO credit grant configured')) {
+      throw err;
+    }
     console.error(
       '⚠️  Plan credit column sync failed — legacy *_credits columns may be stale. ' +
         'Pricing is unaffected (env is the source of truth).',

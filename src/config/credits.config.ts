@@ -138,6 +138,16 @@ export function grantForPlanSlug(slug: string | null | undefined): number {
   return grants.free;
 }
 
+/**
+ * Is there an explicit grant for this slug, as opposed to the free-grant fallback?
+ *
+ * Used by the boot-time plan-coverage check so a PAID plan with no configured grant aborts startup
+ * instead of silently receiving the free allotment.
+ */
+export function hasExplicitGrant(slug: string | null | undefined): boolean {
+  return ((slug || '').trim().toLowerCase() as PlanSlug) in grants;
+}
+
 export function logCreditsConfigFingerprint(): void {
   console.log(`💳 ISEO credit table loaded — sha256:${creditsConfigHash.slice(0, 16)}`);
 }
