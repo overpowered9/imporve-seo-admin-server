@@ -342,7 +342,7 @@ router.post('/templates/:templateId/versions', requireAdmin, async (req: Request
  * Activate prompt version
  * PUT /api/generate/versions/:versionId/activate
  */
-router.put('/versions/:versionId/activate', async (req: Request, res: Response) => {
+router.put('/versions/:versionId/activate', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { versionId } = req.params;
     
@@ -377,7 +377,7 @@ router.put('/versions/:versionId/activate', async (req: Request, res: Response) 
  * Delete prompt version
  * DELETE /api/generate/templates/:templateId/versions/:versionId
  */
-router.delete('/templates/:templateId/versions/:versionId', async (req: Request, res: Response) => {
+router.delete('/templates/:templateId/versions/:versionId', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { templateId, versionId } = req.params;
     

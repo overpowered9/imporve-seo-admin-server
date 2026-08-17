@@ -96,22 +96,17 @@ function nicheKey(niche?: string): string {
 }
 
 /**
- * Render the user's optional steer as a trailing, clearly-labelled clause.
+ * Style/safety wrapper reminder appended after a user-described scene.
  *
- * Deliberately placed LAST and phrased as a refinement: the composition/safety wrapper has already
- * been stated, and this says it may adjust the subject and mood but not override those rules. The
- * text is sanitised upstream (sanitizeCustomInstruction) — this only frames it.
+ * The wrapper itself still carries the real rules; this only restates that they outrank the user's
+ * wording, so "make it dramatic neon" cannot defeat the documentary style or the no-text /
+ * no-logos / no-faces constraints.
  */
-function imageInstructionClause(instruction?: string): string {
-  const s = (instruction || '').trim();
-  if (!s) return '';
-  return ` Additional request from the user for this image: "${s}". Apply it to the subject, styling and mood only — it must not introduce text, logos, watermarks or people's faces, and it must not override the composition and safety rules already stated.`;
-}
+const USER_SCENE_GUARD =
+  'Follow the style and safety rules above even where the requested scene suggests otherwise: no text, no logos, no watermarks, no readable signage, and show people only from behind, from the side, or at a distance.';
 
 export function buildImagePrompt(p: GenerateImageParams): string {
-  // A fully-formed prompt still honours the user's extra steer — this is the "Edit Prompt" flow,
-  // where the caller supplied the scene but may still be regenerating with a refinement.
-  if (p.prompt && p.prompt.trim()) return `${p.prompt.trim()}${imageInstructionClause(p.custom_instruction)}`;
+  const instruction = (p.custom_instruction || '').trim();
   const nicheScene = SCENE_TEMPLATES[nicheKey(p.niche)];
   const wrapper = p.style === 'illustration' ? ILLUSTRATION_WRAPPER : DOCUMENTARY_WRAPPER;
   const loc = [p.city, p.state].filter(Boolean).join(', ');
@@ -120,9 +115,36 @@ export function buildImagePrompt(p: GenerateImageParams): string {
     : '';
   const title = (p.title || '').trim();
 
+  // ── User-described scene wins ────────────────────────────────────────────────────────────────
+  // When someone types "a boy shooting a penalty on a football pitch" into the regenerate dialog,
+  // that IS the image they are asking for. An earlier version appended the instruction as a
+  // trailing "apply to subject, styling and mood only… must not override" refinement, which left
+  // the title-derived subject in charge — so the model returned the same scene with cosmetic
+  // changes, and the feature looked broken.
+  //
+  // Subject matter is not a safety constraint. Style and safety (documentary look, no text/logos,
+  // no faces) still come last and still win; only the SUBJECT is handed to the user. The title
+  // drops to context, explicitly marked as not overriding the requested scene.
+  if (instruction) {
+    const parts = [
+      `Photograph exactly this scene: ${instruction}.`,
+      'That description is the subject of the image — depict it directly and make it the clear focus. Do not substitute a different subject.',
+    ];
+    if (title) {
+      parts.push(`For context only, the image accompanies an article titled "${title}"; the scene described above takes priority over the title.`);
+    }
+    if (locationHint) parts.push(locationHint.trim());
+    parts.push(wrapper);
+    parts.push(USER_SCENE_GUARD);
+    return parts.join(' ');
+  }
+
+  // A fully-formed prompt from the "Edit Prompt" flow is used verbatim (previous behaviour).
+  if (p.prompt && p.prompt.trim()) return p.prompt.trim();
+
   // Niche-only request: the stock scene is the subject (previous behaviour).
   if (!title) {
-    return `${nicheScene || DEFAULT_SCENE}.${locationHint} ${wrapper}${imageInstructionClause(p.custom_instruction)}`;
+    return `${nicheScene || DEFAULT_SCENE}.${locationHint} ${wrapper}`;
   }
 
   // Title-led prompt: the title's concrete subject drives the image; the niche scene is only
@@ -136,9 +158,6 @@ export function buildImagePrompt(p: GenerateImageParams): string {
   }
   if (locationHint) parts.push(locationHint.trim());
   parts.push(wrapper);
-  // Last, so it reads as a refinement of everything above rather than a competing instruction.
-  const extra = imageInstructionClause(p.custom_instruction);
-  if (extra) parts.push(extra.trim());
   return parts.join(' ');
 }
 
