@@ -27,8 +27,16 @@ dotenv.config();
 /** Article size tiers. Mirrors WordCountVariant in services/content-blueprint.ts. */
 export type WordCountVariant = 'small' | 'medium' | 'large';
 
-/** Plan slugs that receive a credit grant each billing cycle. */
-const PLAN_SLUGS = ['free', 'grow', 'scale', 'enterprise'] as const;
+/**
+ * Plan slugs that receive a credit grant each billing cycle.
+ *
+ * These MUST match subscription_plans.slug in the database exactly. They are the real production
+ * slugs, confirmed against it — note that the 950-cent plan has the slug 'basic' while its display
+ * name is "Grow", which is why guessing from the product names got this wrong. A slug with no
+ * matching key falls back to the FREE grant (see grantForPlanSlug), so a mismatch silently gives
+ * paying customers the free allotment rather than failing loudly.
+ */
+const PLAN_SLUGS = ['free', 'basic', 'starter', 'pro'] as const;
 export type PlanSlug = (typeof PLAN_SLUGS)[number];
 
 /**
@@ -64,9 +72,9 @@ const envSchema = z.object({
 
   // ── Plan grants — ISEO Credits per billing cycle, keyed by subscription_plans.slug ──
   ISEO_GRANT_FREE: positiveInt('ISEO_GRANT_FREE'),
-  ISEO_GRANT_GROW: positiveInt('ISEO_GRANT_GROW'),
-  ISEO_GRANT_SCALE: positiveInt('ISEO_GRANT_SCALE'),
-  ISEO_GRANT_ENTERPRISE: positiveInt('ISEO_GRANT_ENTERPRISE'),
+  ISEO_GRANT_BASIC: positiveInt('ISEO_GRANT_BASIC'),
+  ISEO_GRANT_STARTER: positiveInt('ISEO_GRANT_STARTER'),
+  ISEO_GRANT_PRO: positiveInt('ISEO_GRANT_PRO'),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -103,9 +111,9 @@ const costs = Object.freeze({
 /** Per-billing-cycle grant, keyed by subscription_plans.slug. Frozen. */
 const grants: Readonly<Record<PlanSlug, number>> = Object.freeze({
   free: env.ISEO_GRANT_FREE,
-  grow: env.ISEO_GRANT_GROW,
-  scale: env.ISEO_GRANT_SCALE,
-  enterprise: env.ISEO_GRANT_ENTERPRISE,
+  basic: env.ISEO_GRANT_BASIC,
+  starter: env.ISEO_GRANT_STARTER,
+  pro: env.ISEO_GRANT_PRO,
 });
 
 export const creditsConfig = Object.freeze({ costs, grants });

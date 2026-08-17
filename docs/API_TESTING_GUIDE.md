@@ -259,7 +259,11 @@ the migrations against production data, and the WordPress plugin end to end.
 4. **`target_key` is minted per wizard session.** Reloading the wizard before regenerating mints a
    new key, so that regeneration is charged full price. Deliberate — failing towards full price is
    the safe direction.
-5. **No admin role in the database.** Admin is an env allowlist (`ADMIN_EMAILS`). Moving to a
+5. **Plan grant keys are slug-coupled.** `ISEO_GRANT_<SLUG>` must match `subscription_plans.slug`
+   exactly (`free`, `basic`, `starter`, `pro`). An unmatched slug silently falls back to the FREE
+   grant rather than failing loudly, so adding a plan without its key under-grants that plan's
+   customers. Worth converting to a startup check that every plan row has a key.
+6. **No admin role in the database.** Admin is an env allowlist (`ADMIN_EMAILS`). Moving to a
    `users.is_admin` column later only requires changing `isAdminEmail()`.
 
 ---

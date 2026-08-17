@@ -32,11 +32,18 @@ ISEO_COST_CONTENT_REGEN_LARGE=8
 ISEO_COST_IMAGE=5
 ISEO_COST_IMAGE_REGEN=3
 ISEO_COST_KEYWORDS=1
-ISEO_GRANT_FREE=30
-ISEO_GRANT_GROW=300
-ISEO_GRANT_SCALE=1000
-ISEO_GRANT_ENTERPRISE=5000
+ISEO_GRANT_FREE=100
+ISEO_GRANT_BASIC=220
+ISEO_GRANT_STARTER=580
+ISEO_GRANT_PRO=1150
 ```
+
+> **The four grant keys match your real `subscription_plans.slug` values** — `free`, `basic`,
+> `starter`, `pro` — verified against the production database. An earlier draft used
+> `grow/scale/enterprise`, which matched none of them: because an unrecognised slug falls back to
+> the FREE grant, every paying customer would have been given the free allotment. If you add or
+> rename a plan, add the matching `ISEO_GRANT_<SLUG>` key at the same time. Note the 950-cent plan's
+> slug is `basic` even though its display name is "Grow".
 
 **The four `ISEO_GRANT_*` values are placeholders.** They are internally consistent but are not a
 pricing decision. Confirm them against real retail prices using:
@@ -90,6 +97,10 @@ list. `.env` is gitignored and must stay that way.
   are summed across the three old rows and moved onto the new one. This is generous in the user's
   favour, which is the right direction to err with money.
 
+Scope, measured against production on 2026-08-18: **12 users** hold credit rows, and **3 of them
+hold 3,322 purchased credits** between them. Those 3,322 are the ones being carried over — confirm
+they survive the migration before promoting.
+
 Take a database backup before proceeding. Migration 011 runs in a single transaction and rolls back
 cleanly on failure, but the reset itself is intentional and not undone by a rollback once committed.
 
@@ -114,7 +125,7 @@ that regeneration pricing reads. Both are idempotent — safe to re-run if one i
 
 ## 7. Spot-check two real accounts
 
-- **A free-tier account** — balance should equal `ISEO_GRANT_FREE` (30), purchased 0.
+- **A free-tier account** — balance should equal `ISEO_GRANT_FREE` (100), purchased 0.
 - **A paid account that had leftover purchased credits** — included should equal that plan's grant,
   and `purchased_remaining` should equal the **sum** of its three old purchased balances.
 
@@ -140,7 +151,7 @@ these are the checks that matter for this change; add them to one if a shared ch
 | 10 | Instruction attempting to override the format | Structure intact; >2000 chars truncated |
 | 11 | `POST /api/v1/admin/users/1/gift-credits`, no token | **401** — before *and* after adding a new route to that router |
 | 12 | `POST /content-v2/article/test`, unauthenticated | **401** |
-| 13 | Change `ISEO_GRANT_GROW`, restart | `subscription_plans.content_credits` matches; Stripe description reflects it |
+| 13 | Change `ISEO_GRANT_PRO`, restart | `subscription_plans.content_credits` matches; Stripe description reflects it |
 
 Then run **one real single-post generation and one regeneration** against the preview before
 promoting. The WordPress plugin cannot be exercised locally, so this is the only true end-to-end

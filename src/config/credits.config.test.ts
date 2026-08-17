@@ -26,9 +26,9 @@ const REQUIRED = [
   'ISEO_COST_IMAGE_REGEN',
   'ISEO_COST_KEYWORDS',
   'ISEO_GRANT_FREE',
-  'ISEO_GRANT_GROW',
-  'ISEO_GRANT_SCALE',
-  'ISEO_GRANT_ENTERPRISE',
+  'ISEO_GRANT_BASIC',
+  'ISEO_GRANT_STARTER',
+  'ISEO_GRANT_PRO',
 ] as const;
 
 /** The finalized .env.sample values, so the test exercises the real shipping configuration. */
@@ -42,10 +42,10 @@ const VALID: Record<string, string> = {
   ISEO_COST_IMAGE: '5',
   ISEO_COST_IMAGE_REGEN: '3',
   ISEO_COST_KEYWORDS: '1',
-  ISEO_GRANT_FREE: '30',
-  ISEO_GRANT_GROW: '300',
-  ISEO_GRANT_SCALE: '1000',
-  ISEO_GRANT_ENTERPRISE: '5000',
+  ISEO_GRANT_FREE: '100',
+  ISEO_GRANT_BASIC: '220',
+  ISEO_GRANT_STARTER: '580',
+  ISEO_GRANT_PRO: '1150',
 };
 
 let saved: Record<string, string | undefined> = {};
@@ -82,7 +82,7 @@ describe('credits.config fail-closed', () => {
     assert.equal(creditsConfig.costs.image, 5);
     assert.equal(creditsConfig.costs.image_regen, 3);
     assert.equal(creditsConfig.costs.keywords, 1);
-    assert.equal(creditsConfig.grants.grow, 300);
+    assert.equal(creditsConfig.grants.pro, 1150);
     assert.equal(typeof priceOfSanityCheck, 'undefined'); // no accidental export creep
   });
 
@@ -148,10 +148,14 @@ describe('credits.config fail-closed', () => {
 
   test('an unknown plan slug degrades to the free grant instead of throwing or granting freely', async () => {
     const { grantForPlanSlug } = (await loadConfig()) as any;
-    assert.equal(grantForPlanSlug('grow'), 300);
-    assert.equal(grantForPlanSlug('GROW'), 300);   // case-insensitive
-    assert.equal(grantForPlanSlug('nonsense'), 30); // falls back to free
-    assert.equal(grantForPlanSlug(undefined), 30);
-    assert.equal(grantForPlanSlug(null), 30);
+    assert.equal(grantForPlanSlug('pro'), 1150);
+    assert.equal(grantForPlanSlug('PRO'), 1150);     // case-insensitive
+    assert.equal(grantForPlanSlug('basic'), 220);    // slug 'basic', display name "Grow"
+    assert.equal(grantForPlanSlug('starter'), 580);
+    // A slug that is not configured falls back to free. This is the failure mode that would have
+    // given every paying customer the free allotment when the keys did not match the database.
+    assert.equal(grantForPlanSlug('nonsense'), 100);
+    assert.equal(grantForPlanSlug(undefined), 100);
+    assert.equal(grantForPlanSlug(null), 100);
   });
 });
