@@ -6,6 +6,7 @@ import { router as v1 } from './routes/v1.js';
 import { errorHandler } from './utils/error-handler.js';
 import { connectToDatabase } from './config/database.js';
 import adminPromptRoutes from './routes/admin/prompts.routes.js';
+import { requireAdmin } from './middleware/adminAuth.middleware.js';
 import generationsRoutes from './routes/generations.routes.js';
 import { testConnection } from './data/db.js';
 import { startTrialEmailScheduler } from './services/trial-emails.service.js';
@@ -51,7 +52,10 @@ app.use((req, res, next) => {
 // ===== ROUTES CONFIGURATION =====
 app.use('/api/v1', v1);
 app.use('/api/v1/generations', generationsRoutes);
-app.use('/api/admin', adminPromptRoutes);
+// requireAdmin is applied at the MOUNT rather than inside prompts.routes.ts so that a route added
+// to that router later cannot ship unprotected by someone forgetting a per-route guard. This mount
+// previously had no auth at all, and the router's own `requireAdmin` was a stub calling next().
+app.use('/api/admin', requireAdmin, adminPromptRoutes);
 
 // Root health check
 app.get('/health', (req, res) => {

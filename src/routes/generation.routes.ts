@@ -11,14 +11,38 @@ import sql from '../data/db.js';
 import { FluxAIService } from '../services/fluxai.service.js';
 import { chat } from '../services/openai.js';
 import { enforceMetaLength, META_BOUNDS } from '../services/meta-length.js';
+import { requireAdmin } from '../middleware/adminAuth.middleware.js';
+import { rateLimitPerUser } from '../middleware/rateLimit.middleware.js';
 
 const router = Router();
+
+/** See the /auxiliary route below for why this endpoint is rate-limited rather than credit-charged. */
+const auxiliaryRateLimit = rateLimitPerUser({
+  limit: 120,
+  windowMs: 60_000,
+  message: 'Too many auxiliary generation requests. Please wait a moment and try again.',
+});
+
+/*
+ * AUTH MODEL FOR THIS ROUTER — it deliberately mixes two, which is why requireAdmin is applied
+ * per-route here rather than at the mount (a blanket mount would break the plugin's routes).
+ *
+ *   validateApiAccess (x-api-key + x-site-code) → routes the WordPress plugin calls:
+ *                                                 /auxiliary, /generateimage, /generatekeyword, /active
+ *   requireAdmin      (Supabase JWT + allowlist) → prompt tooling and test routes used only by the
+ *                                                 admin panel
+ *
+ * The requireAdmin routes previously had NO auth and NO credit check, while each call spends real
+ * model money. They are guarded rather than removed: the admin frontend actively calls /templates,
+ * /templates/:templateId/versions, /testWithActiveVersions and /immediateVersionTesting (see
+ * improvese0-admin-frontend/src/services/api.ts), so deleting them would break the panel.
+ */
 
 /**
  * Generate content using default prompt set
  * POST /api/generate/default
  */
-router.post('/default', async (req: Request, res: Response) => {
+router.post('/default', requireAdmin, async (req: Request, res: Response) => {
   try {
     const {
       seedKeyword,
@@ -77,7 +101,7 @@ router.post('/default', async (req: Request, res: Response) => {
  * Generate content using specific prompt set
  * POST /api/generate/promptset/:setId
  */
-router.post('/promptset/:setId', async (req: Request, res: Response) => {
+router.post('/promptset/:setId', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { setId } = req.params;
     const {
@@ -137,7 +161,7 @@ router.post('/promptset/:setId', async (req: Request, res: Response) => {
  * Test individual prompt template
  * POST /api/generate/test-prompt
  */
-router.post('/test-prompt', async (req: Request, res: Response) => {
+router.post('/test-prompt', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { templateType, parameters } = req.body;
 
@@ -174,7 +198,7 @@ router.post('/test-prompt', async (req: Request, res: Response) => {
  * Get all system templates (updated for conversational prompts)
  * GET /api/generate/templates
  */
-router.get('/templates', async (req: Request, res: Response) => {
+router.get('/templates', requireAdmin, async (req: Request, res: Response) => {
   try {
     console.log('📋 Fetching all prompt templates...');
     
@@ -208,7 +232,7 @@ router.get('/templates', async (req: Request, res: Response) => {
  * Get template versions with template info
  * GET /api/generate/templates/:templateId/versions
  */
-router.get('/templates/:templateId/versions', async (req: Request, res: Response) => {
+router.get('/templates/:templateId/versions', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { templateId } = req.params;
     
@@ -270,7 +294,7 @@ router.get('/templates/:templateId/versions', async (req: Request, res: Response
  * Create new prompt version
  * POST /api/generate/templates/:templateId/versions
  */
-router.post('/templates/:templateId/versions', async (req: Request, res: Response) => {
+router.post('/templates/:templateId/versions', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { templateId } = req.params;
     const { prompt, createdBy = 'admin', metadata } = req.body;
@@ -379,7 +403,7 @@ router.delete('/templates/:templateId/versions/:versionId', async (req: Request,
  * Get default prompt set configuration
  * GET /api/generate/default-config
  */
-router.get('/default-config', async (req: Request, res: Response) => {
+router.get('/default-config', requireAdmin, async (req: Request, res: Response) => {
   try {
     console.log('⚙️ Fetching default prompt set configuration...');
     
@@ -558,7 +582,7 @@ router.post('/active', validateApiAccess, validateCredits('content', 1), async (
 
 // POST /api/v1/generate/testWithActiveVersions
 // Admin panel route: Use ConversationalAIContentGenerator with all active database prompts
-router.post('/testWithActiveVersions', async (req: Request, res: Response) => {
+router.post('/testWithActiveVersions', requireAdmin, async (req: Request, res: Response) => {
   try {
     const {
       seed_keyword,
@@ -653,7 +677,7 @@ router.post('/testWithActiveVersions', async (req: Request, res: Response) => {
 
 // POST /api/v1/generate/immediateVersionTesting
 // Test a specific version of one prompt type while using active versions for others
-router.post('/immediateVersionTesting', async (req: Request, res: Response) => {
+router.post('/immediateVersionTesting', requireAdmin, async (req: Request, res: Response) => {
   try {
     const {
       // Core generation parameters (same as /active route)
@@ -1318,7 +1342,12 @@ router.post('/generatekeywordded', validateApiAccess, validateCredits('keywords'
  *
  * Response: { success: true, data: { type, text } }
  */
-router.post('/auxiliary', validateApiAccess, async (req: AuthenticatedRequest, res: Response) => {
+// Rate-limited rather than credit-charged: each call is sub-cent, so a credit line would be
+// disproportionate, but the route is free and the plugin's meta-length enforcement retries it up
+// to 4x per article — so an authenticated caller could otherwise spin it indefinitely at our cost.
+// 120/minute leaves ample headroom for a legitimate bulk run (4 aux calls per post) while putting
+// a hard ceiling on abuse.
+router.post('/auxiliary', validateApiAccess, auxiliaryRateLimit, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { type, seed_keyword, title, content, audience_data, title_type } = req.body as {
       type?: string;

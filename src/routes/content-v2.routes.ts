@@ -24,6 +24,7 @@ import {
   ImageStyle,
 } from '../services/openai-image.service.js';
 import { validateApiAccess, validateCredits, AuthenticatedRequest } from '../middleware/apiAuth.middleware.js';
+import { requireAdmin } from '../middleware/adminAuth.middleware.js';
 import { deductCredits } from '../models/user.models.js';
 import sql from '../data/db.js';
 
@@ -79,8 +80,14 @@ function parseParams(body: any): { error?: string; params?: GenerateV2Params } {
   };
 }
 
-/** Testing endpoint — no auth, no credit. Returns full diagnostics for the admin panel. */
-router.post('/article/test', async (req: Request, res: Response) => {
+/**
+ * Testing endpoint — admin-only, no credit. Returns full diagnostics for the admin panel.
+ *
+ * SECURITY: this was previously open to the internet with no auth and no credit check, while every
+ * call spends real Anthropic money. It is now behind requireAdmin. It still charges no credits,
+ * which is the point of a test route — the protection is that only admins can reach it.
+ */
+router.post('/article/test', requireAdmin, async (req: Request, res: Response) => {
   const { error, params } = parseParams(req.body);
   if (error) return res.status(400).json({ success: false, error });
 
@@ -179,8 +186,11 @@ router.post('/article', validateApiAccess, validateCredits('content', 1), async 
 
 // ---------------- IMAGE (OpenAI, synchronous) ----------------
 
-/** Image testing endpoint — no auth, no credit. Returns a data URI for the admin panel. */
-router.post('/image/test', async (req: Request, res: Response) => {
+/**
+ * Image testing endpoint — admin-only, no credit. Returns a data URI for the admin panel.
+ * Same reasoning as /article/test above: previously unauthenticated while spending real OpenAI money.
+ */
+router.post('/image/test', requireAdmin, async (req: Request, res: Response) => {
   const { error, params } = parseImageParams(req.body);
   if (error) return res.status(400).json({ success: false, error });
 

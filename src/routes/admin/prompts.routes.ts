@@ -1,14 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { PromptManagementService } from '../../services/prompt-management.service.js';
+// Real admin auth. This replaces a local placeholder that set a mock admin id and called next()
+// unconditionally, which left this whole router — and the credit-granting routes mounted beside
+// it — open to anyone. The router is ALSO mounted behind requireAdmin in index.ts; that mount is
+// the actual guarantee, and requireAdmin short-circuits when it has already run, so listing it
+// per-route below costs nothing and keeps the intent visible at each call site.
+import { requireAdmin } from '../../middleware/adminAuth.middleware.js';
 
 const router = Router();
-
-// Middleware for admin authentication (placeholder - implement based on your auth system)
-const requireAdmin = (req: any, res: any, next: any) => {
-  // TODO: Implement actual admin authentication
-  req.adminId = 'admin-user-id'; // Mock admin ID
-  next();
-};
 
 // Initialize service (assumes MongoDB connection is already established)
 const promptService = new PromptManagementService();

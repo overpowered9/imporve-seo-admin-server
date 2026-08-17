@@ -13,6 +13,7 @@ import stripeRoutes from './stripe.routes.js';
 import ticketsRoutes from './tickets.routes.js';
 import adminUsersRoutes from './admin-users.routes.js';
 import bulkNotificationsRoutes from './bulk-notifications.routes.js';
+import { requireAdmin } from '../middleware/adminAuth.middleware.js';
 
 export const router = Router();
 
@@ -142,5 +143,8 @@ router.use('/websites', websitesRoutes);
 router.use('/users', usersRoutes);
 router.use('/stripe', stripeRoutes);
 router.use('/tickets', ticketsRoutes);
-router.use('/admin/users', adminUsersRoutes);
+// SECURITY: this mount previously had NO middleware, so POST /admin/users/:userId/gift-credits let
+// any unauthenticated caller grant unlimited credits to any account. requireAdmin is applied here
+// at the mount so every current and future route on this router is covered.
+router.use('/admin/users', requireAdmin, adminUsersRoutes);
 router.use('/bulk-notifications', bulkNotificationsRoutes);

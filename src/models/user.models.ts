@@ -851,6 +851,122 @@ export const deductCredits = async (
     `;
   });
 };
+/**
+ * Outcome of a credit reservation. `ok: false` means the user could not afford the action and
+ * NOTHING was debited — the caller must return 402 and must not call the model.
+ */
+export interface ReserveResult {
+  ok: boolean;
+  included_remaining: number;
+  purchased_remaining: number;
+}
+
+/**
+ * Atomically reserve credits BEFORE doing paid work (reserve-then-settle).
+ *
+ * Why this exists: deductCredits() above reads the balance and then writes it. Under the default
+ * READ COMMITTED isolation two concurrent requests both read the same value, both pass their
+ * check and both write — so the balance can go negative. A bulk run reproduces it trivially.
+ *
+ * Here the check and the debit are ONE conditional statement. The WHERE clause is the check, so
+ * the database decides affordability; concurrency cannot interleave between the two. Zero rows
+ * returned means "could not afford" — there is no partial state to unwind.
+ *
+ * Plan (included) credits drain first so the expiring allotment is spent before credits the user
+ * paid extra for. Both SET expressions read the row's OLD values, which is what makes the
+ * two-bucket split correct in a single statement.
+ *
+ * NOTE: credit_balances.amount is a GENERATED column (included + purchased) — never write it.
+ */
+export const reserveCredits = async (
+  user_id: number,
+  credit_type: string,
+  amount: number,
+  reason: string,
+  website_id?: number,
+  generation_id?: number,
+): Promise<ReserveResult> => {
+  if (!Number.isInteger(amount) || amount <= 0) {
+    // A zero/negative/fractional price is a configuration bug, not a free action. Refuse loudly
+    // rather than silently granting free generations.
+    throw new Error(`reserveCredits: amount must be a positive integer, got ${amount}`);
+  }
+
+  return await sql.begin(async (sql) => {
+    const rows = await sql`
+      UPDATE credit_balances
+      SET included_remaining  = included_remaining  - LEAST(included_remaining, ${amount}),
+          purchased_remaining = purchased_remaining - GREATEST(0, ${amount} - included_remaining),
+          updated_at = NOW()
+      WHERE user_id = ${user_id}
+        AND credit_type = ${credit_type}
+        AND included_remaining + purchased_remaining >= ${amount}
+      RETURNING included_remaining, purchased_remaining
+    `;
+
+    if (rows.length === 0) {
+      return { ok: false, included_remaining: 0, purchased_remaining: 0 };
+    }
+
+    await sql`
+      INSERT INTO credit_transactions (user_id, credit_type, delta, reason, website_id, generation_id)
+      VALUES (${user_id}, ${credit_type}, ${-amount}, ${reason}, ${website_id || null}, ${generation_id || null})
+    `;
+
+    return {
+      ok: true,
+      included_remaining: Number(rows[0].included_remaining),
+      purchased_remaining: Number(rows[0].purchased_remaining),
+    };
+  });
+};
+
+/**
+ * Compensating refund for a reservation whose paid work then failed.
+ *
+ * Refund policy: restore the plan (included) bucket first, capped at included_allotment, and put
+ * any remainder into purchased. This mirrors the drain order and means a refund can never inflate
+ * included_remaining above what the plan grants, nor silently convert plan credits into purchased
+ * ones (which survive the billing cycle and would hand the user more value than they started with).
+ *
+ * Deliberately best-effort: it is called from a catch block, so a failure here must not mask the
+ * original generation error. It logs loudly instead — the ledger row is the audit trail.
+ */
+export const refundCredits = async (
+  user_id: number,
+  credit_type: string,
+  amount: number,
+  reason: string,
+  website_id?: number,
+  generation_id?: number,
+): Promise<void> => {
+  if (!Number.isInteger(amount) || amount <= 0) return;
+
+  try {
+    await sql.begin(async (sql) => {
+      await sql`
+        UPDATE credit_balances
+        SET included_remaining  = included_remaining
+              + LEAST(${amount}, GREATEST(0, included_allotment - included_remaining)),
+            purchased_remaining = purchased_remaining
+              + (${amount} - LEAST(${amount}, GREATEST(0, included_allotment - included_remaining))),
+            updated_at = NOW()
+        WHERE user_id = ${user_id} AND credit_type = ${credit_type}
+      `;
+
+      await sql`
+        INSERT INTO credit_transactions (user_id, credit_type, delta, reason, website_id, generation_id)
+        VALUES (${user_id}, ${credit_type}, ${amount}, ${reason}, ${website_id || null}, ${generation_id || null})
+      `;
+    });
+  } catch (err) {
+    console.error(
+      `❌ refundCredits FAILED — user ${user_id} is owed ${amount} ${credit_type} credit(s) for "${reason}". Refund manually.`,
+      err,
+    );
+  }
+};
+
 export const createWebsite = async (user_id: number, domain: string, trial_used: boolean = false): Promise<Website> => {
   let site_code = generateSiteCode();
   
