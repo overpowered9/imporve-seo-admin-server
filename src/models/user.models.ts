@@ -1,6 +1,7 @@
 import sql from '../data/db.js';
 import crypto from 'crypto';
 import bcrypt from 'bcrypt';
+import { grantForPlanSlug } from '../config/credits.config.js';
 export interface User {
   id: number;
   email: string;
@@ -42,7 +43,7 @@ export interface Website {
 export interface CreditBalance {
   id: number;
   user_id: number;
-  credit_type: 'images' | 'content' | 'keywords';
+  credit_type: CreditType;
   /** Plan-included credits remaining; reset to included_allotment each billing cycle. */
   included_remaining: number;
   /** Purchased (top-up) credits remaining; persist across cycles, never wiped by refills. */
@@ -56,16 +57,41 @@ export interface CreditBalance {
   updated_at: Date;
 }
 
-type CreditType = 'images' | 'content' | 'keywords';
-const CREDIT_TYPES: CreditType[] = ['images', 'content', 'keywords'];
+/**
+ * ISEO Credits — ONE pool.
+ *
+ * Was three independent pools ('images' | 'content' | 'keywords'), each charged a flat 1 credit
+ * per action regardless of what the action actually cost us. Real cost varies roughly 2x across
+ * article sizes and again between an article and an image, so a flat charge over-priced small work
+ * and under-priced large. A single pool with a per-action deduction table (config/credits.config.ts,
+ * priced by services/credit-pricing.ts) replaces it.
+ *
+ * These two symbols are the seam every credit path already funnels through, so collapsing them
+ * collapses the whole model: the loops below now run once instead of three times, and their
+ * transaction, ledger and proration behaviour is unchanged.
+ *
+ * See migrations/011-iseo-credit-pool.ts. Per-type balances are NOT carried over.
+ */
+export type CreditType = 'iseo';
+export const ISEO_CREDIT_TYPE: CreditType = 'iseo';
+const CREDIT_TYPES: CreditType[] = [ISEO_CREDIT_TYPE];
 
 /** Length of the free trial started at signup. */
 export const TRIAL_DAYS = 7;
 
-const planAllotment = (plan: any, creditType: CreditType): number => {
-  if (creditType === 'images') return plan.image_credits;
-  if (creditType === 'content') return plan.content_credits;
-  return plan.keyword_credits;
+/**
+ * Credits a plan grants per billing cycle.
+ *
+ * Now sourced from env (ISEO_GRANT_<SLUG>) rather than the subscription_plans.*_credits columns.
+ * Those columns still exist and are kept in sync by the boot-time sync so Stripe checkout
+ * descriptions and CMS joins keep working, but they are DERIVED — env is the source of truth, and
+ * there is no runtime path that can change a grant.
+ *
+ * `creditType` is retained in the signature purely so the call sites keep reading naturally now
+ * that CREDIT_TYPES has one member; there is only one pool to allot.
+ */
+const planAllotment = (plan: any, _creditType: CreditType): number => {
+  return grantForPlanSlug(plan?.slug);
 };
 
 // Add these interfaces to existing ones
@@ -157,14 +183,14 @@ export const initializeUserCredits = async (user_id: number, plan_id?: number): 
   
   const planData = plan[0] as SubscriptionPlan;
 
-  // Initialize credit balances with the plan's full allotment (free plan = the
-  // trial credits, currently 10 of each type; paid plans = their allotment).
+  // Seed the single ISEO pool with the plan's env-configured grant. Was three rows, one per
+  // legacy type, read from planData.*_credits — those columns are derived now (see
+  // plan-credit-sync.ts) and the rows they seeded no longer exist after migration 011, so
+  // inserting them would leave a new signup with no spendable balance at all.
+  const allotment = grantForPlanSlug(planData.slug);
   await sql`
     INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
-    VALUES
-      (${user_id}, 'images', ${planData.image_credits}, ${planData.image_credits}, 0, NOW()),
-      (${user_id}, 'content', ${planData.content_credits}, ${planData.content_credits}, 0, NOW()),
-      (${user_id}, 'keywords', ${planData.keyword_credits}, ${planData.keyword_credits}, 0, NOW())
+    VALUES (${user_id}, ${ISEO_CREDIT_TYPE}, ${allotment}, ${allotment}, 0, NOW())
     ON CONFLICT (user_id, credit_type) DO NOTHING
   `;
   

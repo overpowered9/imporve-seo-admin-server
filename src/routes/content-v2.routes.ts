@@ -23,9 +23,16 @@ import {
   ImageQuality,
   ImageStyle,
 } from '../services/openai-image.service.js';
-import { validateApiAccess, validateCredits, AuthenticatedRequest } from '../middleware/apiAuth.middleware.js';
+import { validateApiAccess, AuthenticatedRequest } from '../middleware/apiAuth.middleware.js';
 import { requireAdmin } from '../middleware/adminAuth.middleware.js';
-import { deductCredits } from '../models/user.models.js';
+import { reserveCredits, refundCredits, ISEO_CREDIT_TYPE } from '../models/user.models.js';
+import { priceOf, type BillableAction } from '../services/credit-pricing.js';
+import {
+  isRegeneration,
+  sanitizeTargetKey,
+  sanitizeCustomInstruction,
+} from '../services/generation-history.js';
+import { variantFromWords } from '../services/content-blueprint.js';
 import sql from '../data/db.js';
 
 const router = Router();
@@ -119,21 +126,64 @@ router.post('/article/test', requireAdmin, async (req: Request, res: Response) =
   }
 });
 
-/** Production endpoint — auth + 1 content credit, saves the generation and deducts. */
-router.post('/article', validateApiAccess, validateCredits('content', 1), async (req: AuthenticatedRequest, res: Response) => {
+/**
+ * Production endpoint — auth + a variable ISEO Credit charge, saves the generation.
+ *
+ * Charging is reserve-then-settle: the credits are debited atomically BEFORE the model is called
+ * and refunded if it throws. validateCredits() is deliberately gone — it read the balance in
+ * middleware and left the write to the end of the handler, so two concurrent requests could both
+ * pass and both generate. Here the check and the debit are one statement.
+ *
+ * Price depends on two server-resolved facts, neither of which the client can assert:
+ *   - the size variant, from variantFromWords() on the same nos_of_words that drives generation;
+ *   - whether this is a regeneration, from a prior successful user_generations row for this
+ *     target_key. A body flag is never consulted.
+ */
+router.post('/article', validateApiAccess, async (req: AuthenticatedRequest, res: Response) => {
   const { error, params } = parseParams(req.body);
   if (error) return res.status(400).json({ success: false, error });
 
+  const userId = req.user.id;
+  const websiteId = req.website?.id || null;
+
+  // Resolve the size ONCE here and hand the same value to both the price and the generator. A
+  // client may ask for a cheaper size, but then it receives the cheaper article — no arbitrage.
+  // variantFromWords already fails closed to 'medium', so garbage cannot reach the cheapest tier.
+  const variant = variantFromWords(params!.nos_of_words || '1200 to 2400 words');
+
+  const targetKey = sanitizeTargetKey(req.body?.target_key);
+  const customInstruction = sanitizeCustomInstruction(req.body?.custom_instruction);
+
+  // THE regeneration decision. Server history only — req.body.is_regeneration is ignored, so a
+  // caller claiming a discount without a real prior generation pays the first-generation price.
+  const regen = await isRegeneration(userId, targetKey, 'content_v2');
+  const action: BillableAction = regen ? 'content_regen' : 'content';
+  const cost = priceOf(action, variant);
+
+  const reservation = await reserveCredits(
+    userId,
+    ISEO_CREDIT_TYPE,
+    cost,
+    `Content v2 (${regen ? 'regen' : 'new'}, ${variant}): ${params!.seed_keyword.substring(0, 180)}`,
+    websiteId ?? undefined,
+  );
+
+  if (!reservation.ok) {
+    // Nothing was debited and the model has not been called.
+    return res.status(402).json({
+      success: false,
+      error: 'Insufficient ISEO Credits for this generation.',
+      required: cost,
+    });
+  }
+
   try {
     const start = Date.now();
-    const result = await generateContentV2(params!);
+    const result = await generateContentV2({ ...params!, custom_instruction: customInstruction ?? undefined });
     const processingTime = Date.now() - start;
 
-    const userId = req.user.id;
-    const websiteId = req.website?.id || null;
-
     const generationRecord = await sql`
-      INSERT INTO user_generations (user_id, website_id, type, status, parameters, result, metadata, processing_time_ms)
+      INSERT INTO user_generations (user_id, website_id, type, status, parameters, result, metadata, processing_time_ms, target_key, custom_instruction)
       VALUES (
         ${userId}, ${websiteId}, 'content_v2', 'success',
         ${JSON.stringify({
@@ -150,21 +200,17 @@ router.post('/article', validateApiAccess, validateCredits('content', 1), async 
           faq: result.faq,
           faq_schema: result.faq_schema,
         })},
-        ${JSON.stringify({ method: 'claude-v2', model: process.env.ANTHROPIC_MODEL, blueprintSeed: result.blueprint.seed })},
-        ${processingTime}
+        ${JSON.stringify({
+          method: 'claude-v2',
+          model: process.env.ANTHROPIC_MODEL,
+          blueprintSeed: result.blueprint.seed,
+          billed: { action, variant, cost },
+        })},
+        ${processingTime}, ${targetKey}, ${customInstruction}
       )
       RETURNING id
     `;
     const generationId = generationRecord[0].id;
-
-    await deductCredits(
-      userId,
-      'content',
-      1,
-      `Content v2: ${params!.seed_keyword.substring(0, 200)}`,
-      websiteId,
-      generationId
-    );
 
     res.json({
       success: true,
@@ -176,10 +222,24 @@ router.post('/article', validateApiAccess, validateCredits('content', 1), async 
         faq: result.faq,
         faq_schema: result.faq_schema,
       },
-      metadata: { method: 'claude-v2', processingTime, blueprintSeed: result.blueprint.seed },
+      metadata: {
+        method: 'claude-v2',
+        processingTime,
+        blueprintSeed: result.blueprint.seed,
+        // Echoed so the plugin can show what was actually charged, and so support can reconcile.
+        credits: { charged: cost, action, variant, balance_after: reservation.included_remaining + reservation.purchased_remaining },
+      },
     });
   } catch (e) {
-    console.error('❌ [v2] production generation error:', e);
+    // The user paid for work that did not happen — give it back before surfacing the error.
+    await refundCredits(
+      userId,
+      ISEO_CREDIT_TYPE,
+      cost,
+      `Refund — content v2 generation failed: ${params!.seed_keyword.substring(0, 160)}`,
+      websiteId ?? undefined,
+    );
+    console.error('❌ [v2] production generation error (credits refunded):', e);
     res.status(500).json({ success: false, error: e instanceof Error ? e.message : 'Generation failed' });
   }
 });
@@ -217,41 +277,58 @@ router.post('/image/test', requireAdmin, async (req: Request, res: Response) => 
   }
 });
 
-/** Production image endpoint — auth + 1 image credit. Hosts to Supabase if configured, deducts on success. */
-router.post('/image', validateApiAccess, validateCredits('images', 1), async (req: AuthenticatedRequest, res: Response) => {
+/**
+ * Production image endpoint — auth + a variable ISEO Credit charge. Hosts to Supabase if configured.
+ * Same reserve-then-settle and same server-derived regen rule as /article above.
+ */
+router.post('/image', validateApiAccess, async (req: AuthenticatedRequest, res: Response) => {
   const { error, params } = parseImageParams(req.body);
   if (error) return res.status(400).json({ success: false, error });
 
+  const userId = req.user.id;
+  const websiteId = req.website?.id || null;
+
+  const targetKey = sanitizeTargetKey(req.body?.target_key);
+  const customInstruction = sanitizeCustomInstruction(req.body?.custom_instruction);
+
+  const regen = await isRegeneration(userId, targetKey, 'image_v2');
+  const action: BillableAction = regen ? 'image_regen' : 'image';
+  const cost = priceOf(action);
+
+  const reservation = await reserveCredits(
+    userId,
+    ISEO_CREDIT_TYPE,
+    cost,
+    `Image v2 (${regen ? 'regen' : 'new'}): ${(params!.title || params!.niche || 'image').substring(0, 180)}`,
+    websiteId ?? undefined,
+  );
+
+  if (!reservation.ok) {
+    return res.status(402).json({
+      success: false,
+      error: 'Insufficient ISEO Credits for this image.',
+      required: cost,
+    });
+  }
+
   try {
     const start = Date.now();
-    const img = await generateOpenAiImage(params!);
+    const img = await generateOpenAiImage({ ...params!, custom_instruction: customInstruction ?? undefined });
     const hostedUrl = await uploadImageToSupabase(img.b64); // best-effort; null if not configured
     const processingTime = Date.now() - start;
 
-    const userId = req.user.id;
-    const websiteId = req.website?.id || null;
-
     const generationRecord = await sql`
-      INSERT INTO user_generations (user_id, website_id, type, status, parameters, result, metadata, processing_time_ms)
+      INSERT INTO user_generations (user_id, website_id, type, status, parameters, result, metadata, processing_time_ms, target_key, custom_instruction)
       VALUES (
         ${userId}, ${websiteId}, 'image_v2', 'success',
         ${JSON.stringify({ niche: params!.niche, title: params!.title, size: img.size, quality: params!.quality || 'medium', style: params!.style })},
         ${JSON.stringify({ image_url: hostedUrl, prompt_used: img.promptUsed })},
-        ${JSON.stringify({ method: 'openai-image', model: img.model, hosted: !!hostedUrl })},
-        ${processingTime}
+        ${JSON.stringify({ method: 'openai-image', model: img.model, hosted: !!hostedUrl, billed: { action, cost } })},
+        ${processingTime}, ${targetKey}, ${customInstruction}
       )
       RETURNING id
     `;
     const generationId = generationRecord[0].id;
-
-    await deductCredits(
-      userId,
-      'images',
-      1,
-      `Image v2: ${(params!.title || params!.niche || 'image').substring(0, 200)}`,
-      websiteId,
-      generationId
-    );
 
     res.json({
       success: true,
@@ -263,9 +340,21 @@ router.post('/image', validateApiAccess, validateCredits('images', 1), async (re
         size: img.size,
         model: img.model,
       },
-      metadata: { method: 'openai-image', processingTime, hosted: !!hostedUrl },
+      metadata: {
+        method: 'openai-image',
+        processingTime,
+        hosted: !!hostedUrl,
+        credits: { charged: cost, action, balance_after: reservation.included_remaining + reservation.purchased_remaining },
+      },
     });
   } catch (e) {
+    await refundCredits(
+      userId,
+      ISEO_CREDIT_TYPE,
+      cost,
+      `Refund — image v2 generation failed: ${(params!.title || params!.niche || 'image').substring(0, 160)}`,
+      websiteId ?? undefined,
+    );
     const status = e instanceof ImageGenError ? e.status : 500;
     const code = e instanceof ImageGenError ? e.code : 'unknown';
     console.error(`❌ [v2] production image error (${code}):`, e instanceof Error ? e.message : e);

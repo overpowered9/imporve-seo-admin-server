@@ -28,7 +28,9 @@
     "migrations:print": "tsx src/scripts/print-migrations.ts",
     "monitor:ledger-gaps": "tsx src/scripts/check-ledger-gaps.ts",
     "notify": "tsx src/scripts/run-notification-jobs.ts",
-    "email:drain": "tsx src/scripts/drain-email-outbox.ts"
+    "email:drain": "tsx src/scripts/drain-email-outbox.ts",
+    "migrate:target-key": "tsx src/migrations/010-generation-target-key.ts",
+    "migrate:iseo-credits": "tsx src/migrations/011-iseo-credit-pool.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",

@@ -253,9 +253,11 @@ export const creditExpiryJob = (leadDays: number, cfg: NotificationConfig): JobD
   category: 'lifecycle',
   fetchPage: (sql, afterId, limit) => sql`
     SELECT u.id AS user_id, u.email, u.name,
-           COALESCE(SUM(cb.included_remaining) FILTER (WHERE cb.credit_type = 'content'), 0)::int AS content,
-           COALESCE(SUM(cb.included_remaining) FILTER (WHERE cb.credit_type = 'images'),  0)::int AS images,
-           COALESCE(SUM(cb.included_remaining) FILTER (WHERE cb.credit_type = 'keywords'),0)::int AS keywords,
+           -- One ISEO pool now. The three aliases are kept so the existing email templates keep
+           -- rendering; each reports the same pooled balance rather than a third of it.
+           COALESCE(SUM(cb.included_remaining), 0)::int AS content,
+           COALESCE(SUM(cb.included_remaining), 0)::int AS images,
+           COALESCE(SUM(cb.included_remaining), 0)::int AS keywords,
            COALESCE(SUM(cb.included_remaining), 0)::int AS expiring_total,
            COALESCE(SUM(cb.purchased_remaining), 0)::int AS remaining_after,
            MAX(cb.cycle_started_at) AS cycle_started_at,
@@ -339,8 +341,9 @@ export const inactivityJob = (cfg: NotificationConfig): JobDefinition => ({
     SELECT u.id AS user_id, u.email, u.name,
            la.last_generation_at,
            COALESCE(sp.name, 'Free') AS plan_name,
-           COALESCE(SUM(cb.amount) FILTER (WHERE cb.credit_type = 'content'), 0)::int AS content,
-           COALESCE(SUM(cb.amount) FILTER (WHERE cb.credit_type = 'images'),  0)::int AS images,
+           -- One ISEO pool now; both aliases report the same pooled balance (see above).
+           COALESCE(SUM(cb.amount), 0)::int AS content,
+           COALESCE(SUM(cb.amount), 0)::int AS images,
            COALESCE(SUM(cb.amount), 0)::int AS total_credits,
            MIN(cb.cycle_started_at) + INTERVAL '1 month' AS nearest_expiry
     FROM   users u

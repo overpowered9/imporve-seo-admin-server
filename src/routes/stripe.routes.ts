@@ -15,7 +15,8 @@ import {
   addPurchasedCredits,
   suspendPlanCredits,
   getFreePlanId,
-  hasBillingAddress
+  hasBillingAddress,
+  ISEO_CREDIT_TYPE
 } from '../models/user.models.js';
 
 /**
@@ -264,10 +265,16 @@ const applyCreditTopupOnce = async (session: Stripe.Checkout.Session): Promise<b
   if (claim.length === 0) return false;
 
   const userId = parseInt(session.metadata?.user_id || '0');
-  const creditType = session.metadata?.credit_type as 'images' | 'content' | 'keywords' | undefined;
+  // Whatever type the checkout was created with, the credits land in the single ISEO pool.
+  // Sessions started BEFORE the pool collapse carry 'images' | 'content' | 'keywords' in their
+  // metadata and their webhook can arrive after this deploys. Those are credits somebody paid
+  // for, so they are mapped onto the pool rather than rejected; the original label is kept only
+  // to keep the ledger description recognisable.
+  const legacyCreditType = session.metadata?.credit_type as string | undefined;
+  const creditType = ISEO_CREDIT_TYPE;
   const quantity = parseInt(session.metadata?.quantity || '0');
 
-  if (!userId || !creditType || !quantity) {
+  if (!userId || !legacyCreditType || !quantity) {
     await sql`
       UPDATE stripe_webhook_events
       SET processed = true, processed_at = NOW(), error_message = 'missing credit_topup metadata'
@@ -287,7 +294,9 @@ const applyCreditTopupOnce = async (session: Stripe.Checkout.Session): Promise<b
   await recordTransaction(sql, {
     userId,
     type: 'credit_purchase',
-    description: `${quantity} ${creditType} credits`,
+    description: legacyCreditType && legacyCreditType !== ISEO_CREDIT_TYPE
+      ? `${quantity} ISEO credits (purchased as "${legacyCreditType}")`
+      : `${quantity} ISEO credits`,
     amountCents: typeof session.amount_total === 'number' ? session.amount_total : null,
     currency: session.currency || 'usd',
     providerEventId: claimId,
@@ -354,7 +363,9 @@ const createCheckoutSessionSchema = z.object({
 
 const buyCreditSchema = z.object({
   user_id: z.number(),
-  credit_type: z.enum(['images', 'content', 'keywords']),
+  // 'iseo' is the real pool. The three legacy labels are still accepted so a CMS that has not
+  // been redeployed keeps working; handleCreditTopup maps whatever arrives onto the pool.
+  credit_type: z.enum(['iseo', 'images', 'content', 'keywords']).default('iseo'),
   quantity: z.number().min(1).max(1000),
   success_url: z.string().url(),
   cancel_url: z.string().url()

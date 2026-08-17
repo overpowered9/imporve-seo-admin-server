@@ -24,6 +24,10 @@ import {
   DEFAULT_BLUEPRINT_DIRECTIVES,
   mergeDirectives,
 } from './content-blueprint.js';
+// Renders the user's optional regenerate-time steer as a delimited, subordinate block. Applied to
+// the USER message only — see buildAdditionalInstructionsBlock for why it never touches the system
+// prompt.
+import { buildAdditionalInstructionsBlock } from './generation-history.js';
 
 const promptService = new PromptManagementService();
 
@@ -57,6 +61,14 @@ export interface GenerateV2Params {
   humanize?: boolean;
   /** Fixed blueprint seed for reproducible structure (testing). */
   seed?: string;
+  /**
+   * Optional free-text steer supplied by the user for THIS generation (the regenerate popup).
+   *
+   * UNTRUSTED. Must already have passed sanitizeCustomInstruction() — the route does this. It is
+   * rendered into the USER prompt inside a delimited block that states it cannot override the
+   * output contract; it is never concatenated into a system prompt.
+   */
+  custom_instruction?: string;
 }
 
 export interface AudienceIntelligence {
@@ -433,7 +445,7 @@ PER-ARTICLE STRUCTURE BLUEPRINT (mandatory — follow exactly):
 ${directive}
 
 ${seoRules}
-Produce ALL required sections (Intro, Quick answer, the body sections, Key takeaways, Conclusion, FAQ, What's next). Remember the OUTPUT CONTRACT: article HTML, then ${TRAILER_DELIM}, then the JSON trailer.`;
+Produce ALL required sections (Intro, Quick answer, the body sections, Key takeaways, Conclusion, FAQ, What's next). Remember the OUTPUT CONTRACT: article HTML, then ${TRAILER_DELIM}, then the JSON trailer.${buildAdditionalInstructionsBlock(params.custom_instruction ?? null)}`;
 }
 
 function stripFences(s: string): string {

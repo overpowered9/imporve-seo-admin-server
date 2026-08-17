@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { findUserByApiKey, findWebsiteByCode, getUserCreditBalance, reconcileTrialCredits, touchWebsiteConnection } from '../models/user.models.js';
+import { findUserByApiKey, findWebsiteByCode, getUserCreditBalance, reconcileTrialCredits, touchWebsiteConnection, ISEO_CREDIT_TYPE } from '../models/user.models.js';
 
 export interface AuthenticatedRequest extends Request {
   user?: any;
@@ -73,7 +73,20 @@ export const validateApiAccess = async (req: AuthenticatedRequest, res: Response
   }
 };
 
-export const validateCredits = (creditType: 'images' | 'content' | 'keywords', requiredAmount: number = 1) => {
+/**
+ * Legacy pre-flight credit check, retained for the older generation routes only.
+ *
+ * ⚠️  NOT atomic: it reads the balance here and leaves the write to the end of the handler, so two
+ * concurrent requests can both pass it and both generate. The v2 money paths
+ * (/content-v2/article, /content-v2/image) no longer use it — they call reserveCredits(), where the
+ * check and the debit are one conditional UPDATE. Anything new must do the same.
+ *
+ * `creditType` is now only a LABEL for the error message. There is a single pool ('iseo'), so the
+ * balance is always read from it: passing the historical 'images' | 'content' | 'keywords' values
+ * would otherwise read rows that migration 011 deletes, and 402 every request on routes the plugin
+ * still depends on (notably /generate/generatekeyword).
+ */
+export const validateCredits = (creditType: 'images' | 'content' | 'keywords' | 'iseo', requiredAmount: number = 1) => {
   return async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     try {
       if (!req.user) {
@@ -94,7 +107,7 @@ export const validateCredits = (creditType: 'images' | 'content' | 'keywords', r
       // with an expired trial; after it runs, `amount` reflects purchased credits only.
       const trialExpired = await reconcileTrialCredits(req.user);
       if (trialExpired) {
-        const purchasedBalance = await getUserCreditBalance(req.user.id, creditType);
+        const purchasedBalance = await getUserCreditBalance(req.user.id, ISEO_CREDIT_TYPE);
         if (purchasedBalance < requiredAmount) {
           return res.status(402).json({
             success: false,
@@ -106,12 +119,12 @@ export const validateCredits = (creditType: 'images' | 'content' | 'keywords', r
         return next();
       }
 
-      const balance = await getUserCreditBalance(req.user.id, creditType);
+      const balance = await getUserCreditBalance(req.user.id, ISEO_CREDIT_TYPE);
       
       if (balance < requiredAmount) {
         return res.status(402).json({
           success: false,
-          error: `Insufficient ${creditType} credits. Required: ${requiredAmount}, Available: ${balance}`,
+          error: `Insufficient ISEO credits. Required: ${requiredAmount}, Available: ${balance}`,
           creditType,
           required: requiredAmount,
           available: balance

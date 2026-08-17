@@ -7,6 +7,8 @@ import { errorHandler } from './utils/error-handler.js';
 import { connectToDatabase } from './config/database.js';
 import adminPromptRoutes from './routes/admin/prompts.routes.js';
 import { requireAdmin } from './middleware/adminAuth.middleware.js';
+import { logCreditsConfigFingerprint } from './config/credits.config.js';
+import { startPlanCreditSync } from './services/billing/plan-credit-sync.js';
 import generationsRoutes from './routes/generations.routes.js';
 import { testConnection } from './data/db.js';
 import { startTrialEmailScheduler } from './services/trial-emails.service.js';
@@ -89,6 +91,15 @@ async function startServer() {
     }
     // Connect to MongoDB
     await connectToDatabase();
+
+    // Record WHICH price table this process is running. One hash line, not a price list — the
+    // values are integrity-sensitive and must not be printed. credits.config.ts has already
+    // thrown at import if any price was missing or malformed, so reaching here means it is valid.
+    logCreditsConfigFingerprint();
+
+    // subscription_plans.*_credits are derived from the env grants now. Best-effort refresh so the
+    // Stripe checkout descriptions and CMS plan tables that still read those columns stay truthful.
+    await startPlanCreditSync();
 
     // Start the trial-email drip scheduler (no-op unless TRIAL_EMAILS_ENABLED=true)
     startTrialEmailScheduler();

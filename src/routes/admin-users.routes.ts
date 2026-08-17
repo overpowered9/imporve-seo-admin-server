@@ -450,7 +450,9 @@ router.get('/:userId', async (req, res) => {
 // POST /admin/users/:userId/gift-credits - Manage credits for a user (add, remove, set)
 const giftCreditsSchema = z.object({
   operation: z.enum(['add', 'remove', 'set']),
-  credit_type: z.enum(['images', 'content', 'keywords']),
+  // One pool now. Legacy labels stay accepted so an un-updated admin panel keeps working; they
+  // are normalised to 'iseo' at the call site below.
+  credit_type: z.enum(['iseo', 'images', 'content', 'keywords']).default('iseo'),
   amount: z.number().int().min(0).max(10000),
   reason: z.string().min(1).max(500)
 }).refine(data => data.operation === 'set' || data.amount >= 1, {

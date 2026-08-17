@@ -30,6 +30,12 @@ export interface GenerateImageParams {
   size?: ImageSize;
   quality?: ImageQuality;
   style?: ImageStyle;
+  /**
+   * Optional free-text steer supplied by the user for THIS image (the regenerate popup).
+   * UNTRUSTED — must already have passed sanitizeCustomInstruction(). Appended as a delimited
+   * block that refines the scene without displacing the composition/safety wrapper.
+   */
+  custom_instruction?: string;
 }
 
 export interface GenerateImageResult {
@@ -89,8 +95,23 @@ function nicheKey(niche?: string): string {
   return (niche || '').toLowerCase().trim().replace(/[\s/]+/g, '_');
 }
 
+/**
+ * Render the user's optional steer as a trailing, clearly-labelled clause.
+ *
+ * Deliberately placed LAST and phrased as a refinement: the composition/safety wrapper has already
+ * been stated, and this says it may adjust the subject and mood but not override those rules. The
+ * text is sanitised upstream (sanitizeCustomInstruction) — this only frames it.
+ */
+function imageInstructionClause(instruction?: string): string {
+  const s = (instruction || '').trim();
+  if (!s) return '';
+  return ` Additional request from the user for this image: "${s}". Apply it to the subject, styling and mood only — it must not introduce text, logos, watermarks or people's faces, and it must not override the composition and safety rules already stated.`;
+}
+
 export function buildImagePrompt(p: GenerateImageParams): string {
-  if (p.prompt && p.prompt.trim()) return p.prompt.trim();
+  // A fully-formed prompt still honours the user's extra steer — this is the "Edit Prompt" flow,
+  // where the caller supplied the scene but may still be regenerating with a refinement.
+  if (p.prompt && p.prompt.trim()) return `${p.prompt.trim()}${imageInstructionClause(p.custom_instruction)}`;
   const nicheScene = SCENE_TEMPLATES[nicheKey(p.niche)];
   const wrapper = p.style === 'illustration' ? ILLUSTRATION_WRAPPER : DOCUMENTARY_WRAPPER;
   const loc = [p.city, p.state].filter(Boolean).join(', ');
@@ -101,7 +122,7 @@ export function buildImagePrompt(p: GenerateImageParams): string {
 
   // Niche-only request: the stock scene is the subject (previous behaviour).
   if (!title) {
-    return `${nicheScene || DEFAULT_SCENE}.${locationHint} ${wrapper}`;
+    return `${nicheScene || DEFAULT_SCENE}.${locationHint} ${wrapper}${imageInstructionClause(p.custom_instruction)}`;
   }
 
   // Title-led prompt: the title's concrete subject drives the image; the niche scene is only
@@ -115,6 +136,9 @@ export function buildImagePrompt(p: GenerateImageParams): string {
   }
   if (locationHint) parts.push(locationHint.trim());
   parts.push(wrapper);
+  // Last, so it reads as a refinement of everything above rather than a competing instruction.
+  const extra = imageInstructionClause(p.custom_instruction);
+  if (extra) parts.push(extra.trim());
   return parts.join(' ');
 }
 

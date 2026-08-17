@@ -2,9 +2,11 @@ import express, { type Response as ExpressResponse } from 'express';
 import { z } from 'zod';
 import sql from '../data/db.js';
 import { validateApiAccess } from '../middleware/apiAuth.middleware.js';
+import { publicPricing } from '../services/credit-pricing.js';
 import { 
   findUserByEmail,
   findUserByApiKey,
+  ISEO_CREDIT_TYPE,
   getUserCreditBalances,
   getUserWebsites,
   getUserWithPlan,
@@ -48,10 +50,14 @@ router.get('/status', validateApiAccess, async (req, res) => {
     // Get user subscription/plan details
     const subscription = await getUserSubscription(user.id);
 
+    const iseoBalance = credits.find(c => c.credit_type === ISEO_CREDIT_TYPE)?.amount || 0;
+
     // Per-type plan-vs-purchased breakdown, so clients (the plugin's connection panel)
     // can explain a balance instead of showing a bare number.
-    const detailFor = (t: 'images' | 'content' | 'keywords') => {
-      const c = credits.find(cr => cr.credit_type === t);
+    // One pool now, so every legacy label resolves to the SAME row. Kept as a function so the
+    // three compatibility keys below keep rendering for plugins/CMS builds that have not updated.
+    const detailFor = (_t: string) => {
+      const c = credits.find(cr => cr.credit_type === ISEO_CREDIT_TYPE);
       return {
         total: c?.amount ?? 0,
         plan_remaining: c?.included_remaining ?? 0,
@@ -72,10 +78,19 @@ router.get('/status', validateApiAccess, async (req, res) => {
       user: user.name || user.email,
       email: user.email,
       website: website?.domain,
+      // THE balance. One ISEO pool.
+      credits_total: iseoBalance,
+      // Pricing so a client can show what an action will cost BEFORE the user commits. Advisory
+      // only — the server reservation is the real gate and the client never states which price
+      // applies (regeneration is detected server-side).
+      pricing: publicPricing(),
+      // COMPATIBILITY SHIM — kept for one release so an un-updated plugin/CMS does not break.
+      // All three report the same pooled number rather than a third of it, so a legacy display
+      // shows what the user actually has. Remove once both consumers read credits_total.
       credits: {
-        images: credits.find(c => c.credit_type === 'images')?.amount || 0,
-        content: credits.find(c => c.credit_type === 'content')?.amount || 0,
-        keywords: credits.find(c => c.credit_type === 'keywords')?.amount || 0
+        images: iseoBalance,
+        content: iseoBalance,
+        keywords: iseoBalance
       },
       credit_details: {
         images: detailFor('images'),

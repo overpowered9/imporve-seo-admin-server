@@ -6,7 +6,8 @@ import { ConversationalAIContentGenerator } from '../services/conversational-ai-
 import { PromptManagementService } from '../services/prompt-management.service.js';
 import { PromptTemplate, PromptVersion } from '../models/prompt.models.js';
 import { validateApiAccess, validateCredits, AuthenticatedRequest } from '../middleware/apiAuth.middleware.js';
-import { deductCredits } from '../models/user.models.js';
+import { deductCredits, ISEO_CREDIT_TYPE } from '../models/user.models.js';
+import { priceOf } from '../services/credit-pricing.js';
 import sql from '../data/db.js';
 import { FluxAIService } from '../services/fluxai.service.js';
 import { chat } from '../services/openai.js';
@@ -427,7 +428,7 @@ router.get('/default-config', requireAdmin, async (req: Request, res: Response) 
  * Generate content using active prompts from database (focused approach)
  * POST /api/generate/active
  */
-router.post('/active', validateApiAccess, validateCredits('content', 1), async (req: AuthenticatedRequest, res: Response) => {
+router.post('/active', validateApiAccess, validateCredits('iseo', priceOf('content', 'medium')), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const {
       seed_keyword,
@@ -546,8 +547,8 @@ router.post('/active', validateApiAccess, validateCredits('content', 1), async (
     const truncatedKeyword = seed_keyword.substring(0, 200);
     await deductCredits(
       userId,
-      'content',
-      1,
+      ISEO_CREDIT_TYPE,
+      priceOf('content', 'medium'),
       `Content generation: ${truncatedKeyword}`,
       websiteId,
       generationId
@@ -812,7 +813,7 @@ router.post('/immediateVersionTesting', requireAdmin, async (req: Request, res: 
  * 
  * POST /api/v1/generate/conversational
  */
-router.post('/conversational', validateApiAccess, validateCredits('content', 1), async (req: AuthenticatedRequest, res: Response) => {
+router.post('/conversational', validateApiAccess, validateCredits('iseo', priceOf('content', 'medium')), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const {
       seed_keyword,
@@ -934,8 +935,8 @@ router.post('/conversational', validateApiAccess, validateCredits('content', 1),
     const truncatedKeyword = seed_keyword.substring(0, 200);
     await deductCredits(
       userId,
-      'content',
-      1,
+      ISEO_CREDIT_TYPE,
+      priceOf('content', 'medium'),
       `Conversational content: ${truncatedKeyword}`,
       websiteId,
       generationId
@@ -971,7 +972,7 @@ router.post('/conversational', validateApiAccess, validateCredits('content', 1),
  * Generate AI Image
  * POST /api/v1/generate/generateimage
  */
-router.post('/generateimage', validateApiAccess, validateCredits('images', 1), async (req: AuthenticatedRequest, res: Response) => {
+router.post('/generateimage', validateApiAccess, validateCredits('iseo', priceOf('image')), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const {
       title,
@@ -1082,8 +1083,8 @@ router.post('/generateimage', validateApiAccess, validateCredits('images', 1), a
     const truncatedTitle = (title || prompt || '').substring(0, 200);
     await deductCredits(
       userId,
-      'images',
-      1,
+      ISEO_CREDIT_TYPE,
+      priceOf('image'),
       `AI image generation: ${truncatedTitle}`,
       websiteId,
       generationId
@@ -1118,7 +1119,7 @@ router.post('/generateimage', validateApiAccess, validateCredits('images', 1), a
  * Generate Keyword List
  * POST /api/v1/generate/generatekeyword
  */
-router.post('/generatekeyword', validateApiAccess, validateCredits('keywords', 1), async (req: AuthenticatedRequest, res: Response) => {
+router.post('/generatekeyword', validateApiAccess, validateCredits('iseo', priceOf('keywords')), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const {
       seed_keyword,
@@ -1210,8 +1211,8 @@ Output rules: one keyword per line, lowercase, no numbering, no bullets, no quot
     const truncatedKeyword = seed.substring(0, 200);
     await deductCredits(
       userId,
-      'keywords',
-      1,
+      ISEO_CREDIT_TYPE,
+      priceOf('keywords'),
       `Keyword research: ${truncatedKeyword}`,
       websiteId,
       generationId
@@ -1248,7 +1249,7 @@ Output rules: one keyword per line, lowercase, no numbering, no bullets, no quot
  * (which deducts atomically). Kept for older plugin installs that still scrape
  * Google Suggest in the browser and report usage here.
  */
-router.post('/generatekeywordded', validateApiAccess, validateCredits('keywords', 1), async (req: AuthenticatedRequest, res: Response) => {
+router.post('/generatekeywordded', validateApiAccess, validateCredits('iseo', priceOf('keywords')), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const {
       seed_keyword,
@@ -1301,8 +1302,8 @@ router.post('/generatekeywordded', validateApiAccess, validateCredits('keywords'
     const truncatedReason = (reason || `Plugin keyword: ${truncatedKeyword}`).substring(0, 240);
     await deductCredits(
       userId,
-      'keywords',
-      count,
+      ISEO_CREDIT_TYPE,
+      count * priceOf('keywords'),
       truncatedReason,
       websiteId,
       generationId
