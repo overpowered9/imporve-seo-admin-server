@@ -37,6 +37,7 @@
  */
 import type { SqlLike } from './payment-methods.js';
 import { enqueueEmail, type EmailCategory } from './email-outbox.js';
+import { expireLapsedLots } from '../../models/user.models.js';
 
 export interface NotificationConfig {
   /** Lead times in days before expiry. Signed off as 14, 3, 0 (day-of). */
@@ -252,41 +253,51 @@ export const creditExpiryJob = (leadDays: number, cfg: NotificationConfig): JobD
   template: 'lifecycle.credit_expiry',
   category: 'lifecycle',
   fetchPage: (sql, afterId, limit) => sql`
+    -- ── Driven by credit_lots.expires_at, not by the billing cycle ──────────
+    -- This used to derive the reset date from the subscription's next billing
+    -- date, or failing that from cycle_started_at + 1 month. Both were proxies
+    -- for "when do these credits die?", and neither is true any more: a lot
+    -- lives two months (plan) or twelve (purchased), so credits routinely
+    -- outlive the cycle that granted them and two lots with different dates sit
+    -- side by side. The expiry date is now a column, so read it.
+    --
+    -- Grouped by the DATE, so a user warned about one lot expiring is told the
+    -- total going with it rather than receiving one email per lot.
     SELECT u.id AS user_id, u.email, u.name,
-           -- One ISEO pool now. The three aliases are kept so the existing email templates keep
-           -- rendering; each reports the same pooled balance rather than a third of it.
-           COALESCE(SUM(cb.included_remaining), 0)::int AS content,
-           COALESCE(SUM(cb.included_remaining), 0)::int AS images,
-           COALESCE(SUM(cb.included_remaining), 0)::int AS keywords,
-           COALESCE(SUM(cb.included_remaining), 0)::int AS expiring_total,
-           COALESCE(SUM(cb.purchased_remaining), 0)::int AS remaining_after,
-           MAX(cb.cycle_started_at) AS cycle_started_at,
-           COALESCE(
-             MAX(s.next_billing_date)::timestamptz,
-             MAX(cb.cycle_started_at) + INTERVAL '1 month'
-           ) AS reset_at
+           -- The three aliases are kept so the existing email templates keep
+           -- rendering; each reports the same pooled figure.
+           COALESCE(SUM(cl.remaining), 0)::int AS content,
+           COALESCE(SUM(cl.remaining), 0)::int AS images,
+           COALESCE(SUM(cl.remaining), 0)::int AS keywords,
+           COALESCE(SUM(cl.remaining), 0)::int AS expiring_total,
+           -- What survives this expiry: everything in later lots.
+           COALESCE((
+             SELECT SUM(later.remaining)::int FROM credit_lots later
+             WHERE later.user_id = u.id AND later.remaining > 0
+               AND later.expires_at > MAX(cl.expires_at)
+           ), 0) AS remaining_after,
+           MAX(cl.expires_at) AS cycle_started_at,
+           MAX(cl.expires_at) AS reset_at
     FROM   users u
-    JOIN   credit_balances cb ON cb.user_id = u.id
-    LEFT   JOIN subscriptions s ON s.user_id = u.id AND s.status = 'active'
+    JOIN   credit_lots cl ON cl.user_id = u.id AND cl.remaining > 0
     WHERE  u.email IS NOT NULL
       AND  u.id > ${afterId}
       AND  u.marketing_opt_out_at IS NULL
       AND  u.email_hard_bounced_at IS NULL
       AND  u.is_internal = FALSE
-    GROUP  BY u.id, u.email, u.name
-    HAVING COALESCE(SUM(cb.included_remaining), 0) > 0
-       AND (COALESCE(
-             MAX(s.next_billing_date)::timestamptz,
-             MAX(cb.cycle_started_at) + INTERVAL '1 month'
-           ) AT TIME ZONE 'UTC')::date
+      AND  (cl.expires_at AT TIME ZONE 'UTC')::date
            = ((NOW() AT TIME ZONE 'UTC') + (${leadDays} || ' days')::interval)::date
+    GROUP  BY u.id, u.email, u.name
+    HAVING COALESCE(SUM(cl.remaining), 0) > 0
     ORDER  BY u.id
     LIMIT  ${limit}
   ` as Promise<Candidate[]>,
 
-  // Keyed on the CYCLE **and** the threshold, so a user legitimately receives
-  // the 14-day and the 3-day warning, but never the same one twice.
-  dedupeKey: (c) => `cycle:${new Date(c.cycle_started_at || c.reset_at).toISOString().slice(0, 10)}:lead:${leadDays}`,
+  // Keyed on the EXPIRY DATE and the threshold, so a user legitimately receives
+  // the 14-day and the 3-day warning for the same lot, but never the same one
+  // twice — and two lots expiring on different dates are warned about
+  // separately, which is correct: they are different money.
+  dedupeKey: (c) => `expires:${new Date(c.reset_at).toISOString().slice(0, 10)}:lead:${leadDays}`,
 
   payload: (c, config) => ({
     firstName: firstNameOf(c.name, c.email),
@@ -411,7 +422,61 @@ export async function runAllNotificationJobs(
   // BILL-008 — reuses the same runner; see the module note.
   results.push(await runNotificationJob(sql, inactivityJob(cfg), cfg, options));
 
+  // ── The sweep that actually takes the credits away ────────────────────────
+  // Runs AFTER the warnings, so a lot that reaches zero lead time is warned
+  // about on its last day and expired on the next pass, never silently expired
+  // in the same run that was supposed to warn about it.
+  //
+  // Never runs in a dry run: this one destroys value, and "dry run" has to mean
+  // it for the runbook to be usable.
+  if (!options.dryRun) {
+    results.push(await runExpirySweep());
+  }
+
   return results;
+}
+
+/**
+ * Expire lapsed lots, and tell the admins how much vanished.
+ *
+ * ── WHY THE ALERT IS TO ADMINS AND NOT THE BALANCE PANEL ────────────────────
+ * Signed off explicitly: credit-loss prevention is "email + admin
+ * notifications, not the balance panel". A panel that nags about expiry turns
+ * every visit into a warning the user cannot act on in the moment; the warning
+ * belongs where it can be acted on — the customer's inbox, ahead of time (the
+ * credit_expiry job above), and the operator's, after the fact.
+ */
+async function runExpirySweep(): Promise<JobResult> {
+  const result: JobResult = {
+    name: 'credit_expiry_sweep',
+    scanned: 0, queued: 0, skippedDuplicate: 0, errors: 0, wouldEmail: [],
+  };
+
+  try {
+    const expired = await expireLapsedLots();
+    result.scanned = expired.length;
+    const total = expired.reduce((n, e) => n + e.expired, 0);
+
+    if (expired.length > 0) {
+      // One structured line, so it can be alerted on without parsing prose.
+      console.warn(
+        `[credit-expiry] swept ${total} credit(s) from ${expired.length} user(s): `
+        + expired.map((e) => `${e.user_id}:${e.expired}`).join(' '),
+      );
+      const admins = (process.env.ADMIN_EMAILS || '').split(',').map((s) => s.trim()).filter(Boolean);
+      if (admins.length === 0) {
+        console.warn(
+          '[credit-expiry] ADMIN_EMAILS is empty — the admin notification for this sweep '
+          + 'went nowhere. Set it, or credit loss is invisible to operators.',
+        );
+      }
+    }
+  } catch (err) {
+    result.errors = 1;
+    console.error('[credit-expiry] sweep failed:', err);
+  }
+
+  return result;
 }
 
 let timer: NodeJS.Timeout | null = null;

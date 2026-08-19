@@ -34,6 +34,49 @@
 import type Stripe from 'stripe';
 import type { SqlLike } from './payment-methods.js';
 
+/**
+ * The statuses under which a paid plan is still RUNNING.
+ *
+ * ── WHY THIS IS A SHARED CONSTANT ───────────────────────────────────────────
+ * This set has now been got wrong FOUR separate times, each time by someone
+ * writing the list out again and omitting a member:
+ *
+ *   • `trialing` omitted → a customer who upgraded mid-trial was labelled
+ *     "Free Trial" and shown free-tier wording on a paid plan.
+ *   • `pending_downgrade` omitted in the CMS → a cancelled subscription read
+ *     "NEXT BILLING" instead of "PLAN ENDS", offered Cancel on something
+ *     already cancelling, and hid the only route back (Reactivate).
+ *   • `pending_downgrade` omitted in the credit-expiry job → warnings timed off
+ *     the credit cycle instead of the real billing date.
+ *   • `pending_downgrade` omitted below → the cancellation banner vanished for
+ *     anyone holding a queued downgrade.
+ *
+ * Four bugs, one cause: a list that is data was written as a literal, four
+ * times. Every consumer imports THIS now, so adding a status is one edit rather
+ * than a hunt for copies.
+ *
+ * `pending_downgrade` belongs here — the plan runs normally, only its FUTURE
+ * plan is settled. `past_due` belongs — the plan has not lapsed, a payment
+ * failed. Ended states live in ENDED_SUBSCRIPTION_STATUSES.
+ */
+export const LIVE_SUBSCRIPTION_STATUSES: readonly string[] = Object.freeze([
+  'active',
+  'trialing',
+  'past_due',
+  'pending_downgrade',
+]);
+
+/** Statuses meaning the plan is no longer running. */
+export const ENDED_SUBSCRIPTION_STATUSES: readonly string[] = Object.freeze([
+  'cancelled',
+  'canceled',
+  'paused',
+]);
+
+/** Is this subscription still running? Case-insensitive and null-safe. */
+export const isLiveStatus = (status: string | null | undefined): boolean =>
+  LIVE_SUBSCRIPTION_STATUSES.includes(String(status || '').trim().toLowerCase());
+
 export interface SubscriptionStateInput {
   status?: string | null;
   cancel_at_period_end?: boolean | null;
@@ -65,7 +108,10 @@ export function deriveCancellationBanner(
   // cancelled. Showing a future-tense banner there is the inverse error.
   const status = (sub.status || '').toLowerCase();
   if (status === 'cancelled' || status === 'canceled') return hide('already cancelled');
-  if (status !== 'active' && status !== 'trialing' && status !== 'past_due') {
+  // Uses the shared set — this line previously spelled the statuses out and
+  // omitted `pending_downgrade`, so a user who cancelled and then queued a
+  // downgrade saw no cancellation banner at all.
+  if (!isLiveStatus(status)) {
     return hide(`status is ${status || 'unknown'}`);
   }
 

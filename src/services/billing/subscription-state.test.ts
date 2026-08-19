@@ -14,13 +14,57 @@ import {
   releaseOrphanedSchedules,
   clearScheduledCancellation,
   diffSubscriptionState,
+  isLiveStatus,
+  LIVE_SUBSCRIPTION_STATUSES,
 } from './subscription-state.js';
 
 const NOW = new Date('2026-08-10T12:00:00Z');
 const FUTURE = '2026-09-02T00:00:00Z';
 const PAST = '2026-08-01T00:00:00Z';
 
+// ── The set that has now been got wrong four times ─────────────────────────
+// Every omission produced a different-looking bug (a paid plan labelled "Free
+// Trial", a cancelled plan reading "NEXT BILLING", expiry warnings on the wrong
+// day, a vanishing cancellation banner). Pinning the membership here is what
+// makes the fifth omission a failing test rather than another support ticket.
+describe('LIVE_SUBSCRIPTION_STATUSES', () => {
+  test('contains every status under which a plan is still running', () => {
+    for (const s of ['active', 'trialing', 'past_due', 'pending_downgrade']) {
+      assert.ok(isLiveStatus(s), `${s} must count as live`);
+    }
+  });
+
+  test('excludes the ended states', () => {
+    for (const s of ['cancelled', 'canceled', 'paused']) {
+      assert.ok(!isLiveStatus(s), `${s} must not count as live`);
+    }
+  });
+
+  test('is null-safe and case-insensitive', () => {
+    assert.ok(isLiveStatus('ACTIVE'));
+    assert.ok(isLiveStatus('  Pending_Downgrade '));
+    assert.ok(!isLiveStatus(null));
+    assert.ok(!isLiveStatus(undefined));
+    assert.ok(!isLiveStatus(''));
+  });
+
+  test('is frozen — no consumer can mutate the shared set', () => {
+    assert.ok(Object.isFrozen(LIVE_SUBSCRIPTION_STATUSES));
+  });
+});
+
 describe('deriveCancellationBanner', () => {
+  test('REGRESSION: shows for a cancelling subscription with a queued downgrade', () => {
+    // status 'pending_downgrade' used to fall through the hardcoded status
+    // list, so a user who cancelled and then queued a downgrade saw no
+    // cancellation banner at all — the plan was ending and nothing said so.
+    const r = deriveCancellationBanner(
+      { status: 'pending_downgrade', cancel_at_period_end: true, next_billing_date: FUTURE },
+      NOW,
+    );
+    assert.equal(r.visible, true);
+  });
+
   test('shows for an active subscription cancelling in the future', () => {
     const banner = deriveCancellationBanner(
       { status: 'active', cancel_at_period_end: true, next_billing_date: FUTURE },

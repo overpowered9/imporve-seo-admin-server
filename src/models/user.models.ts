@@ -1,7 +1,11 @@
 import sql from '../data/db.js';
 import crypto from 'crypto';
 import bcrypt from 'bcrypt';
-import { grantForPlanSlug } from '../config/credits.config.js';
+import {
+  grantForPlanSlug,
+  PLAN_CREDIT_LIFETIME_MONTHS,
+  PURCHASED_CREDIT_LIFETIME_MONTHS,
+} from '../config/credits.config.js';
 export interface User {
   id: number;
   email: string;
@@ -373,16 +377,34 @@ export const refillPlanCredits = async (user_id: number, plan: any, reason = 'Pl
   await sql.begin(async sql => {
     for (const creditType of CREDIT_TYPES) {
       const allotment = planAllotment(plan, creditType);
+
+      // ── The refill no longer WIPES the previous cycle's credits ────────────
+      // It used to set included_remaining = allotment, which meant last
+      // month's unused plan credits vanished the instant the new grant landed.
+      // Under a two-month life they are still the customer's to spend, so the
+      // new grant is an additional LOT and the old one lives out its term.
+      // Whichever expires first is spent first; see burnFromLots.
+      await sql`
+        INSERT INTO credit_lots (user_id, source, granted, remaining, expires_at, plan_id, reason)
+        VALUES (${user_id}, 'plan', ${allotment}, ${allotment},
+                NOW() + ${`${PLAN_CREDIT_LIFETIME_MONTHS} months`}::interval,
+                ${plan?.id ?? null}, ${reason})
+      `;
+
+      // included_allotment stays the plan's headline number (what a cycle
+      // grants), which is what the usage bar and the upgrade bump compare
+      // against; the spendable figure is re-derived from the lots.
       await sql`
         INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
         VALUES (${user_id}, ${creditType}, ${allotment}, ${allotment}, 0, NOW())
         ON CONFLICT (user_id, credit_type)
         DO UPDATE SET
-          included_remaining = ${allotment},
           included_allotment = ${allotment},
           cycle_started_at   = NOW(),
           updated_at         = NOW()
       `;
+      await syncBalanceCache(sql, user_id);
+
       await sql`
         INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
         VALUES (${user_id}, ${creditType}, ${allotment}, ${reason})
@@ -402,14 +424,19 @@ export const addPurchasedCredits = async (
   reason = 'Credit purchase'
 ): Promise<void> => {
   await sql.begin(async sql => {
+    // A purchase is its own lot on the 12-month lifetime, so two top-ups bought
+    // months apart expire months apart rather than sharing one date.
+    await sql`
+      INSERT INTO credit_lots (user_id, source, granted, remaining, expires_at, reason)
+      VALUES (${user_id}, 'purchased', ${quantity}, ${quantity},
+              NOW() + ${`${PURCHASED_CREDIT_LIFETIME_MONTHS} months`}::interval, ${reason})
+    `;
     await sql`
       INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
-      VALUES (${user_id}, ${credit_type}, 0, 0, ${quantity}, NOW())
-      ON CONFLICT (user_id, credit_type)
-      DO UPDATE SET
-        purchased_remaining = credit_balances.purchased_remaining + ${quantity},
-        updated_at = NOW()
+      VALUES (${user_id}, ${credit_type}, 0, 0, 0, NOW())
+      ON CONFLICT (user_id, credit_type) DO NOTHING
     `;
+    await syncBalanceCache(sql, user_id);
     await sql`
       INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
       VALUES (${user_id}, ${credit_type}, ${quantity}, ${reason})
@@ -449,7 +476,16 @@ export const upgradeIncludedCredits = async (
   user_id: number,
   newPlan: any,
   reason = 'Plan upgrade',
-  prorationFactor: number = 1
+  prorationFactor: number = 1,
+  /**
+   * The plan the user is coming FROM.
+   *
+   * Passed in rather than looked up, because changePlan writes users.plan_id to
+   * the NEW plan before calling this — so reading the current plan here would
+   * compare the new plan against itself and grant a difference of zero. The
+   * caller is the only one that still knows the previous plan by this point.
+   */
+  previousPlanSlug?: string | null,
 ): Promise<void> => {
   // Guard the factor — a bad cycle date must never invert or inflate a grant.
   const factor = Number.isFinite(prorationFactor)
@@ -459,32 +495,42 @@ export const upgradeIncludedCredits = async (
   await sql.begin(async sql => {
     for (const creditType of CREDIT_TYPES) {
       const newAllotment = planAllotment(newPlan, creditType);
-      const rows = await sql`
-        SELECT included_allotment FROM credit_balances
-        WHERE user_id = ${user_id} AND credit_type = ${creditType}
-        LIMIT 1
-      `;
-      const oldAllotment = rows.length > 0 ? Number(rows[0].included_allotment) : 0;
+
+      // From the PLAN, not from credit_balances.included_allotment — see
+      // previewUpgradeCreditGrant for why that cached column cannot be trusted
+      // to decide money. Both functions must read the same source, or the
+      // figure disclosed before the upgrade stops matching the one granted
+      // after it.
+      const oldAllotment = previousPlanSlug ? grantForPlanSlug(previousPlanSlug) : 0;
       const fullDifference = Math.max(0, newAllotment - oldAllotment);
 
       // OLD (always the full difference, regardless of when in the cycle):
       // const bump = Math.max(0, newAllotment - oldAllotment);
       //
-      // Round rather than floor so a genuine upgrade never grants 0 credits
-      // near the end of a cycle; a paid upgrade should always give something.
-      const bump = fullDifference > 0
-        ? Math.max(1, Math.round(fullDifference * factor))
-        : 0;
+      // The arithmetic moved to creditBumpFor so that the confirmation dialog
+      // can state this number BEFORE the upgrade and be certain it matches what
+      // is granted after it. Two copies of a rounding rule is two answers.
+      const bump = creditBumpFor(fullDifference, factor);
 
+      // The upgrade difference is its own plan lot, on the normal plan
+      // lifetime — mid-cycle extra credits should not outlive the cycle's own.
+      if (bump > 0) {
+        await sql`
+          INSERT INTO credit_lots (user_id, source, granted, remaining, expires_at, plan_id, reason)
+          VALUES (${user_id}, 'plan', ${bump}, ${bump},
+                  NOW() + ${`${PLAN_CREDIT_LIFETIME_MONTHS} months`}::interval,
+                  ${newPlan?.id ?? null}, ${reason})
+        `;
+      }
       await sql`
         INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
-        VALUES (${user_id}, ${creditType}, ${bump}, ${newAllotment}, 0, NOW())
+        VALUES (${user_id}, ${creditType}, 0, ${newAllotment}, 0, NOW())
         ON CONFLICT (user_id, credit_type)
         DO UPDATE SET
           included_allotment = ${newAllotment},
-          included_remaining = credit_balances.included_remaining + ${bump},
           updated_at = NOW()
       `;
+      await syncBalanceCache(sql, user_id);
       if (bump > 0) {
         // Record what was actually granted AND why it differs from the headline
         // plan difference, so support can explain a bill without re-deriving it.
@@ -519,6 +565,115 @@ export const remainingCycleFraction = (
   if (now >= end) return 0;
   if (now <= start) return 1;
   return (end - now) / (end - start);
+};
+
+/**
+ * How many credits an upgrade adds today, given the whole-cycle difference and
+ * how much of the cycle is left.
+ *
+ * Extracted so the DISCLOSURE and the GRANT run the same line of code. The
+ * confirmation dialog now states this figure before the customer agrees, and a
+ * second implementation of the rounding rule is a second answer that can
+ * disagree with the first — the same reason no money figure in this codebase is
+ * computed twice.
+ *
+ * Rounds rather than floors so a genuine upgrade never grants 0 credits near
+ * the end of a cycle; a paid upgrade should always give something.
+ */
+export const creditBumpFor = (fullDifference: number, prorationFactor: number): number => {
+  // Guard the factor — a bad cycle date must never invert or inflate a grant.
+  const factor = Number.isFinite(prorationFactor)
+    ? Math.min(1, Math.max(0, prorationFactor))
+    : 1;
+  return fullDifference > 0 ? Math.max(1, Math.round(fullDifference * factor)) : 0;
+};
+
+/**
+ * Is the prorated credit grant switched on?
+ *
+ * ── FLAG: BILLING_PRORATED_CREDITS_ENABLED ─────────────────────────────────
+ * Prorating changes how many credits a paying customer receives, so it stays
+ * OFF until verified against a real billing cycle. Off = the previous behaviour
+ * exactly: the full plan difference, granted regardless of cycle position.
+ *
+ * Read through ONE function so the preview and the commit cannot end up on
+ * opposite sides of the flag — which would have the dialog promise a prorated
+ * figure while the grant handed out the full one, or vice versa.
+ */
+export const proratedCreditsEnabled = (): boolean =>
+  String(process.env.BILLING_PRORATED_CREDITS_ENABLED || '').toLowerCase() === 'true';
+
+/** What an upgrade will do to the credit balance. */
+export interface UpgradeCreditGrant {
+  /** Credits added to the balance today. */
+  granted_now: number;
+  /** What a full cycle's difference would have been. */
+  full_difference: number;
+  /** Monthly allotment after the change. */
+  new_allotment: number;
+  /** Monthly allotment before it. */
+  previous_allotment: number;
+  /** True when granted_now was scaled down for the part-cycle. */
+  prorated: boolean;
+}
+
+/**
+ * Work out what changePlan WOULD grant, without granting anything.
+ *
+ * The read-only twin of the grant inside upgradeIncludedCredits, sharing its
+ * allotment lookup, its proration factor and its rounding. Exists so BILL-003's
+ * "tell them before you charge them" extends to what they RECEIVE, not just
+ * what they pay: an upgrade that costs a prorated $8.40 and quietly grants a
+ * prorated share of the credits was disclosing half the transaction.
+ */
+export const previewUpgradeCreditGrant = async (
+  user_id: number,
+  newPlan: any,
+  cycleEnd: Date | string | null | undefined,
+): Promise<UpgradeCreditGrant> => {
+  const creditType = ISEO_CREDIT_TYPE;
+  const newAllotment = planAllotment(newPlan, creditType);
+
+  const rows = await sql`
+    SELECT cb.cycle_started_at, sp.slug AS current_plan_slug
+    FROM   credit_balances cb
+    LEFT   JOIN users u ON u.id = cb.user_id
+    LEFT   JOIN subscription_plans sp ON sp.id = u.plan_id
+    WHERE  cb.user_id = ${user_id} AND cb.credit_type = ${creditType}
+    LIMIT  1
+  `;
+
+  // ── Measured against the PLAN, not against a cached column ────────────────
+  // This used to read credit_balances.included_allotment. That column is a
+  // cached copy of the plan's grant, and it drifts: user 1 was on Pro with the
+  // column reading 0, so an upgrade preview offered the FULL 1150 rather than
+  // the difference. Stale in the other direction it under-grants, which is how
+  // a grow→optimize→scale sequence appeared to count only the last step.
+  //
+  // grantForPlanSlug is the same function the monthly refill uses to decide the
+  // allotment in the first place, so the difference is now derived from the
+  // same source of truth as the grant it is a difference of.
+  const previousAllotment = rows[0]?.current_plan_slug
+    ? grantForPlanSlug(rows[0].current_plan_slug)
+    : 0;
+  const fullDifference = Math.max(0, newAllotment - previousAllotment);
+
+  const factor = proratedCreditsEnabled()
+    ? remainingCycleFraction(rows[0]?.cycle_started_at, cycleEnd)
+    : 1;
+
+  const grantedNow = creditBumpFor(fullDifference, factor);
+
+  return {
+    granted_now: grantedNow,
+    full_difference: fullDifference,
+    new_allotment: newAllotment,
+    previous_allotment: previousAllotment,
+    // Only claim proration when it actually reduced the grant — a mid-cycle
+    // upgrade at factor 1.0, or one where rounding lands on the full figure,
+    // must not be labelled "prorated" when nothing was taken off.
+    prorated: grantedNow < fullDifference,
+  };
 };
 
 /**
@@ -650,6 +805,11 @@ export const changePlan = async (
     throw new Error('No active subscription found');
   }
 
+  // Captured BEFORE the transaction below writes users.plan_id to the new plan.
+  // After that write, nothing else in this function can still say what the user
+  // was upgrading FROM, and the credit difference depends on it.
+  const previousPlanSlug: string | null = currentSub.plan_slug ?? null;
+
   if (immediate) {
     // UPGRADE: Immediate effect + raise included allotment / grant the difference now.
     await sql.begin(async sql => {
@@ -698,28 +858,34 @@ export const changePlan = async (
         ORDER BY cycle_started_at DESC
         LIMIT 1
       `;
-      // ── FLAG: BILLING_PRORATED_CREDITS_ENABLED ───────────────────────────
-      // Prorating the grant changes how many credits a paying customer
-      // receives, so it stays OFF until it has been verified against a real
-      // billing cycle. Off = the previous behaviour exactly: the full plan
-      // difference, granted regardless of cycle position.
-      //
-      // Turn it on only after confirming, on a test account mid-cycle, that
-      // the credits granted line up with the prorated amount charged.
-      const prorateCredits = String(process.env.BILLING_PRORATED_CREDITS_ENABLED || '').toLowerCase() === 'true';
-      const factor = prorateCredits
+      // The flag is read through proratedCreditsEnabled() so this path and the
+      // preview that quoted the customer cannot land on opposite sides of it.
+      const factor = proratedCreditsEnabled()
         ? remainingCycleFraction(cycleRows[0]?.cycle_started_at, currentSub.next_billing_date)
         : 1;
-      await upgradeIncludedCredits(user_id, newPlan[0], 'Plan upgrade credit bonus', factor);
+      await upgradeIncludedCredits(
+        user_id, newPlan[0], 'Plan upgrade credit bonus', factor, previousPlanSlug,
+      );
     }
   } else {
-    // DOWNGRADE: Schedule for next billing date
+    // DOWNGRADE: Schedule for next billing date.
+    //
+    // cancel_at_period_end is cleared here for the same reason the upgrade
+    // branch clears it: choosing a plan to move TO is a statement that the
+    // customer is staying. Leaving it set produced a subscription that was
+    // simultaneously "changing to Grow next month" and "ending next month" —
+    // contradictory data that the CMS then had to render, and the state real
+    // accounts were found sitting in.
+    //
+    // OLD (pending_plan_id and status only):
+    //   SET pending_plan_id = …, pending_plan_effective_date = …, status = …
     await sql`
       UPDATE subscriptions
       SET
         pending_plan_id = ${new_plan_id},
         pending_plan_effective_date = next_billing_date,
-        status = 'pending_downgrade'
+        status = 'pending_downgrade',
+        cancel_at_period_end = FALSE
       WHERE user_id = ${user_id}
     `;
   }
@@ -843,25 +1009,15 @@ export const deductCredits = async (
   generation_id?: number
 ) => {
   await sql.begin(async sql => {
-    // Drain PLAN (included) credits first so the expiring allotment is used before the
-    // purchased credits the user paid extra for. Any remainder comes out of purchased.
-    const rows = await sql`
-      SELECT included_remaining, purchased_remaining FROM credit_balances
-      WHERE user_id = ${user_id} AND credit_type = ${credit_type}
-      LIMIT 1
-    `;
-    const included = rows.length > 0 ? Number(rows[0].included_remaining) : 0;
-    const fromIncluded = Math.min(included, amount);
-    const fromPurchased = amount - fromIncluded;
-
-    await sql`
-      UPDATE credit_balances
-      SET
-        included_remaining  = included_remaining - ${fromIncluded},
-        purchased_remaining = purchased_remaining - ${fromPurchased},
-        updated_at = NOW()
-      WHERE user_id = ${user_id} AND credit_type = ${credit_type}
-    `;
+    // Earliest-expiring lot first — see burnFromLots for why bucket order is no
+    // longer the same thing as expiry order.
+    //
+    // Unlike reserveCredits this path does not refuse when short: it is the
+    // legacy settle-after-work caller, and failing here would mean work already
+    // done and not paid for. burnFromLots spends what it can and the shortfall
+    // is visible in the ledger.
+    await burnFromLots(sql, user_id, amount);
+    await syncBalanceCache(sql, user_id);
 
     // Log transaction with website_id and generation_id
     await sql`
@@ -886,6 +1042,230 @@ export interface ReserveResult {
   included_remaining: number;
   purchased_remaining: number;
 }
+
+/** What a user actually holds, by lot, after expiry is applied. */
+export interface LiveBalance {
+  total: number;
+  plan: number;
+  purchased: number;
+  /** The soonest expiry among live lots, for the balance panel. */
+  next_expiry_at: Date | null;
+  next_expiry_amount: number;
+}
+
+/**
+ * Spend `amount`, earliest-expiring lot first (FEFO).
+ *
+ * ── WHY THE ORDER IS NOT "PLAN, THEN PURCHASED" ─────────────────────────────
+ * That was the old rule, and it was a stand-in for this one: plan credits used
+ * to be the only ones that expired, so draining them first happened to spend
+ * the perishable stock first. Once purchased credits expire too — and once a
+ * two-month plan life means a user routinely holds TWO plan grants with
+ * different dates — bucket order and expiry order stop agreeing, and spending
+ * by bucket would let a customer's older credits lapse while their newer ones
+ * were spent. Ordering by expires_at is the rule the product actually promises.
+ *
+ * ── WHY IT IS SAFE UNDER CONCURRENCY ────────────────────────────────────────
+ * Each lot is decremented by a single conditional UPDATE whose WHERE clause is
+ * the affordability check for that lot, so two concurrent burns cannot both
+ * claim the same credits — the loser simply sees fewer rows and moves to the
+ * next lot. The whole walk runs inside the caller's transaction, so a burn that
+ * cannot be completed rolls back rather than leaving a partial debit. This
+ * preserves the property reserveCredits was written for; see its docblock.
+ *
+ * Returns ok:false having changed nothing when the balance is short.
+ */
+async function burnFromLots(
+  tx: any,
+  user_id: number,
+  amount: number,
+): Promise<{ ok: boolean; plan_remaining: number; purchased_remaining: number }> {
+  // Lock the candidate lots so a concurrent burn cannot read the same rows and
+  // double-spend them. FOR UPDATE is what makes the read-then-write below safe;
+  // the per-lot WHERE guard is the second line of defence.
+  const lots = (await tx`
+    SELECT id, remaining
+    FROM   credit_lots
+    WHERE  user_id = ${user_id} AND remaining > 0 AND expires_at > NOW()
+    ORDER  BY expires_at ASC, id ASC
+    FOR UPDATE
+  `) as unknown as Array<{ id: number; remaining: number }>;
+
+  const available = lots.reduce((n, l) => n + Number(l.remaining), 0);
+  if (available < amount) {
+    return { ok: false, plan_remaining: 0, purchased_remaining: 0 };
+  }
+
+  let outstanding = amount;
+  for (const lot of lots) {
+    if (outstanding <= 0) break;
+    const take = Math.min(Number(lot.remaining), outstanding);
+    await tx`
+      UPDATE credit_lots
+      SET remaining = remaining - ${take}, updated_at = NOW()
+      WHERE id = ${lot.id} AND remaining >= ${take}
+    `;
+    outstanding -= take;
+  }
+
+  const after = (await tx`
+    SELECT source, COALESCE(SUM(remaining), 0)::int AS n
+    FROM   credit_lots
+    WHERE  user_id = ${user_id} AND remaining > 0 AND expires_at > NOW()
+    GROUP  BY source
+  `) as unknown as Array<{ source: string; n: number }>;
+
+  const bySource = (s: string) => Number(after.find((r) => r.source === s)?.n ?? 0);
+  return { ok: true, plan_remaining: bySource('plan'), purchased_remaining: bySource('purchased') };
+}
+
+/**
+ * Re-derive credit_balances from the lots, inside the caller's transaction.
+ *
+ * credit_balances is a READ-THROUGH CACHE now, never an independent source. It
+ * is kept because a great deal already reads it (the credits endpoint, the
+ * notification queries, the CMS), and because summing lots on every read would
+ * be wasteful. The rule that makes it safe is that nothing writes it except
+ * here, in the same transaction as the lot change that caused it — the moment
+ * two writers maintain the same number independently you get the 3090-vs-1139
+ * divergence this whole change exists to remove.
+ *
+ * `amount` is a GENERATED column (included + purchased) and is never written.
+ */
+async function syncBalanceCache(tx: any, user_id: number): Promise<void> {
+  await tx`
+    INSERT INTO credit_balances (user_id, credit_type, included_remaining, purchased_remaining, included_allotment, cycle_started_at)
+    SELECT ${user_id}, ${ISEO_CREDIT_TYPE},
+           COALESCE(SUM(remaining) FILTER (WHERE source = 'plan'), 0)::int,
+           COALESCE(SUM(remaining) FILTER (WHERE source = 'purchased'), 0)::int,
+           COALESCE((SELECT included_allotment FROM credit_balances
+                     WHERE user_id = ${user_id} AND credit_type = ${ISEO_CREDIT_TYPE}), 0),
+           COALESCE((SELECT cycle_started_at FROM credit_balances
+                     WHERE user_id = ${user_id} AND credit_type = ${ISEO_CREDIT_TYPE}), NOW())
+    FROM   credit_lots
+    WHERE  user_id = ${user_id} AND remaining > 0 AND expires_at > NOW()
+    ON CONFLICT (user_id, credit_type) DO UPDATE SET
+      included_remaining  = EXCLUDED.included_remaining,
+      purchased_remaining = EXCLUDED.purchased_remaining,
+      updated_at = NOW()
+  `;
+}
+
+/** What the user can actually spend right now, with the next expiry. */
+export const getLiveBalance = async (user_id: number): Promise<LiveBalance> => {
+  const rows = (await sql`
+    SELECT source, COALESCE(SUM(remaining), 0)::int AS n
+    FROM   credit_lots
+    WHERE  user_id = ${user_id} AND remaining > 0 AND expires_at > NOW()
+    GROUP  BY source
+  `) as unknown as Array<{ source: string; n: number }>;
+
+  const next = (await sql`
+    SELECT expires_at, COALESCE(SUM(remaining), 0)::int AS n
+    FROM   credit_lots
+    WHERE  user_id = ${user_id} AND remaining > 0 AND expires_at > NOW()
+    GROUP  BY expires_at
+    ORDER  BY expires_at ASC
+    LIMIT  1
+  `) as unknown as Array<{ expires_at: Date; n: number }>;
+
+  const bySource = (s: string) => Number(rows.find((r) => r.source === s)?.n ?? 0);
+  const plan = bySource('plan');
+  const purchased = bySource('purchased');
+
+  return {
+    total: plan + purchased,
+    plan,
+    purchased,
+    next_expiry_at: next[0]?.expires_at ?? null,
+    next_expiry_amount: Number(next[0]?.n ?? 0),
+  };
+};
+
+/**
+ * Add a lot. The single entry point for creating credits, so every credit in
+ * the system has an expiry date by construction rather than by remembering.
+ */
+export const grantCreditLot = async (
+  user_id: number,
+  source: 'plan' | 'purchased',
+  amount: number,
+  opts: { reason?: string; planId?: number | null; providerObjectId?: string | null; expiresAt?: Date } = {},
+): Promise<void> => {
+  if (!Number.isInteger(amount) || amount <= 0) return;
+  const months = source === 'plan' ? PLAN_CREDIT_LIFETIME_MONTHS : PURCHASED_CREDIT_LIFETIME_MONTHS;
+
+  await sql.begin(async (tx) => {
+    if (opts.expiresAt) {
+      await tx`
+        INSERT INTO credit_lots (user_id, source, granted, remaining, expires_at, plan_id, provider_object_id, reason)
+        VALUES (${user_id}, ${source}, ${amount}, ${amount}, ${opts.expiresAt},
+                ${opts.planId ?? null}, ${opts.providerObjectId ?? null}, ${opts.reason ?? null})
+      `;
+    } else {
+      await tx`
+        INSERT INTO credit_lots (user_id, source, granted, remaining, expires_at, plan_id, provider_object_id, reason)
+        VALUES (${user_id}, ${source}, ${amount}, ${amount},
+                NOW() + ${`${months} months`}::interval,
+                ${opts.planId ?? null}, ${opts.providerObjectId ?? null}, ${opts.reason ?? null})
+      `;
+    }
+    await syncBalanceCache(tx, user_id);
+    await tx`
+      INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
+      VALUES (${user_id}, ${ISEO_CREDIT_TYPE}, ${amount}, ${opts.reason ?? 'Credits granted'})
+    `;
+  });
+};
+
+/**
+ * Expire lapsed lots and record the loss.
+ *
+ * Zeroes `remaining` rather than deleting the row, so the ledger can point at
+ * the lot that lapsed when a customer asks where their credits went. Returns
+ * per-user totals so the caller can log or alert on them.
+ */
+export const expireLapsedLots = async (): Promise<Array<{ user_id: number; expired: number }>> => {
+  return await sql.begin(async (tx) => {
+    // Read what is about to be lost BEFORE zeroing it. An UPDATE ... RETURNING
+    // hands back the post-update value, so the amount would come back as 0 and
+    // every ledger row would say "0 credits expired".
+    //
+    // FOR UPDATE so a burn running concurrently cannot spend these between the
+    // read and the write — the customer would then be debited for credits this
+    // statement is about to declare expired.
+    const lapsed = (await tx`
+      SELECT id, user_id, remaining
+      FROM   credit_lots
+      WHERE  remaining > 0 AND expires_at <= NOW()
+      FOR UPDATE
+    `) as unknown as Array<{ id: number; user_id: number; remaining: number }>;
+
+    if (lapsed.length === 0) return [];
+
+    const perUser = new Map<number, number>();
+    for (const lot of lapsed) {
+      perUser.set(lot.user_id, (perUser.get(lot.user_id) ?? 0) + Number(lot.remaining));
+    }
+
+    await tx`
+      UPDATE credit_lots SET remaining = 0, updated_at = NOW()
+      WHERE id = ANY(${lapsed.map((l) => l.id)})
+    `;
+
+    const results: Array<{ user_id: number; expired: number }> = [];
+    for (const [userId, expired] of perUser) {
+      await syncBalanceCache(tx, userId);
+      // Negative delta: this is a loss, and the ledger should read as one.
+      await tx`
+        INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
+        VALUES (${userId}, ${ISEO_CREDIT_TYPE}, ${-expired}, 'Credits expired')
+      `;
+      results.push({ user_id: userId, expired });
+    }
+    return results;
+  });
+};
 
 /**
  * Atomically reserve credits BEFORE doing paid work (reserve-then-settle).
@@ -919,31 +1299,17 @@ export const reserveCredits = async (
   }
 
   return await sql.begin(async (sql) => {
-    const rows = await sql`
-      UPDATE credit_balances
-      SET included_remaining  = included_remaining  - LEAST(included_remaining, ${amount}),
-          purchased_remaining = purchased_remaining - GREATEST(0, ${amount} - included_remaining),
-          updated_at = NOW()
-      WHERE user_id = ${user_id}
-        AND credit_type = ${credit_type}
-        AND included_remaining + purchased_remaining >= ${amount}
-      RETURNING included_remaining, purchased_remaining
-    `;
+    const spent = await burnFromLots(sql, user_id, amount);
+    if (!spent.ok) return { ok: false, included_remaining: 0, purchased_remaining: 0 };
 
-    if (rows.length === 0) {
-      return { ok: false, included_remaining: 0, purchased_remaining: 0 };
-    }
+    await syncBalanceCache(sql, user_id);
 
     await sql`
       INSERT INTO credit_transactions (user_id, credit_type, delta, reason, website_id, generation_id)
       VALUES (${user_id}, ${credit_type}, ${-amount}, ${reason}, ${website_id || null}, ${generation_id || null})
     `;
 
-    return {
-      ok: true,
-      included_remaining: Number(rows[0].included_remaining),
-      purchased_remaining: Number(rows[0].purchased_remaining),
-    };
+    return { ok: true, included_remaining: spent.plan_remaining, purchased_remaining: spent.purchased_remaining };
   });
 };
 
@@ -970,15 +1336,47 @@ export const refundCredits = async (
 
   try {
     await sql.begin(async (sql) => {
-      await sql`
-        UPDATE credit_balances
-        SET included_remaining  = included_remaining
-              + LEAST(${amount}, GREATEST(0, included_allotment - included_remaining)),
-            purchased_remaining = purchased_remaining
-              + (${amount} - LEAST(${amount}, GREATEST(0, included_allotment - included_remaining))),
-            updated_at = NOW()
-        WHERE user_id = ${user_id} AND credit_type = ${credit_type}
-      `;
+      // ── Refund into the lots it came from, NOT into a fresh one ────────────
+      // A new lot would carry a new expiry date, so refunding a failed
+      // generation would quietly extend the life of those credits — turning a
+      // compensating action into free time. Topping the most recently drained
+      // live lots back up keeps the original dates.
+      //
+      // Capped at `granted` by the table's CHECK, so a refund can never inflate
+      // a lot beyond what it originally held.
+      let outstanding = amount;
+      const lots = (await sql`
+        SELECT id, granted, remaining
+        FROM   credit_lots
+        WHERE  user_id = ${user_id} AND expires_at > NOW() AND remaining < granted
+        ORDER  BY expires_at ASC, id ASC
+        FOR UPDATE
+      `) as unknown as Array<{ id: number; granted: number; remaining: number }>;
+
+      for (const lot of lots) {
+        if (outstanding <= 0) break;
+        const room = Number(lot.granted) - Number(lot.remaining);
+        const give = Math.min(room, outstanding);
+        await sql`
+          UPDATE credit_lots SET remaining = remaining + ${give}, updated_at = NOW()
+          WHERE id = ${lot.id} AND remaining + ${give} <= granted
+        `;
+        outstanding -= give;
+      }
+
+      // Every live lot was already full — the credits were spent from lots that
+      // have since expired, or from none at all. Issue the remainder as a plan
+      // lot on the default lifetime so the user is not left short.
+      if (outstanding > 0) {
+        await sql`
+          INSERT INTO credit_lots (user_id, source, granted, remaining, expires_at, reason)
+          VALUES (${user_id}, 'plan', ${outstanding}, ${outstanding},
+                  NOW() + ${`${PLAN_CREDIT_LIFETIME_MONTHS} months`}::interval,
+                  ${`Refund: ${reason}`})
+        `;
+      }
+
+      await syncBalanceCache(sql, user_id);
 
       await sql`
         INSERT INTO credit_transactions (user_id, credit_type, delta, reason, website_id, generation_id)

@@ -14,6 +14,7 @@
  */
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
 
 const REQUIRED = [
   'ISEO_COST_CONTENT_SMALL',
@@ -29,6 +30,15 @@ const REQUIRED = [
   'ISEO_GRANT_BASIC',
   'ISEO_GRANT_STARTER',
   'ISEO_GRANT_PRO',
+  // Package sizes and prices joined the fail-closed set: a deploy missing a
+  // price would otherwise sell credits for nothing, which is the same class of
+  // failure as a missing deduction price.
+  'ISEO_PACKAGE_SMALL_CREDITS',
+  'ISEO_PACKAGE_SMALL_PRICE_CENTS',
+  'ISEO_PACKAGE_MEDIUM_CREDITS',
+  'ISEO_PACKAGE_MEDIUM_PRICE_CENTS',
+  'ISEO_PACKAGE_LARGE_CREDITS',
+  'ISEO_PACKAGE_LARGE_PRICE_CENTS',
 ] as const;
 
 /** The finalized .env.sample values, so the test exercises the real shipping configuration. */
@@ -46,10 +56,17 @@ const VALID: Record<string, string> = {
   ISEO_GRANT_BASIC: '220',
   ISEO_GRANT_STARTER: '580',
   ISEO_GRANT_PRO: '1150',
+  ISEO_PACKAGE_SMALL_CREDITS: '60',
+  ISEO_PACKAGE_SMALL_PRICE_CENTS: '399',
+  ISEO_PACKAGE_MEDIUM_CREDITS: '100',
+  ISEO_PACKAGE_MEDIUM_PRICE_CENTS: '599',
+  ISEO_PACKAGE_LARGE_CREDITS: '200',
+  ISEO_PACKAGE_LARGE_PRICE_CENTS: '1099',
 };
 
 let saved: Record<string, string | undefined> = {};
 let bust = 0;
+let realCwd = '';
 
 /** Fresh evaluation of the module under the current process.env. */
 async function loadConfig() {
@@ -58,6 +75,23 @@ async function loadConfig() {
 }
 
 beforeEach(() => {
+  // ── Why the working directory moves ─────────────────────────────────────
+  // credits.config.ts calls dotenv.config() itself (deliberately — it must not
+  // depend on index.ts having loaded the env first). dotenv resolves `.env`
+  // against process.cwd(), so re-importing the module RE-READS the developer's
+  // real .env and silently restores any var this test just deleted.
+  //
+  // The effect was that "THROWS when a required var is missing" passed only on
+  // machines whose .env happened to lack ISEO_* — i.e. the fail-closed
+  // guarantee stopped being tested the moment someone configured their machine
+  // properly, which is the exact opposite of when you want it enforced. It was
+  // found when ISEO_* were added to a local .env and this test went red.
+  //
+  // Running from a directory with no .env makes dotenv a no-op, so process.env
+  // is the only input and these cases test what they claim to.
+  realCwd = process.cwd();
+  process.chdir(os.tmpdir());
+
   saved = {};
   for (const k of REQUIRED) {
     saved[k] = process.env[k];
@@ -70,6 +104,7 @@ afterEach(() => {
     if (saved[k] === undefined) delete process.env[k];
     else process.env[k] = saved[k];
   }
+  if (realCwd) process.chdir(realCwd);
 });
 
 describe('credits.config fail-closed', () => {

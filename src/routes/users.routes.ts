@@ -20,7 +20,8 @@ import {
   updateUserProfileName,
   regenerateApiKey,
   reconcileTrialCredits,
-  effectiveTrialEnd
+  effectiveTrialEnd,
+  getLiveBalance
 } from '../models/user.models.js';
 
 const router = express.Router();
@@ -388,9 +389,18 @@ router.get('/credits/:user_id', async (req, res) => {
 
     const credits = await getUserCreditBalances(user_id);
 
+    // The balance panel needs the ONE spendable number, where it sits, and when
+    // it dies — all computed from the lots, the only place that knows.
+    //
+    // Added ALONGSIDE `data` rather than replacing it: several callers still
+    // read the raw rows, and quietly changing that shape underneath them is how
+    // the CMS came to be summing three stale rows in the first place.
+    const balance = await getLiveBalance(user_id);
+
     res.json({
       success: true,
-      data: credits
+      data: credits,
+      balance,
     });
   } catch (error) {
     console.error('Get user credits error:', error);

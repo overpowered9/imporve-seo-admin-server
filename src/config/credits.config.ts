@@ -75,7 +75,37 @@ const envSchema = z.object({
   ISEO_GRANT_BASIC: positiveInt('ISEO_GRANT_BASIC'),
   ISEO_GRANT_STARTER: positiveInt('ISEO_GRANT_STARTER'),
   ISEO_GRANT_PRO: positiveInt('ISEO_GRANT_PRO'),
+
+  // ── Top-up packages — sold from the Credits page ───────────────────────────
+  //
+  // Sized in PIECES OF CONTENT, not round credit numbers: at ~19 credits for a
+  // finished piece (article 10 + image 5 + keyword list 1, plus a 30%/40% rerun
+  // allowance) these are roughly 3, 5 and 10 pieces.
+  //
+  // Prices are required rather than defaulted, for the same reason the deduction
+  // table is: a deploy missing a package price would otherwise sell credits for
+  // nothing. Missing keys abort boot and are named in the error.
+  ISEO_PACKAGE_SMALL_CREDITS: positiveInt('ISEO_PACKAGE_SMALL_CREDITS'),
+  ISEO_PACKAGE_SMALL_PRICE_CENTS: positiveInt('ISEO_PACKAGE_SMALL_PRICE_CENTS'),
+  ISEO_PACKAGE_MEDIUM_CREDITS: positiveInt('ISEO_PACKAGE_MEDIUM_CREDITS'),
+  ISEO_PACKAGE_MEDIUM_PRICE_CENTS: positiveInt('ISEO_PACKAGE_MEDIUM_PRICE_CENTS'),
+  ISEO_PACKAGE_LARGE_CREDITS: positiveInt('ISEO_PACKAGE_LARGE_CREDITS'),
+  ISEO_PACKAGE_LARGE_PRICE_CENTS: positiveInt('ISEO_PACKAGE_LARGE_PRICE_CENTS'),
 });
+
+/**
+ * How long a credit lives, by where it came from.
+ *
+ * Defaulted in code rather than required from env — unlike a price, a missing
+ * value here cannot give work away for free, and these two numbers are the
+ * product rule itself ("plan credits expire after two months, purchased after
+ * twelve") rather than a tunable. Overridable for testing and for a future
+ * policy change without a code edit.
+ */
+export const PLAN_CREDIT_LIFETIME_MONTHS =
+  Number(process.env.ISEO_PLAN_CREDIT_LIFETIME_MONTHS || 2);
+export const PURCHASED_CREDIT_LIFETIME_MONTHS =
+  Number(process.env.ISEO_PURCHASED_CREDIT_LIFETIME_MONTHS || 12);
 
 const parsed = envSchema.safeParse(process.env);
 
@@ -116,14 +146,55 @@ const grants: Readonly<Record<PlanSlug, number>> = Object.freeze({
   pro: env.ISEO_GRANT_PRO,
 });
 
-export const creditsConfig = Object.freeze({ costs, grants });
+/** A purchasable top-up. `id` is the stable key the CMS sends. */
+export interface CreditPackage {
+  id: CreditPackageId;
+  credits: number;
+  price_cents: number;
+  /** Roughly how many finished pieces this buys, for the storefront label. */
+  approx_pieces: number;
+}
+
+const PACKAGE_IDS = ['small', 'medium', 'large'] as const;
+export type CreditPackageId = (typeof PACKAGE_IDS)[number];
+
+/**
+ * Credits for one finished piece: article (medium) + AI image + keyword list,
+ * with an allowance for the reruns real users do.
+ *
+ *   10 + 5 + 1 = 16, plus 0.30 x 6 content rerun and 0.40 x 3 image rerun ≈ 19
+ *
+ * Derived from the live cost table rather than hardcoded, so changing a price
+ * moves the "≈ N pieces" labels with it instead of leaving them stale.
+ */
+export const creditsPerPiece = (): number =>
+  Math.round(
+    costs.content.medium + costs.image + costs.keywords
+    + 0.3 * costs.content_regen.medium
+    + 0.4 * costs.image_regen,
+  );
+
+/** The top-up packages, frozen. Ordered smallest first for the storefront. */
+const packages: readonly CreditPackage[] = Object.freeze([
+  { id: 'small', credits: env.ISEO_PACKAGE_SMALL_CREDITS, price_cents: env.ISEO_PACKAGE_SMALL_PRICE_CENTS },
+  { id: 'medium', credits: env.ISEO_PACKAGE_MEDIUM_CREDITS, price_cents: env.ISEO_PACKAGE_MEDIUM_PRICE_CENTS },
+  { id: 'large', credits: env.ISEO_PACKAGE_LARGE_CREDITS, price_cents: env.ISEO_PACKAGE_LARGE_PRICE_CENTS },
+].map((p) => Object.freeze({ ...p, approx_pieces: Math.max(1, Math.round(p.credits / creditsPerPiece())) })) as CreditPackage[]);
+
+export const creditPackages = (): readonly CreditPackage[] => packages;
+
+/** One package by id, or null. The route answers 400 on null rather than guessing. */
+export const creditPackageById = (id: string | null | undefined): CreditPackage | null =>
+  packages.find((p) => p.id === String(id || '').trim().toLowerCase()) ?? null;
+
+export const creditsConfig = Object.freeze({ costs, grants, packages });
 
 /**
  * Fingerprint of the active price table, for the boot log and support triage.
  * Exported so a health endpoint can report WHICH table is live without revealing the values.
  */
 export const creditsConfigHash: string = createHash('sha256')
-  .update(JSON.stringify({ costs, grants }))
+  .update(JSON.stringify({ costs, grants, packages }))
   .digest('hex');
 
 /**

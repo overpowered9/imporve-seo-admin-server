@@ -35,6 +35,29 @@ export interface PreviewLine {
   amount_cents: number;
 }
 
+/**
+ * What the customer RECEIVES, alongside what they pay. (BILL-003, extended)
+ *
+ * A prorated upgrade charges for the days left in the cycle and grants a
+ * matching share of the credit difference. Disclosing only the money told half
+ * the story: the customer saw "$8.40 today" with no way to know whether that
+ * bought 360 credits or 180. Every field here comes from the same function that
+ * performs the grant (previewUpgradeCreditGrant), so the figure shown is the
+ * figure added.
+ */
+export interface CreditDisclosure {
+  /** Credits added the moment the change is confirmed. */
+  granted_now: number;
+  /** What a whole cycle's difference would have been. */
+  full_difference: number;
+  /** Monthly allotment once the change is in effect. */
+  new_allotment: number;
+  /** True when granted_now was scaled down for the part-cycle. */
+  prorated: boolean;
+  /** When the new allotment starts, when that is not today. */
+  effective_date?: string | null;
+}
+
 export interface ProrationQuote {
   is_upgrade: boolean;
   is_first_subscription: boolean;
@@ -53,6 +76,8 @@ export interface ProrationQuote {
   description: string;
   lines: PreviewLine[];
   payment_method?: { brand: string | null; last4: string | null } | null;
+  /** What this change does to the credit balance. Null when it changes nothing. */
+  credits?: CreditDisclosure | null;
   disclosure_id?: string;
 }
 

@@ -16,8 +16,55 @@ import {
   suspendPlanCredits,
   getFreePlanId,
   hasBillingAddress,
+  previewUpgradeCreditGrant,
   ISEO_CREDIT_TYPE
 } from '../models/user.models.js';
+// The plan's monthly credit allotment, for the quote branches that do not go
+// through previewUpgradeCreditGrant (a first subscription, a scheduled
+// downgrade). Same function the grant itself uses.
+import {
+  grantForPlanSlug,
+  creditPackages,
+  creditPackageById,
+  creditsPerPiece,
+  type CreditPackage,
+} from '../config/credits.config.js';
+
+/**
+ * Map a legacy raw quantity onto a package.
+ *
+ * Chosen as "the smallest package that covers what they asked for", falling back
+ * to the largest — so an old client can never buy FEWER credits than the
+ * quantity it requested, which would be taking money for less than was ordered.
+ */
+const nearestPackageFor = (quantity: number): CreditPackage => {
+  const all = creditPackages();
+  return all.find((p) => p.credits >= quantity) ?? all[all.length - 1];
+};
+
+export type BillingInterval = 'month' | 'year';
+
+/**
+ * The Stripe price for a plan on a given interval.
+ *
+ * One resolver for every path that starts or changes a subscription, so the
+ * interval cannot be honoured in checkout and quietly dropped in change-plan —
+ * which would move an annual customer onto monthly billing as a side effect of
+ * switching plan.
+ *
+ * Falls back to monthly when a yearly price is not configured for that plan,
+ * rather than failing: a plan without an annual price should still be
+ * purchasable. The caller is told which interval it actually got.
+ */
+const priceForPlan = (
+  plan: { stripe_price_id?: string | null; stripe_price_id_yearly?: string | null },
+  interval: BillingInterval,
+): { priceId: string | null; interval: BillingInterval } => {
+  if (interval === 'year' && plan.stripe_price_id_yearly) {
+    return { priceId: plan.stripe_price_id_yearly, interval: 'year' };
+  }
+  return { priceId: plan.stripe_price_id ?? null, interval: 'month' };
+};
 
 /**
  * Guard for the money-moving endpoints: no billing address, no purchase.
@@ -57,6 +104,7 @@ import { enqueueEmail } from '../services/billing/email-outbox.js';
 import {
   clearScheduledCancellation,
   releaseOrphanedSchedules,
+  isLiveStatus,
 } from '../services/billing/subscription-state.js';
 import {
   recordTransaction,
@@ -202,15 +250,19 @@ const activateSubscriptionInDb = async (params: {
   stripeSubscriptionId: string;
   stripeCustomerId: string;
   nextBillingTimestamp: number;
+  /** How this subscription bills. Recorded so the plan grid opens on the right
+   *  side of the monthly/yearly toggle without asking Stripe. */
+  billingInterval?: 'month' | 'year';
 }): Promise<void> => {
   const { userId, planId, stripeSubscriptionId, stripeCustomerId, nextBillingTimestamp } = params;
+  const billingInterval = params.billingInterval ?? 'month';
 
   await sql`
     INSERT INTO subscriptions (
-      user_id, plan_id, status, stripe_subscription_id, stripe_customer_id, start_date, next_billing_date
+      user_id, plan_id, status, stripe_subscription_id, stripe_customer_id, billing_interval, start_date, next_billing_date
     )
     VALUES (
-      ${userId}, ${planId}, 'active', ${stripeSubscriptionId}, ${stripeCustomerId}, NOW(), TO_TIMESTAMP(${nextBillingTimestamp})
+      ${userId}, ${planId}, 'active', ${stripeSubscriptionId}, ${stripeCustomerId}, ${billingInterval}, NOW(), TO_TIMESTAMP(${nextBillingTimestamp})
     )
     ON CONFLICT (user_id)
     DO UPDATE SET
@@ -218,6 +270,7 @@ const activateSubscriptionInDb = async (params: {
       status = 'active',
       stripe_subscription_id = ${stripeSubscriptionId},
       stripe_customer_id = ${stripeCustomerId},
+      billing_interval = ${billingInterval},
       next_billing_date = TO_TIMESTAMP(${nextBillingTimestamp}),
       cancel_at_period_end = FALSE,
       pending_plan_id = NULL,
@@ -363,10 +416,14 @@ const createCheckoutSessionSchema = z.object({
 
 const buyCreditSchema = z.object({
   user_id: z.number(),
+  // The current shape: pick one of the configured packages.
+  package_id: z.enum(['small', 'medium', 'large']).optional(),
   // 'iseo' is the real pool. The three legacy labels are still accepted so a CMS that has not
   // been redeployed keeps working; handleCreditTopup maps whatever arrives onto the pool.
   credit_type: z.enum(['iseo', 'images', 'content', 'keywords']).default('iseo'),
-  quantity: z.number().min(1).max(1000),
+  // Legacy, and now optional: a raw quantity is mapped onto the nearest package
+  // rather than priced per credit. Required until the CMS ships package_id.
+  quantity: z.number().min(1).max(100000).optional(),
   success_url: z.string().url(),
   cancel_url: z.string().url()
 });
@@ -434,12 +491,33 @@ router.post('/create-checkout-session', async (req: Request, res: Response) => {
 });
 
 /**
+ * The credit packages on sale, and what a piece of content costs.
+ * GET /api/v1/stripe/credit-packages
+ *
+ * Serves the storefront so prices live in ONE place. The CMS previously had no
+ * way to know them and would have had to hardcode a second copy — which is how
+ * a price list drifts from the one that actually charges.
+ *
+ * `credits_per_piece` is included so the info icon on the balance panel can
+ * explain the weighting without shipping its own arithmetic.
+ */
+router.get('/credit-packages', (_req: Request, res: Response) => {
+  res.json({
+    success: true,
+    data: {
+      packages: creditPackages(),
+      credits_per_piece: creditsPerPiece(),
+    },
+  });
+});
+
+/**
  * Buy additional credits (one-time purchase)
  * POST /api/v1/stripe/buy-credits
  */
 router.post('/buy-credits', async (req: Request, res: Response) => {
   try {
-    const { user_id, credit_type, quantity, success_url, cancel_url } = buyCreditSchema.parse(req.body);
+    const { user_id, package_id, quantity, success_url, cancel_url } = buyCreditSchema.parse(req.body);
     if (await blockedForMissingAddress(user_id, res)) return;
 
     // Get user email
@@ -453,15 +531,30 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
 
     const userEmail = userResult[0].email;
 
-    // Define credit prices (in cents)
-    const creditPrices: Record<string, number> = {
-      images: 100,      // $1.00 per image credit
-      content: 200,     // $2.00 per content credit
-      keywords: 50      // $0.50 per keyword credit
-    };
+    // ── Packages, not per-credit pricing ──────────────────────────────────────
+    // This sold `{credit_type, quantity}` at {images: $1, content: $2,
+    // keywords: $0.50} per credit — three prices for three pools that no longer
+    // exist, and an arbitrary quantity the customer had to reason about in a
+    // unit ("one content credit") that stopped meaning anything when the pools
+    // collapsed into one weighted pool.
+    //
+    // Now: three fixed packages sized in PIECES OF CONTENT, priced from the
+    // fail-closed config so a deploy missing a price refuses to boot rather
+    // than selling credits for nothing.
+    //
+    // The legacy shape is still accepted for one release, so a CMS that has not
+    // been redeployed keeps working; it maps onto the nearest package rather
+    // than resurrecting the old per-type maths.
+    const pkg = creditPackageById(package_id)
+      ?? (quantity ? nearestPackageFor(quantity) : null);
 
-    const unitAmount = creditPrices[credit_type];
-    const totalAmount = unitAmount * quantity;
+    if (!pkg) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unknown credit package. Choose one of: '
+          + creditPackages().map((p) => p.id).join(', '),
+      });
+    }
 
     // Create Stripe checkout session for one-time payment
     const session = await stripe.checkout.sessions.create({
@@ -472,12 +565,14 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
           price_data: {
             currency: 'usd',
             product_data: {
-              name: `${quantity} ${credit_type.charAt(0).toUpperCase() + credit_type.slice(1)} Credits`,
-              description: `Add ${quantity} ${credit_type} credits to your account`,
+              name: `${pkg.credits.toLocaleString()} ISEO Credits`,
+              description:
+                `Enough for about ${pkg.approx_pieces} piece${pkg.approx_pieces === 1 ? '' : 's'} of content`
+                + ' (article, AI image and keyword list). Valid for 12 months.',
             },
-            unit_amount: unitAmount,
+            unit_amount: pkg.price_cents,
           },
-          quantity: quantity,
+          quantity: 1,
         },
       ],
       mode: 'payment',
@@ -485,8 +580,11 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
       cancel_url: cancel_url,
       metadata: {
         user_id: user_id.toString(),
-        credit_type,
-        quantity: quantity.toString(),
+        // `quantity` is the CREDITS granted, which is what applyCreditTopupOnce
+        // reads. credit_type stays for that function's legacy branch.
+        credit_type: ISEO_CREDIT_TYPE,
+        quantity: pkg.credits.toString(),
+        package_id: pkg.id,
         purchase_type: 'credit_topup'
       }
     });
@@ -496,9 +594,10 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
       data: {
         session_id: session.id,
         url: session.url,
-        amount: totalAmount,
-        quantity,
-        credit_type
+        amount: pkg.price_cents,
+        quantity: pkg.credits,
+        package_id: pkg.id,
+        approx_pieces: pkg.approx_pieces,
       }
     });
 
@@ -704,6 +803,8 @@ router.post('/webhook', async (req: Request, res: Response) => {
             stripeSubscriptionId: subscription.id,
             stripeCustomerId: subscription.customer as string,
             nextBillingTimestamp,
+            billingInterval:
+              (subscription.items.data[0]?.price?.recurring?.interval === 'year') ? 'year' : 'month',
           });
 
           console.log(`✅ Subscription created for user ${userId}, plan ${planId}, credits refilled`);
@@ -992,6 +1093,10 @@ router.post('/verify-session', async (req: Request, res: Response) => {
               stripeSubscriptionId: subscription.id,
               stripeCustomerId: subscription.customer as string,
               nextBillingTimestamp,
+              // From the PRICE Stripe actually billed, not from what we asked
+              // for — if the two ever disagree, the provider is right.
+              billingInterval:
+                (subscription.items.data[0]?.price?.recurring?.interval === 'year') ? 'year' : 'month',
             });
           }
         }
@@ -1025,11 +1130,33 @@ router.get('/plans', async (req: Request, res: Response) => {
       currentPlanId = subscription?.plan_id;
     }
 
+    // What the customer is currently billed on, so the CMS can open the grid on
+    // the right side of the monthly/yearly toggle instead of defaulting to
+    // monthly and making an annual subscriber think their plan changed.
+    const currentInterval = user_id
+      ? (await getUserSubscription(user_id))?.billing_interval ?? 'month'
+      : 'month';
+
     res.json({
       success: true,
+      current_interval: currentInterval,
       plans: plans.map((plan: any) => ({
         ...plan,
+        // Yearly is the same plan on a different interval — same credits, same
+        // features. Both prices ship on the one row so the toggle needs no
+        // second request and cannot show a stale price for one of them.
+        price_cents_yearly: plan.price_cents_yearly ?? null,
+        yearly_available: Boolean(plan.stripe_price_id_yearly),
+        // Stated rather than left to the client to derive: the saving is a
+        // selling point and must match what is actually charged.
+        yearly_saving_cents: plan.price_cents_yearly != null
+          ? Math.max(0, plan.price_cents * 12 - plan.price_cents_yearly)
+          : null,
         is_current: plan.id === currentPlanId,
+        // Comparisons stay on the MONTHLY price for both sides. Comparing a
+        // yearly figure against a monthly one would read a plan upgrade paid
+        // annually as a downgrade, and schedule it for period end instead of
+        // applying it.
         can_upgrade: currentPlanId ? plan.price_cents > plans.find((p: any) => p.id === currentPlanId)?.price_cents : true,
         can_downgrade: currentPlanId ? plan.price_cents < plans.find((p: any) => p.id === currentPlanId)?.price_cents : false
       }))
@@ -1048,9 +1175,12 @@ router.get('/plans', async (req: Request, res: Response) => {
  */
 router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
   try {
-    const { user_id, plan_id, idempotency_key } = z.object({
+    const { user_id, plan_id, interval, idempotency_key } = z.object({
       user_id: z.number(),
       plan_id: z.number(),
+      // Monthly or annual; monthly by default so an un-updated client is
+      // unaffected.
+      interval: z.enum(['month', 'year']).default('month'),
       // BILL-002 — generated once per confirm action by the CMS and reused
       // across retries, so a double-clicked button cannot create two
       // subscriptions and two charges.
@@ -1085,8 +1215,9 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
       });
     }
 
-    // Validate plan has Stripe Price ID
-    if (!plan.stripe_price_id) {
+    // Validate plan has a Stripe Price for the requested interval
+    const { priceId: subPriceId, interval: subInterval } = priceForPlan(plan, interval);
+    if (!subPriceId) {
       return res.status(500).json({
         success: false,
         error: 'Stripe Price ID not configured for this plan. Please contact support.'
@@ -1148,7 +1279,7 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
       const subscription = await stripe.subscriptions.create({
         customer: user.stripe_customer_id,
         items: [{
-          price: plan.stripe_price_id,
+          price: subPriceId,
         }],
         payment_behavior: 'error_if_incomplete', // Changed: Fail if payment fails
         payment_settings: {
@@ -1158,6 +1289,7 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
         metadata: {
           user_id: user_id.toString(),
           plan_id: plan_id.toString(),
+          billing_interval: subInterval,
           upgrade_from_free: 'true'
         }
       }, idempotencyKeyFor('subscribe', user_id, idempotency_key));
@@ -1181,6 +1313,7 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
             stripeSubscriptionId: subscription.id,
             stripeCustomerId: user.stripe_customer_id,
             nextBillingTimestamp,
+            billingInterval: subInterval,
           });
         } catch (dbError) {
           // Payment succeeded but our DB write failed. Surface a clear error and let the
@@ -1333,11 +1466,14 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
  */
 router.post('/create-subscription-checkout', async (req: Request, res: Response) => {
   try {
-    const { user_id, plan_id, success_url, cancel_url, idempotency_key } = z.object({
+    const { user_id, plan_id, success_url, cancel_url, interval, idempotency_key } = z.object({
       user_id: z.number(),
       plan_id: z.number(),
       success_url: z.string().url(),
       cancel_url: z.string().url(),
+      // Monthly or annual. Defaults to monthly so an un-updated client keeps
+      // its existing behaviour rather than silently switching interval.
+      interval: z.enum(['month', 'year']).default('month'),
       // Same contract as /subscribe-to-plan: one key per confirm action, reused
       // across retries, so a double-clicked button cannot open two checkouts.
       idempotency_key: z.string().min(8).max(200).optional()
@@ -1370,7 +1506,10 @@ router.post('/create-subscription-checkout', async (req: Request, res: Response)
       });
     }
 
-    if (!plan.stripe_price_id) {
+    // Resolves to the yearly price when asked for and configured, otherwise
+    // monthly — `chosen` is what actually gets billed and is recorded below.
+    const { priceId, interval: chosen } = priceForPlan(plan, interval);
+    if (!priceId) {
       return res.status(500).json({
         success: false,
         error: 'Stripe Price ID not configured for this plan. Please contact support.'
@@ -1409,7 +1548,7 @@ router.post('/create-subscription-checkout', async (req: Request, res: Response)
     const session = await stripe.checkout.sessions.create({
       customer: customerId,
       mode: 'subscription',
-      line_items: [{ price: plan.stripe_price_id, quantity: 1 }],
+      line_items: [{ price: priceId, quantity: 1 }],
       // The card is kept on the customer, so renewals and every later upgrade
       // run off a saved payment method rather than sending the user back here.
       payment_method_collection: 'always',
@@ -1422,12 +1561,14 @@ router.post('/create-subscription-checkout', async (req: Request, res: Response)
       // to the user's CURRENT (free) plan and grant the wrong credits.
       metadata: {
         user_id: user_id.toString(),
-        plan_id: plan_id.toString()
+        plan_id: plan_id.toString(),
+        billing_interval: chosen
       },
       subscription_data: {
         metadata: {
           user_id: user_id.toString(),
-          plan_id: plan_id.toString()
+          plan_id: plan_id.toString(),
+          billing_interval: chosen
         }
       }
     }, idempotencyKeyFor('subscription-checkout', user_id, idempotency_key));
@@ -1440,7 +1581,8 @@ router.post('/create-subscription-checkout', async (req: Request, res: Response)
         session_id: session.id,
         url: session.url,
         plan_name: plan.name,
-        price_cents: plan.price_cents
+        price_cents: chosen === 'year' ? plan.price_cents_yearly : plan.price_cents,
+        interval: chosen
       }
     });
 
@@ -1520,7 +1662,18 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
     };
 
     // ── First subscription: nothing to prorate, the full price is due ──────
-    if (!currentSub || !currentSub.stripe_subscription_id) {
+    //
+    // The status check is the part that was missing. A customer who subscribed,
+    // cancelled, and came back to the free trial still HAS a subscriptions row
+    // carrying a stripe_subscription_id — so this branch missed, and their next
+    // purchase was priced as a mid-cycle plan CHANGE: prorated against a
+    // subscription that is no longer running, which is both wrong and
+    // unanswerable (there is no live period to prorate within, which is why the
+    // amount could not be calculated at all).
+    //
+    // A subscription that is not live is not a subscription for pricing
+    // purposes. Same shared status set the banner and the jobs use.
+    if (!currentSub || !currentSub.stripe_subscription_id || !isLiveStatus(currentSub.status)) {
       return serve({
         is_upgrade: true,
         is_first_subscription: true,
@@ -1534,6 +1687,15 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
         description: 'You will be charged the full plan price to start this subscription.',
         lines: [{ description: `${newPlan.name} — first month`, amount_cents: newPlan.price_cents }],
         payment_method: paymentMethod,
+        // A first subscription pays a full month and receives a full month.
+        // refillPlanCredits SETS the balance to the allotment rather than
+        // adding to it, so the whole allotment is what lands.
+        credits: {
+          granted_now: grantForPlanSlug(newPlan.slug),
+          full_difference: grantForPlanSlug(newPlan.slug),
+          new_allotment: grantForPlanSlug(newPlan.slug),
+          prorated: false,
+        },
       });
     }
 
@@ -1578,6 +1740,16 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
         description: 'No charge today. Your new plan starts at the end of the current billing period.',
         lines: [],
         payment_method: paymentMethod,
+        // Nothing is granted today — the current plan's credits stay as they
+        // are until the period ends. Naming the date stops "your allotment
+        // becomes 220" reading as "your balance drops to 220 right now".
+        credits: {
+          granted_now: 0,
+          full_difference: 0,
+          new_allotment: grantForPlanSlug(newPlan.slug),
+          prorated: false,
+          effective_date: currentSub.next_billing_date,
+        },
       });
     }
 
@@ -1605,6 +1777,15 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
       newPriceId: newPlan.stripe_price_id,
     });
 
+    // The other half of the transaction. The money above is prorated by Stripe;
+    // the credits are prorated by us, and until now the customer was told about
+    // the first and left to guess the second.
+    const creditGrant = await previewUpgradeCreditGrant(
+      user_id,
+      newPlan,
+      currentSub.next_billing_date,
+    );
+
     return serve({
       is_upgrade: true,
       is_first_subscription: false,
@@ -1624,6 +1805,12 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
         : 'No charge is due now — the unused portion of your current plan covers the change.',
       lines: quote.lines,
       payment_method: paymentMethod,
+      credits: {
+        granted_now: creditGrant.granted_now,
+        full_difference: creditGrant.full_difference,
+        new_allotment: creditGrant.new_allotment,
+        prorated: creditGrant.prorated,
+      },
     });
 
   } catch (error) {
@@ -1664,7 +1851,12 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     const currentSub = await getUserSubscription(user_id);
     
     // If no subscription = FREE tier user trying to upgrade
-    if (!currentSub) {
+    // The status check mirrors preview-plan-change: a cancelled or paused row
+    // is not a subscription to CHANGE, it is a subscription to start. Without
+    // it the quote and the commit disagreed — the preview correctly priced a
+    // returning customer at full price while this path tried to prorate them
+    // against a dead subscription.
+    if (!currentSub || !isLiveStatus(currentSub.status)) {
       return res.status(400).json({
         success: false,
         error: 'No active subscription. Use /subscribe-to-plan endpoint for first subscription.',
@@ -1708,7 +1900,30 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     //
     // Treat it as what the user means: keep the subscription running. No
     // proration, no credit grant — nothing about the plan is changing.
-    if (new_plan_id === currentSub.plan_id && currentSub.cancel_at_period_end) {
+    if (new_plan_id === currentSub.plan_id) {
+      // ── RE-PICKING THE PLAN YOU ALREADY HOLD ──────────────────────────────
+      // Two cases, and both used to end up in the DOWNGRADE branch because the
+      // prices are equal so isUpgrade is false:
+      //
+      //   cancelling  → the user pressed "Reactivate". They were answered with
+      //                 "Plan downgrade scheduled…", which is not what they
+      //                 asked for and not what happened.
+      //   not cancelling → a no-op, which was turned into a scheduled DOWNGRADE
+      //                 TO THE PLAN THEY ARE ON. Two accounts were found sitting
+      //                 in that state, queued to "change" to their own plan.
+      //
+      // Neither is a downgrade. Handled here, before the price comparison can
+      // mislabel them.
+      if (!currentSub.cancel_at_period_end && !currentSub.pending_plan_id) {
+        return res.json({
+          success: true,
+          message: `You are already on ${newPlan.name}. Nothing has changed and you were not charged.`,
+          immediate: true,
+          unchanged: true,
+          new_plan: newPlan.name,
+        });
+      }
+
       // BILL-005 — clears the flag on the subscription AND releases any leftover
       // schedule object. A schedule survives a subscriptions.update, and one
       // carrying a cancellation will still end the subscription weeks later,
@@ -1722,19 +1937,78 @@ router.post('/change-plan', async (req: Request, res: Response) => {
         },
       );
 
+      // ── FULL RESET, not just the cancel flag ──────────────────────────────
+      // Clearing cancel_at_period_end alone left status at 'pending_downgrade'
+      // with pending_plan_id still set, so after reactivating, the account was
+      // STILL queued to change plan — Settings announced a change to Grow, the
+      // Reactivate button stayed on screen, and the plan was simultaneously
+      // "ending" and "changing". Reactivate means: keep THIS plan running.
+      //
+      // users.plan_id is written in the same statement set because the header
+      // badge reads its plan from `users` while this page reads `subscriptions`
+      // — and a path that updates one without the other is how an account came
+      // to show "Scale" and "Free Trial" at the same time.
+      await sql.begin(async (tx) => {
+        await tx`
+          UPDATE subscriptions
+          SET    status = 'active',
+                 cancel_at_period_end = FALSE,
+                 cancelled_at = NULL,
+                 pending_plan_id = NULL,
+                 pending_plan_effective_date = NULL
+          WHERE  user_id = ${user_id}
+        `;
+        await tx`UPDATE users SET plan_id = ${currentSub.plan_id}, updated_at = NOW() WHERE id = ${user_id}`;
+      });
+
       console.log(
-        `✅ Reactivated cancelled subscription for user ${user_id} (${newPlan.name})` +
+        `✅ Reactivated subscription for user ${user_id} (${newPlan.name})` +
         (releasedSchedules.length ? ` — released ${releasedSchedules.length} orphaned schedule(s)` : ''),
       );
 
       return res.json({
         success: true,
-        message: `Your ${newPlan.name} subscription has been reactivated. Billing continues as normal — you were not charged again today.`,
+        // Names the plan that is now running, which is the question the user
+        // actually has after pressing Reactivate.
+        // No " plan" suffix: the names in subscription_plans already carry it
+        // ("Pro Plan", "Starter Plan"), so appending one read "Your Pro Plan
+        // plan is active again."
+        message: `${newPlan.name} is active again. Billing continues as normal and you were not charged today.`,
         immediate: true,
         reactivated: true,
         effective_date: new Date().toISOString(),
         new_plan: newPlan.name,
       });
+    }
+
+    // ── BILL-005, widened: releasing the schedule is not only for reactivation ──
+    //
+    // The branch above only fires when the chosen plan IS the current one. A
+    // customer who cancels Optimize and then picks Scale is making the same
+    // statement — "I am staying" — but took the ordinary change path, which
+    // cleared cancel_at_period_end in OUR row and left the schedule standing at
+    // the provider.
+    //
+    // The visible symptom was a "Cancellation Scheduled" banner that would not
+    // go away. The unseen one is worse: the schedule still ends the
+    // subscription at period end, so a customer who deliberately resubscribed
+    // onto a HIGHER plan is cancelled weeks later anyway.
+    //
+    // Runs before the subscriptions.update below, because a schedule left in
+    // place can override the very change we are about to make.
+    if (currentSub.cancel_at_period_end) {
+      const { releasedSchedules } = await clearScheduledCancellation(
+        { sql, stripe },
+        {
+          userId: user_id,
+          stripeSubscriptionId: currentSub.stripe_subscription_id,
+          stripeCustomerId: currentSub.stripe_customer_id,
+        },
+      );
+      console.log(
+        `✅ Cleared scheduled cancellation for user ${user_id} — changing to ${newPlan.name}` +
+        (releasedSchedules.length ? ` (released ${releasedSchedules.length} orphaned schedule(s))` : ''),
+      );
     }
 
     // Validate that Stripe Price IDs are configured
@@ -1866,22 +2140,100 @@ router.post('/change-plan', async (req: Request, res: Response) => {
 
         // BILL-003 — close out the disclosure with what Stripe ACTUALLY billed,
         // and shout if it differs from what the customer was shown by more than
-        // rounding. The prorated invoice is raised as part of the update above,
-        // so the figure is available immediately rather than only via webhook.
-        if (disclosure_id && isUpgrade) {
+        // rounding.
+        //
+        // Computed once and reused by the ledger write below, so the audit row
+        // and the customer-visible transaction can never quote two figures.
+        let proratedCents: number | null = null;
+        if (isUpgrade) {
           try {
             const upcoming = await stripe.invoices.createPreview({
               customer: stripeSubscription.customer as string,
               subscription: currentSub.stripe_subscription_id,
             });
-            const chargedNow = (upcoming.lines?.data ?? [])
+            proratedCents = (upcoming.lines?.data ?? [])
               .filter(isProrationLine)
               .reduce((sum: number, line: any) => sum + (line.amount || 0), 0);
-            await settleDisclosure(sql, disclosure_id, chargedNow);
+            if (disclosure_id) await settleDisclosure(sql, disclosure_id, proratedCents);
           } catch (settleErr) {
             // Never fail a completed plan change over an audit write.
             console.error('⚠️ Could not reconcile the disclosure after the change:', settleErr);
           }
+        }
+
+        // ── BILL-004 — record the ledger row HERE, not only from the webhook ──
+        //
+        // recordTransaction was called from applyCreditTopupOnce and from two
+        // webhook handlers, but never from this route. A plan change therefore
+        // reached "Recent Transactions" only if `invoice.payment_succeeded` was
+        // delivered — so the list showed a credit top-up and nothing at all for
+        // the upgrade that had just been paid for.
+        //
+        // Two reasons that is the wrong dependency, and they are the same two
+        // that made activateSubscriptionInDb synchronous:
+        //   • a misconfigured or down webhook endpoint means the customer is
+        //     charged and the event is never recorded — permanently, since
+        //     nothing re-derives it;
+        //   • Stripe cannot reach localhost, so the behaviour was untestable in
+        //     development, which is why it went unnoticed.
+        //
+        // ── WHY THIS IS NOT READ FROM AN INVOICE ────────────────────────────
+        // The obvious implementation — list the subscription's latest invoice
+        // and run transactionsFromInvoice over it — was written first and does
+        // NOT work here. `proration_behavior: 'create_prorations'` (above) does
+        // not raise an invoice today: it attaches the adjustments as PENDING
+        // invoice items, to be billed on the next regular invoice. So the most
+        // recent invoice is the previous cycle's, already in the ledger, and
+        // re-recording it merely hit the ON CONFLICT branch and inserted
+        // nothing. That is exactly what the first attempt did.
+        //
+        // So the row written here describes the PLAN CHANGE, not an invoice:
+        // status 'pending', because the money is owed but not yet billed, and a
+        // key in its own namespace (`plan_change:…`) that can never collide
+        // with the webhook's per-line `invoice_line:<id>` keys. When the next
+        // invoice is paid, those lines land as their own settled rows and this
+        // one has already told the customer what happened, on the day it did.
+        //
+        // `proratedCents` comes from the same preview that settled the
+        // disclosure, so the ledger and the audit trail cannot disagree.
+        try {
+          if (isUpgrade) {
+            await recordTransaction(sql, {
+              userId: user_id,
+              type: 'plan_upgrade',
+              description:
+                `Upgraded ${currentPlan.name} → ${newPlan.name}`
+                + ' (prorated, billed on your next invoice)',
+              amountCents: proratedCents,
+              currency: 'usd',
+              status: 'pending',
+              // Namespaced and pinned to the moment of the change, so a second
+              // upgrade in the same cycle records separately.
+              providerEventId:
+                `plan_change:${currentSub.stripe_subscription_id}:${new_plan_id}:${Math.floor(Date.now() / 1000)}`,
+              providerObjectId: currentSub.stripe_subscription_id,
+              planId: new_plan_id,
+            });
+          } else {
+            // A downgrade raises no invoice — proration_behavior is 'none' and
+            // nothing is charged today. It is still an event the customer needs
+            // to find when asking "why did my plan change?", so it gets a $0
+            // row keyed on the subscription and the date it was scheduled.
+            await recordTransaction(sql, {
+              userId: user_id,
+              type: 'plan_downgrade',
+              description: `Downgrade scheduled: ${currentPlan.name} → ${newPlan.name}`,
+              amountCents: 0,
+              currency: 'usd',
+              providerEventId: `plan_downgrade:${currentSub.stripe_subscription_id}:${new_plan_id}`,
+              providerObjectId: currentSub.stripe_subscription_id,
+              planId: new_plan_id,
+            });
+          }
+        } catch (ledgerError) {
+          // recordTransaction never throws; this guards anything around it.
+          // A ledger write must not fail a plan change that already succeeded.
+          console.error('⚠️ Could not record the plan change in the ledger:', ledgerError);
         }
 
         if (isUpgrade) {

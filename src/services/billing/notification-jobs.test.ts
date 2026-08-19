@@ -212,7 +212,10 @@ describe('BILL-007 — credit expiry', () => {
     assert.match(q.text, /marketing_opt_out_at IS NULL/, 'unsubscribed users must be excluded');
     assert.match(q.text, /email_hard_bounced_at IS NULL/, 'hard-bounced addresses must be excluded');
     assert.match(q.text, /is_internal = FALSE/, 'internal accounts must be excluded');
-    assert.match(q.text, /HAVING COALESCE\(SUM\(cb\.included_remaining\), 0\) > 0/, 'zero balances must be excluded');
+    // Reads from credit_lots now: a warning is about a LOT expiring, not about
+    // a billing cycle rolling over. Only lots with credits left qualify.
+    assert.match(q.text, /HAVING COALESCE\(SUM\(cl\.remaining\), 0\) > 0/, 'zero balances must be excluded');
+    assert.match(q.text, /cl\.remaining > 0/, 'spent lots must be excluded at the join');
   });
 
   test('BOUNDARY: the threshold compares whole UTC days, not instants', async () => {
@@ -227,14 +230,25 @@ describe('BILL-007 — credit expiry', () => {
     assert.ok(q.params.includes(14));
   });
 
-  test('MONTH-END: the fallback cycle uses interval arithmetic, not +30 days', async () => {
+  test('EXPIRY IS READ, NOT RECOMPUTED — the query derives no date of its own', async () => {
     const { sql } = sqlWithConstraints([]);
     await runNotificationJob(sql, creditExpiryJob(14, cfg()), cfg());
     const q = sql.matching(/SELECT u\.id AS user_id/)[0];
-    // + INTERVAL '1 month' on 31 January gives 28 February, which is what a
-    // billing cycle does. Adding 30 days gives 2 March.
-    assert.match(q.text, /INTERVAL '1 month'/);
-    assert.ok(!/30 days/.test(q.text));
+
+    // This used to reconstruct the expiry as cycle_started_at + INTERVAL '1
+    // month', and the month-end concern lived here: +1 month on 31 January is
+    // 28 February, whereas +30 days is 2 March.
+    //
+    // That arithmetic moved to where lots are GRANTED, which is the only place
+    // that should decide when credits die. A warning job that recomputes the
+    // date can disagree with the sweep that enforces it — and then a customer
+    // is warned on one day and loses the credits on another.
+    //
+    // So the assertion is now the stronger one: this query does no date maths
+    // beyond the lead-time comparison. It reads the stored column.
+    assert.match(q.text, /cl\.expires_at/, 'must read the stored expiry');
+    assert.ok(!/INTERVAL '1 month'/.test(q.text), 'must not reconstruct the expiry date');
+    assert.ok(!/30 days/.test(q.text), 'never day-count a month');
   });
 
   test('DRY RUN reports who would be emailed and writes nothing', async () => {
