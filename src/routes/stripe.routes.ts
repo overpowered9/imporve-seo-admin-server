@@ -1300,6 +1300,160 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
 });
 
 /**
+ * Start a hosted Checkout for a FIRST subscription, card and all.
+ * POST /api/v1/stripe/create-subscription-checkout
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ * /subscribe-to-plan charges a card the customer has ALREADY saved; it answers
+ * 400 requires_payment_method when there is none. That left a user with no card
+ * on file having to complete a card-saving step (Elements or a hosted setup
+ * session) purely so a second request could then charge it — two payment UIs,
+ * two round trips, and an abandoned SetupIntent whenever they dropped out.
+ *
+ * Client decision: a user with no payment method goes STRAIGHT to checkout. One
+ * hosted page collects the card, takes the first payment and creates the
+ * subscription, which is also the flow Stripe hardens (3DS/SCA, wallets, local
+ * payment methods) without us reimplementing any of it.
+ *
+ * ── How this differs from /create-checkout-session and /upgrade-plan ────────
+ * Both of those bind the session with `customer_email`, which makes Stripe mint
+ * a NEW customer for every checkout — the card then lands on a customer that is
+ * not the one users.stripe_customer_id points at, so Settings shows no saved
+ * card afterwards. This reuses (or creates, once) the user's real customer.
+ * They also price with ad-hoc `price_data` rather than the plan's configured
+ * Stripe price. This uses stripe_price_id, so what the customer is charged is
+ * the price the plan is actually sold at.
+ *
+ * ── Activation ─────────────────────────────────────────────────────────────
+ * Nothing is granted here. The session carries user_id + plan_id BOTH on itself
+ * and on the subscription it creates, and activation happens in exactly the two
+ * places it already did — /verify-session on return, and the webhook — which
+ * are idempotent with each other. A checkout that is abandoned or declined
+ * therefore leaves no trace in our database at all.
+ */
+router.post('/create-subscription-checkout', async (req: Request, res: Response) => {
+  try {
+    const { user_id, plan_id, success_url, cancel_url, idempotency_key } = z.object({
+      user_id: z.number(),
+      plan_id: z.number(),
+      success_url: z.string().url(),
+      cancel_url: z.string().url(),
+      // Same contract as /subscribe-to-plan: one key per confirm action, reused
+      // across retries, so a double-clicked button cannot open two checkouts.
+      idempotency_key: z.string().min(8).max(200).optional()
+    }).parse(req.body);
+
+    // A subscription is a purchase, so the same address rule applies here as on
+    // every other money-moving endpoint. Checked BEFORE any Stripe object is
+    // created, so a blocked user leaves nothing behind.
+    if (await blockedForMissingAddress(user_id, res)) return;
+
+    const [userResult, planResult] = await Promise.all([
+      sql`SELECT id, email, stripe_customer_id FROM users WHERE id = ${user_id}`,
+      sql`SELECT * FROM subscription_plans WHERE id = ${plan_id}`
+    ]);
+
+    if (userResult.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+    if (planResult.length === 0) {
+      return res.status(404).json({ success: false, error: 'Plan not found' });
+    }
+
+    const user = userResult[0];
+    const plan = planResult[0];
+
+    if (plan.price_cents === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot subscribe to the free plan via checkout'
+      });
+    }
+
+    if (!plan.stripe_price_id) {
+      return res.status(500).json({
+        success: false,
+        error: 'Stripe Price ID not configured for this plan. Please contact support.'
+      });
+    }
+
+    // ── The guard that keeps this endpoint safe ──────────────────────────────
+    // Checkout in `mode: 'subscription'` CREATES a subscription. Running it for
+    // someone who already has one would leave them holding two, billed twice,
+    // with our single-row subscriptions table only able to remember the second.
+    // A plan CHANGE is /change-plan's job — it prorates against the existing
+    // subscription instead of starting a parallel one.
+    const existing = await getUserSubscription(user_id);
+    const liveStatuses = ['active', 'trialing', 'past_due', 'unpaid'];
+    if (existing?.stripe_subscription_id && liveStatuses.includes(String(existing.status))) {
+      return res.status(409).json({
+        success: false,
+        error: 'You already have a subscription. Change your plan instead of starting a new one.',
+        code: 'SUBSCRIPTION_EXISTS'
+      });
+    }
+
+    // Reuse the customer we already know about; create one only the first time.
+    // Same shape as /create-setup-intent, deliberately — one user must never end
+    // up with two Stripe customers.
+    let customerId = user.stripe_customer_id as string | null;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        metadata: { user_id: user_id.toString() }
+      });
+      customerId = customer.id;
+      await sql`UPDATE users SET stripe_customer_id = ${customerId} WHERE id = ${user_id}`;
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      mode: 'subscription',
+      line_items: [{ price: plan.stripe_price_id, quantity: 1 }],
+      // The card is kept on the customer, so renewals and every later upgrade
+      // run off a saved payment method rather than sending the user back here.
+      payment_method_collection: 'always',
+      success_url: withSessionId(success_url),
+      cancel_url: cancel_url,
+      client_reference_id: user_id.toString(),
+      // On the SESSION for /verify-session, and on the SUBSCRIPTION for the
+      // customer.subscription.created webhook. Both readers need the plan; the
+      // webhook never sees the session, and without plan_id it would fall back
+      // to the user's CURRENT (free) plan and grant the wrong credits.
+      metadata: {
+        user_id: user_id.toString(),
+        plan_id: plan_id.toString()
+      },
+      subscription_data: {
+        metadata: {
+          user_id: user_id.toString(),
+          plan_id: plan_id.toString()
+        }
+      }
+    }, idempotencyKeyFor('subscription-checkout', user_id, idempotency_key));
+
+    console.log(`🧾 Checkout session ${session.id} opened for user ${user_id} → ${plan.name}`);
+
+    res.json({
+      success: true,
+      data: {
+        session_id: session.id,
+        url: session.url,
+        plan_name: plan.name,
+        price_cents: plan.price_cents
+      }
+    });
+
+  } catch (error) {
+    console.error('Create subscription checkout error:', error);
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to start checkout'
+    });
+  }
+});
+
+/**
  * Preview what a plan change will cost, WITHOUT committing to it.
  * POST /api/v1/stripe/preview-plan-change
  *
