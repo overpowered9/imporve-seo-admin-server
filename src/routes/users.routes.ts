@@ -627,6 +627,13 @@ router.patch('/profile/:user_id', async (req, res) => {
       // came back as a Zod failure naming neither the field nor the real limit.
       // The two numbers have to agree, and the form's is the looser one.
       first_name: z.string().trim().min(1).max(100).optional(),
+      // Deliberately NOT .min(1) here, even though a last name is now required.
+      //
+      // A Zod failure serialises as a raw issues array, and the CMS surfaces
+      // `error` verbatim — so a user who cleared the field would be shown a
+      // JSON dump mentioning "too_small" instead of being told to enter their
+      // last name. The requirement is enforced just below, in one place, with
+      // wording a person can act on and identical for both request shapes.
       last_name: z.string().trim().max(100).optional(),
       // Composed from the parts whenever they are supplied, so this bound now
       // only constrains a legacy caller sending `name` on its own. Raised to
@@ -636,6 +643,18 @@ router.patch('/profile/:user_id', async (req, res) => {
 
     let first = body.first_name ?? '';
     let last = body.last_name ?? '';
+
+    // A last name is REQUIRED as of this change, matching the asterisk the CMS
+    // now shows. Enforced on the server as well as in the form because the form
+    // is a courtesy and this is the rule — an asterisk nothing validates is
+    // decorative, and once one asterisk on a page is decorative none of them
+    // mean anything.
+    if (body.first_name !== undefined && !last) {
+      return res.status(400).json({
+        success: false,
+        error: 'Enter your last name.',
+      });
+    }
 
     if (!body.first_name) {
       if (!body.name) {
@@ -647,6 +666,15 @@ router.patch('/profile/:user_id', async (req, res) => {
       const spaceAt = body.name.indexOf(' ');
       first = spaceAt === -1 ? body.name : body.name.slice(0, spaceAt);
       last = spaceAt === -1 ? '' : body.name.slice(spaceAt + 1).trim();
+      // A one-word `name` yields no last name, which the parts path above now
+      // refuses. Refusing it here too keeps the two forms of this request under
+      // the same rule instead of leaving `name` as a way around it.
+      if (!last) {
+        return res.status(400).json({
+          success: false,
+          error: 'A last name is required. Send first_name and last_name, or a full name containing both.',
+        });
+      }
     }
 
     const updated = await updateUserProfileName(user_id, first, last);
