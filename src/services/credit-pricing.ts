@@ -75,3 +75,39 @@ export function publicPricing() {
     keywords: creditsConfig.costs.keywords,
   };
 }
+
+/**
+ * What a balance can still buy, in words.
+ *
+ * The point of this is the moment a generation is refused. "Insufficient ISEO
+ * Credits" tells the user they are blocked and nothing else — not what they
+ * hold, not how short they are, and not that the balance in front of them is
+ * still enough to do something useful. Someone with 5 credits cannot start the
+ * cheapest article (6) but can generate an AI image (5) or five keyword lists.
+ *
+ * Derived from the live price table, so it cannot drift from what is actually
+ * charged, and ordered by usefulness rather than by price — an image is a more
+ * meaningful suggestion than a keyword list.
+ *
+ * Returns null when the balance affords nothing at all; the caller then says so
+ * plainly rather than appending an empty "you could also…".
+ */
+export function affordableWith(balance: number): string | null {
+  const held = Math.max(0, Number(balance) || 0);
+  const options: Array<{ label: (n: number) => string; cost: number }> = [
+    { cost: priceOf('image'), label: (n) => `${n} AI image${n === 1 ? '' : 's'}` },
+    { cost: priceOf('keywords'), label: (n) => `${n} keyword list${n === 1 ? '' : 's'}` },
+  ];
+
+  const affordable = options
+    .filter((o) => o.cost > 0 && held >= o.cost)
+    .map((o) => o.label(Math.floor(held / o.cost)));
+
+  if (affordable.length === 0) return null;
+  return affordable.join(' or ');
+}
+
+/** The cheapest article, for "you are N credits short" messaging. */
+export function cheapestContentCost(): number {
+  return priceOf('content', 'small');
+}

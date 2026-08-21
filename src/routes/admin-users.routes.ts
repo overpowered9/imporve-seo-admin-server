@@ -1,6 +1,10 @@
 import express from 'express';
 import { z } from 'zod';
 import sql from '../data/db.js';
+// Credits live in credit_lots; credit_balances is a derived cache with exactly
+// one writer. Both imports exist so this route cannot reinvent either.
+import { syncBalanceCache } from '../models/user.models.js';
+import { PURCHASED_CREDIT_LIFETIME_MONTHS } from '../config/credits.config.js';
 
 const router = express.Router();
 
@@ -475,52 +479,62 @@ router.post('/:userId/gift-credits', async (req, res) => {
       return res.status(404).json({ success: false, error: 'User not found' });
     }
 
-    // Update/create credits in a transaction
+    // ── Adjustments operate on LOTS, which is where the balance now lives ──
+    //
+    // This edited credit_balances directly. That table became a derived cache
+    // when credits gained expiry dates, so an admin grant produced a number the
+    // customer could see and could not spend — and a removal removed nothing,
+    // because the next read recomputed the cache from the untouched lots.
+    //
+    // Admin grants go to the PURCHASED bucket on a full lifetime: they are a
+    // goodwill gesture or a correction, and expiring them with the current plan
+    // cycle would quietly take them back.
     await sql.begin(async (tx) => {
-      // Check if credit balance row exists
-      const existing = await tx`
-        SELECT id FROM credit_balances WHERE user_id = ${userId} AND credit_type = ${credit_type} LIMIT 1
-      `;
+      const live = (await tx`
+        SELECT id, source, remaining FROM credit_lots
+        WHERE user_id = ${userId} AND remaining > 0 AND expires_at > NOW()
+        ORDER BY expires_at ASC, id ASC
+        FOR UPDATE
+      `) as unknown as Array<{ id: number; source: string; remaining: number }>;
 
-      // Admin adjustments operate on the PURCHASED bucket so manual grants persist across
-      // billing cycles (a monthly refill only resets the plan/included bucket). `amount`
-      // is a generated column (included + purchased) and cannot be written directly.
-      if (existing.length > 0) {
-        if (operation === 'add') {
-          await tx`
-            UPDATE credit_balances
-            SET purchased_remaining = purchased_remaining + ${amount}, updated_at = NOW()
-            WHERE user_id = ${userId} AND credit_type = ${credit_type}
-          `;
-        } else if (operation === 'remove') {
-          // Remove from the total balance, draining purchased first then included.
-          await tx`
-            UPDATE credit_balances
-            SET
-              purchased_remaining = GREATEST(0, purchased_remaining - ${amount}),
-              included_remaining  = GREATEST(0, included_remaining - GREATEST(0, ${amount} - purchased_remaining)),
-              updated_at = NOW()
-            WHERE user_id = ${userId} AND credit_type = ${credit_type}
-          `;
-        } else {
-          // "Set to X" targets the purchased bucket and clears the included bucket so the
-          // visible total equals exactly X.
-          await tx`
-            UPDATE credit_balances
-            SET purchased_remaining = ${amount}, included_remaining = 0, updated_at = NOW()
-            WHERE user_id = ${userId} AND credit_type = ${credit_type}
-          `;
-        }
-      } else {
-        const insertAmount = operation === 'remove' ? 0 : amount;
+      const held = live.reduce((n, l) => n + Number(l.remaining), 0);
+
+      // "set" is expressed as the delta needed to reach the target, so all three
+      // operations share one code path and one set of edge cases.
+      const delta = operation === 'add' ? amount
+        : operation === 'remove' ? -Math.min(amount, held)
+          : amount - held;
+
+      if (delta > 0) {
         await tx`
-          INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
-          VALUES (${userId}, ${credit_type}, 0, 0, ${insertAmount}, NOW())
+          INSERT INTO credit_lots (user_id, source, granted, remaining, expires_at, reason)
+          VALUES (${userId}, 'purchased', ${delta}, ${delta},
+                  NOW() + ${`${PURCHASED_CREDIT_LIFETIME_MONTHS} months`}::interval,
+                  ${`Admin adjustment: ${reason}`})
         `;
+      } else if (delta < 0) {
+        // Drain earliest-expiring first, the same order a generation would —
+        // taking credits back should not leave a customer holding only the
+        // stock that is about to lapse.
+        let outstanding = -delta;
+        for (const lot of live) {
+          if (outstanding <= 0) break;
+          const take = Math.min(Number(lot.remaining), outstanding);
+          await tx`
+            UPDATE credit_lots SET remaining = remaining - ${take}, updated_at = NOW()
+            WHERE id = ${lot.id} AND remaining >= ${take}
+          `;
+          outstanding -= take;
+        }
       }
 
-      // Log transaction (delta: positive for add/set, negative for remove)
-      const delta = operation === 'remove' ? -amount : amount;
+      await syncBalanceCache(tx, userId);
+
+      // Reuses the delta computed above rather than recomputing it. The old
+      // line here was `operation === 'remove' ? -amount : amount`, which logged
+      // a "set" as a positive grant of the target value even when the target
+      // was LOWER than the balance — a reduction recorded in the ledger as an
+      // increase. The delta above is the real movement in all three cases.
       const logReason = operation === 'add' ? `Admin add: ${reason}` :
                         operation === 'remove' ? `Admin remove: ${reason}` :
                         `Admin correction: ${reason}`;

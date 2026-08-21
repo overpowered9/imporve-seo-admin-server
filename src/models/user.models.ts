@@ -192,12 +192,43 @@ export const initializeUserCredits = async (user_id: number, plan_id?: number): 
   // plan-credit-sync.ts) and the rows they seeded no longer exist after migration 011, so
   // inserting them would leave a new signup with no spendable balance at all.
   const allotment = grantForPlanSlug(planData.slug);
-  await sql`
-    INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
-    VALUES (${user_id}, ${ISEO_CREDIT_TYPE}, ${allotment}, ${allotment}, 0, NOW())
-    ON CONFLICT (user_id, credit_type) DO NOTHING
-  `;
-  
+
+  // ── The grant is a LOT, not a balance row ────────────────────────────────
+  // This wrote credit_balances alone, which stopped being enough the moment the
+  // spendable balance started being derived from credit_lots: a brand-new
+  // account got a cached figure it could not spend a single credit of. Not just
+  // a display bug — burnFromLots finds no lots, so every generation is refused.
+  //
+  // Guarded on "has this user any lots yet", which preserves the idempotence the
+  // ON CONFLICT DO NOTHING below provided: signup is retried, and a retry must
+  // not hand out the allotment twice.
+  await sql.begin(async (tx) => {
+    const existing = (await tx`
+      SELECT 1 FROM credit_lots WHERE user_id = ${user_id} LIMIT 1
+    `) as unknown as unknown[];
+
+    await tx`
+      INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
+      VALUES (${user_id}, ${ISEO_CREDIT_TYPE}, 0, ${allotment}, 0, NOW())
+      ON CONFLICT (user_id, credit_type) DO UPDATE SET included_allotment = ${allotment}
+    `;
+
+    if (existing.length === 0 && allotment > 0) {
+      await tx`
+        INSERT INTO credit_lots (user_id, source, granted, remaining, expires_at, plan_id, reason)
+        VALUES (${user_id}, 'plan', ${allotment}, ${allotment},
+                NOW() + ${`${PLAN_CREDIT_LIFETIME_MONTHS} months`}::interval,
+                ${resolvedPlanId}, 'Account created')
+      `;
+      await tx`
+        INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
+        VALUES (${user_id}, ${ISEO_CREDIT_TYPE}, ${allotment}, 'Account created')
+      `;
+    }
+
+    await syncBalanceCache(tx, user_id);
+  });
+
   // ONLY create subscription record for PAID plans
   // Free tier users have NO subscription
   if (planData.price_cents > 0) {
@@ -682,19 +713,39 @@ export const previewUpgradeCreditGrant = async (
  */
 export const suspendPlanCredits = async (user_id: number, reason = 'Subscription suspended'): Promise<void> => {
   await sql.begin(async sql => {
-    const rows = await sql`
-      SELECT credit_type, included_remaining FROM credit_balances
-      WHERE user_id = ${user_id} AND included_remaining > 0
-    `;
-    await sql`
-      UPDATE credit_balances
-      SET included_remaining = 0, updated_at = NOW()
-      WHERE user_id = ${user_id}
-    `;
-    for (const row of rows) {
+    // ── Void the LOTS, not the cache ──────────────────────────────────────
+    // This zeroed credit_balances.included_remaining and nothing else. Once the
+    // balance became derived, that stopped suspending anything at all: the next
+    // read re-computed the cache from the untouched lots and the credits came
+    // straight back.
+    //
+    // The consequence was silent and ongoing — reconcileTrialCredits calls this
+    // on trial expiry, so expired trials carried on generating. Nobody reports
+    // a bug that gives them more than they paid for.
+    //
+    // Purchased lots are deliberately untouched: the user paid for those
+    // separately, and suspension is about the PLAN's allotment.
+    const lots = (await sql`
+      SELECT id, remaining FROM credit_lots
+      WHERE user_id = ${user_id} AND source = 'plan' AND remaining > 0
+      FOR UPDATE
+    `) as unknown as Array<{ id: number; remaining: number }>;
+
+    const voided = lots.reduce((n, l) => n + Number(l.remaining), 0);
+
+    if (lots.length > 0) {
+      await sql`
+        UPDATE credit_lots SET remaining = 0, updated_at = NOW()
+        WHERE id = ANY(${lots.map((l) => l.id)})
+      `;
+    }
+
+    await syncBalanceCache(sql, user_id);
+
+    if (voided > 0) {
       await sql`
         INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
-        VALUES (${user_id}, ${row.credit_type}, ${-Number(row.included_remaining)}, ${reason})
+        VALUES (${user_id}, ${ISEO_CREDIT_TYPE}, ${-voided}, ${reason})
       `;
     }
   });
@@ -1132,7 +1183,7 @@ async function burnFromLots(
  *
  * `amount` is a GENERATED column (included + purchased) and is never written.
  */
-async function syncBalanceCache(tx: any, user_id: number): Promise<void> {
+export async function syncBalanceCache(tx: any, user_id: number): Promise<void> {
   await tx`
     INSERT INTO credit_balances (user_id, credit_type, included_remaining, purchased_remaining, included_allotment, cycle_started_at)
     SELECT ${user_id}, ${ISEO_CREDIT_TYPE},

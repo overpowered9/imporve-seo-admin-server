@@ -25,8 +25,8 @@ import {
 } from '../services/openai-image.service.js';
 import { validateApiAccess, AuthenticatedRequest } from '../middleware/apiAuth.middleware.js';
 import { requireAdmin } from '../middleware/adminAuth.middleware.js';
-import { reserveCredits, refundCredits, ISEO_CREDIT_TYPE } from '../models/user.models.js';
-import { priceOf, type BillableAction } from '../services/credit-pricing.js';
+import { reserveCredits, refundCredits, getLiveBalance, ISEO_CREDIT_TYPE } from '../models/user.models.js';
+import { priceOf, affordableWith, type BillableAction } from '../services/credit-pricing.js';
 import {
   isRegeneration,
   sanitizeTargetKey,
@@ -170,10 +170,24 @@ router.post('/article', validateApiAccess, async (req: AuthenticatedRequest, res
 
   if (!reservation.ok) {
     // Nothing was debited and the model has not been called.
+    //
+    // This said only "Insufficient ISEO Credits" plus the required amount. It
+    // never told the user what they HAVE, how short they are, or that the
+    // balance in front of them might still buy something useful — 5 credits
+    // cannot start the cheapest article (6) but will buy an AI image. The
+    // moment someone is blocked is the moment that guidance is worth most.
+    const balance = await getLiveBalance(userId);
+    const alsoAffords = affordableWith(balance.total);
     return res.status(402).json({
       success: false,
-      error: 'Insufficient ISEO Credits for this generation.',
+      error: alsoAffords
+        ? `Not enough credits: this needs ${cost} and you have ${balance.total}. `
+          + `Your balance is still enough for ${alsoAffords}.`
+        : `Not enough credits: this needs ${cost} and you have ${balance.total}.`,
       required: cost,
+      available: balance.total,
+      shortfall: Math.max(0, cost - balance.total),
+      also_affords: alsoAffords,
     });
   }
 
@@ -304,10 +318,20 @@ router.post('/image', validateApiAccess, async (req: AuthenticatedRequest, res: 
   );
 
   if (!reservation.ok) {
+    // Same reasoning as the content path: say what they hold and what it still
+    // buys, not merely that they are short.
+    const balance = await getLiveBalance(userId);
+    const alsoAffords = affordableWith(balance.total);
     return res.status(402).json({
       success: false,
-      error: 'Insufficient ISEO Credits for this image.',
+      error: alsoAffords
+        ? `Not enough credits: this image needs ${cost} and you have ${balance.total}. `
+          + `Your balance is still enough for ${alsoAffords}.`
+        : `Not enough credits: this image needs ${cost} and you have ${balance.total}.`,
       required: cost,
+      available: balance.total,
+      shortfall: Math.max(0, cost - balance.total),
+      also_affords: alsoAffords,
     });
   }
 

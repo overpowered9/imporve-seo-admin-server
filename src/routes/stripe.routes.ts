@@ -101,6 +101,7 @@ import {
   type DefaultPaymentMethod,
 } from '../services/billing/payment-methods.js';
 import { enqueueEmail } from '../services/billing/email-outbox.js';
+import { publicPricing } from '../services/credit-pricing.js';
 import {
   clearScheduledCancellation,
   releaseOrphanedSchedules,
@@ -507,6 +508,11 @@ router.get('/credit-packages', (_req: Request, res: Response) => {
     data: {
       packages: creditPackages(),
       credits_per_piece: creditsPerPiece(),
+      // The real per-action price table, so the CMS can say what a balance is
+      // good for ("enough for 1 AI image") without shipping a second copy of
+      // the prices that would drift the moment one changed. Same function the
+      // plugin endpoint already serves.
+      pricing: publicPricing(),
     },
   });
 });
