@@ -10,6 +10,8 @@ import { createFakeSql } from '../../test/helpers/fake-sql.js';
 import {
   recordTransaction,
   transactionsFromInvoice,
+  receiptUrlFromSession,
+  fetchCheckoutReceiptUrl,
   readLedger,
 } from './transactions.js';
 
@@ -276,5 +278,78 @@ describe('readLedger', () => {
     await readLedger(sql, 7, { limit: 100000 });
     const q = sql.matching(/FROM billing_transactions/)[0];
     assert.ok(q.params.includes(101), 'clamped to 100 (+1 probe row)');
+  });
+});
+
+describe('receipt links for credit purchases', () => {
+  // Every credit_purchase row in the database had receipt_url NULL while Stripe
+  // held the link, because nothing ever looked for it. The Account Activity CSV
+  // therefore had an empty Receipt column on exactly the rows people expense.
+
+  test('reads the receipt off the charge behind the payment intent', () => {
+    const session = {
+      id: 'cs_test_1',
+      payment_intent: { latest_charge: { receipt_url: 'https://pay.stripe.com/receipts/abc' } },
+    };
+    assert.equal(receiptUrlFromSession(session), 'https://pay.stripe.com/receipts/abc');
+  });
+
+  test('an UNEXPANDED payment_intent reads as absent, not as a receipt', () => {
+    // This is the shape the webhook actually receives — a bare id string. Had
+    // this returned something truthy, we would have stored an id as a URL.
+    assert.equal(receiptUrlFromSession({ id: 'cs_1', payment_intent: 'pi_123' }), null);
+    assert.equal(
+      receiptUrlFromSession({ id: 'cs_1', payment_intent: { latest_charge: 'ch_123' } }),
+      null,
+    );
+  });
+
+  test('a session with no payment at all yields null', () => {
+    assert.equal(receiptUrlFromSession({ id: 'cs_1' }), null);
+    assert.equal(receiptUrlFromSession(null), null);
+    assert.equal(
+      receiptUrlFromSession({ payment_intent: { latest_charge: { receipt_url: null } } }),
+      null,
+    );
+  });
+
+  test('fetches with payment_intent.latest_charge expanded', async () => {
+    const calls: any[] = [];
+    const stripe = {
+      checkout: {
+        sessions: {
+          async retrieve(id: string, params?: any) {
+            calls.push({ id, params });
+            return { id, payment_intent: { latest_charge: { receipt_url: 'https://r/1' } } };
+          },
+        },
+      },
+    };
+    assert.equal(await fetchCheckoutReceiptUrl(stripe, 'cs_1'), 'https://r/1');
+    // Without the expand the retrieve returns a bare id and this whole thing is
+    // a no-op that silently keeps storing null.
+    assert.deepEqual(calls[0].params, { expand: ['payment_intent.latest_charge'] });
+  });
+
+  test('a Stripe failure returns null instead of throwing', async () => {
+    // THE point of the guard: this runs in the webhook that grants credits the
+    // customer has already paid for. Throwing here would abort that handler.
+    const stripe = {
+      checkout: {
+        sessions: {
+          async retrieve() { throw new Error('stripe is down'); },
+        },
+      },
+    };
+    assert.equal(await fetchCheckoutReceiptUrl(stripe, 'cs_1'), null);
+  });
+
+  test('no session id means no call and no receipt', async () => {
+    let called = false;
+    const stripe = {
+      checkout: { sessions: { async retrieve() { called = true; return {}; } } },
+    };
+    assert.equal(await fetchCheckoutReceiptUrl(stripe, null), null);
+    assert.equal(called, false, 'must not call Stripe with an empty id');
   });
 });

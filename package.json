@@ -25,6 +25,7 @@
     "backfill:payment-defaults": "tsx src/scripts/backfill-default-payment-methods.ts",
     "backfill:transactions": "tsx src/scripts/backfill-billing-transactions.ts",
     "backfill:cancellation-flags": "tsx src/scripts/backfill-stale-cancellations.ts",
+    "backfill:receipts": "tsx src/scripts/backfill-credit-purchase-receipts.ts",
     "migrations:print": "tsx src/scripts/print-migrations.ts",
     "monitor:ledger-gaps": "tsx src/scripts/check-ledger-gaps.ts",
     "notify": "tsx src/scripts/run-notification-jobs.ts",

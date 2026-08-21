@@ -78,15 +78,21 @@ DATABASE_MIGRATIONS.sql
 add_stripe_price_id.sql
 *.sql
 /extra
-/src/scripts
+/src/scripts/*
 # …but the OPERATIONAL scripts must ship: the backfills are deliverables the
 # billing tickets require, and the CLI entry points are documented in
 # docs/BILLING_RUNBOOK.md as the way to run and pause these jobs. An on-call
 # runbook that references a script nobody else has is not a runbook.
 #
-# (The six scripts already tracked above this rule stay tracked because git
-# ignores .gitignore for files already in the index — which is why this was not
-# noticed sooner. New ones need an explicit negation.)
+# (The scripts already tracked stayed tracked because git ignores .gitignore for
+# files already in the index — which is why this was not noticed sooner.)
+#
+# The rule above is `/src/scripts/*`, NOT `/src/scripts`. That distinction is
+# load-bearing: git does not descend into an excluded DIRECTORY, so every
+# negation below was inert while the rule named the directory itself. Excluding
+# the contents leaves the directory readable, and the negations take effect.
+# A new operational script needs a line here AND will otherwise be silently
+# dropped from the deploy while its npm entry point remains in package.json.)
 !/src/scripts/print-migrations.ts
 !/src/scripts/backfill-default-payment-methods.ts
 !/src/scripts/backfill-billing-transactions.ts
@@ -94,4 +100,5 @@ add_stripe_price_id.sql
 !/src/scripts/check-ledger-gaps.ts
 !/src/scripts/run-notification-jobs.ts
 !/src/scripts/drain-email-outbox.ts
+!/src/scripts/backfill-credit-purchase-receipts.ts
 /claude reference

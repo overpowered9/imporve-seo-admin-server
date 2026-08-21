@@ -143,6 +143,60 @@ export async function recordTransaction(
 }
 
 /**
+ * The receipt link for a one-off Checkout payment.
+ *
+ * Invoice-backed rows get theirs from `hosted_invoice_url` (see
+ * transactionsFromInvoice). A credit top-up has no invoice — it is a Checkout
+ * Session in `payment` mode — so its receipt lives one level down, on the
+ * charge behind the payment intent. Nothing was reading it, which is why every
+ * credit_purchase row in the ledger has a null receipt_url while Stripe has had
+ * the URL all along. Those are precisely the rows a customer wants a receipt
+ * for; a plan change at least appears on the next invoice.
+ *
+ * Pure, and separate from the fetch below, so the shape-handling is testable
+ * without a network: the webhook payload carries `payment_intent` as a bare id
+ * string, and an unexpanded field must read as "absent", not as a receipt.
+ */
+export function receiptUrlFromSession(session: any): string | null {
+  const intent = session?.payment_intent;
+  if (!intent || typeof intent === 'string') return null;
+  const charge = intent.latest_charge;
+  if (!charge || typeof charge === 'string') return null;
+  return charge.receipt_url || null;
+}
+
+/** The minimum of a Stripe client this needs — structural, like SqlLike. */
+type CheckoutRetriever = {
+  checkout: { sessions: { retrieve: (id: string, params?: any) => Promise<any> } };
+};
+
+/**
+ * Re-read a Checkout Session with enough expanded to find its receipt.
+ *
+ * NEVER THROWS, for the same reason recordTransaction does not: this runs in
+ * the webhook that grants purchased credits. The customer has already paid. A
+ * Stripe hiccup while fetching a convenience link must not abort that handler
+ * and leave the credits ungranted — the worst acceptable outcome is the null
+ * receipt_url we store today, and recordTransaction's COALESCE upsert means a
+ * later backfill can still fill it in.
+ */
+export async function fetchCheckoutReceiptUrl(
+  stripe: CheckoutRetriever,
+  sessionId: string | null | undefined,
+): Promise<string | null> {
+  if (!sessionId) return null;
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['payment_intent.latest_charge'],
+    });
+    return receiptUrlFromSession(session);
+  } catch (error) {
+    console.error(`[billing] could not fetch receipt for session ${sessionId}:`, error);
+    return null;
+  }
+}
+
+/**
  * Turn a Stripe invoice into ledger rows.
  *
  * An upgrade invoice carries BOTH a credit for unused time and a charge for the

@@ -110,6 +110,7 @@ import {
 import {
   recordTransaction,
   transactionsFromInvoice,
+  fetchCheckoutReceiptUrl,
   readLedger,
 } from '../services/billing/transactions.js';
 import {
@@ -345,6 +346,13 @@ const applyCreditTopupOnce = async (session: Stripe.Checkout.Session): Promise<b
   // previously left no trace in any billing record. Keyed on the SESSION, the
   // same claim this function already holds, so the webhook and /verify-session
   // cannot produce two rows.
+  // The webhook payload carries payment_intent as a bare id, so the receipt has
+  // to be fetched. Without this every credit purchase landed in the ledger with
+  // a null receipt_url and downloaded to an Account Activity CSV with an empty
+  // Receipt column — on exactly the rows people expense. Returns null rather
+  // than throwing: the credits above are already granted and paid for.
+  const receiptUrl = await fetchCheckoutReceiptUrl(stripe, session.id);
+
   await recordTransaction(sql, {
     userId,
     type: 'credit_purchase',
@@ -355,6 +363,7 @@ const applyCreditTopupOnce = async (session: Stripe.Checkout.Session): Promise<b
     currency: session.currency || 'usd',
     providerEventId: claimId,
     providerObjectId: session.id,
+    receiptUrl,
     creditType,
     creditDelta: quantity,
   });
