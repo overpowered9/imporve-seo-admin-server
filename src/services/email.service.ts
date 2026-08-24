@@ -1054,11 +1054,23 @@ export interface CancelledPayload {
 
 export interface CreditExpiryPayload {
   firstName: string;
+  /** Already worded, e.g. "214 plan credits" or "100 credits (60 plan, 40 purchased)". */
   expiringAmount: string;
   expiryDate: string;
   remainingAfter: string;
   ctaUrl: string;
   leadTimeLabel: string;
+  /**
+   * The raw split, for copy that wants to phrase it differently from
+   * `expiringAmount`. Plan credits come with the subscription and lapse with
+   * their cycle; purchased ones were paid for separately and last 12 months.
+   * Either can be 0 — most batches are entirely one kind.
+   *
+   * Optional so an older queued payload, already serialised into email_sends
+   * before this field existed, still renders when the worker picks it up.
+   */
+  planExpiring?: number;
+  purchasedExpiring?: number;
 }
 
 export interface InactivityPayload {

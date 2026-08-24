@@ -244,3 +244,96 @@ export async function previewUpgrade(
     prorationDate,
   };
 }
+
+/** What actually happened when we tried to bill the proration at upgrade time. */
+export interface ProrationCharge {
+  /** True only when Stripe reports the invoice as paid. */
+  paid: boolean;
+  /** What was billed, in minor units. 0 when there was nothing to bill. */
+  amountCents: number;
+  currency: string;
+  invoiceId: string | null;
+  receiptUrl: string | null;
+  /** Set when billing was attempted and did not succeed. */
+  error: string | null;
+}
+
+/**
+ * Bill the pending proration for an upgrade NOW, instead of at the next cycle.
+ *
+ * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+ * `proration_behavior: 'create_prorations'` does not raise an invoice. It
+ * attaches the adjustment as a PENDING invoice item to be swept up by the next
+ * regular invoice. That is a legitimate Stripe mode, but it did not match a
+ * single thing the product told the customer:
+ *
+ *   • the upgrade preview said "You will be charged this prorated amount now"
+ *   • the success dialog said "Prorated charge applied"
+ *   • the ledger row said "billed on your next invoice", status `pending`
+ *
+ * Three statements about one payment, and the only true one was the third. The
+ * customer reported exactly that contradiction. Worse, nothing ever settled the
+ * pending row: when the next invoice finally paid, its lines arrived under a
+ * different idempotency namespace and landed as SEPARATE `proration_charge`
+ * rows, so the upgrade appeared twice and the first copy stayed `pending`
+ * forever.
+ *
+ * Charging now collapses all of it: the money moves when we say it does, the
+ * row is `succeeded` with a real amount and a real receipt, and there is no
+ * second row later because the items have already been billed.
+ *
+ * ── WHY IT NEVER THROWS ─────────────────────────────────────────────────────
+ * The subscription has ALREADY been moved to the new plan by the time this
+ * runs, and the credits have been granted. Throwing here would report failure
+ * for an upgrade that demonstrably happened. So a billing failure degrades to
+ * exactly the old behaviour — the charge stays pending on the subscription and
+ * Stripe's own dunning collects it on the next invoice — and the caller records
+ * the row as pending, which is then the truth rather than a contradiction.
+ */
+export async function chargeProrationNow(
+  stripe: Stripe,
+  params: { customerId: string; subscriptionId: string; idempotencyKey?: string },
+): Promise<ProrationCharge> {
+  const nothingToBill: ProrationCharge = {
+    paid: true, amountCents: 0, currency: 'usd', invoiceId: null, receiptUrl: null, error: null,
+  };
+
+  try {
+    // `subscription` scopes the draft to this subscription's pending items, so
+    // an unrelated pending item on the customer cannot be swept into it.
+    const draft = await stripe.invoices.create({
+      customer: params.customerId,
+      subscription: params.subscriptionId,
+      // We pay it explicitly below; letting Stripe advance it too invites a
+      // race where both attempt collection.
+      auto_advance: false,
+      collection_method: 'charge_automatically',
+      description: 'Prorated charge for your plan upgrade',
+    }, params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : undefined);
+
+    // A same-plan or fully-credited change produces a zero invoice. Paying it
+    // is a no-op that still leaves a $0 invoice in the customer's history, so
+    // void it and report the honest "nothing was charged".
+    if (!draft.id) return nothingToBill;
+    if ((draft.amount_due ?? 0) <= 0) {
+      try { await stripe.invoices.voidInvoice(draft.id); } catch { /* a draft may simply be deleted */ }
+      return { ...nothingToBill, currency: draft.currency || 'usd' };
+    }
+
+    const paid = await stripe.invoices.pay(draft.id);
+    return {
+      paid: paid.status === 'paid',
+      amountCents: paid.amount_paid ?? paid.amount_due ?? 0,
+      currency: paid.currency || 'usd',
+      invoiceId: paid.id ?? null,
+      receiptUrl: paid.hosted_invoice_url || paid.invoice_pdf || null,
+      error: paid.status === 'paid' ? null : `invoice status ${paid.status}`,
+    };
+  } catch (err: any) {
+    // Card declined, no payment method, Stripe unreachable — all the same shape
+    // to the caller: the plan changed, the money did not move yet.
+    const message = err?.message || String(err);
+    console.error(`⚠️ Could not bill the upgrade proration now (${params.subscriptionId}):`, message);
+    return { paid: false, amountCents: 0, currency: 'usd', invoiceId: null, receiptUrl: null, error: message };
+  }
+}

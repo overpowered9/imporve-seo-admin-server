@@ -17,6 +17,7 @@ import {
   getFreePlanId,
   hasBillingAddress,
   previewUpgradeCreditGrant,
+  getLiveBalance,
   ISEO_CREDIT_TYPE
 } from '../models/user.models.js';
 // The plan's monthly credit allotment, for the quote branches that do not go
@@ -118,8 +119,16 @@ import {
   recordDisclosure,
   settleDisclosure,
   isProrationLine,
+  chargeProrationNow,
   type ProrationQuote,
 } from '../services/billing/proration.js';
+import {
+  describePlanUpgraded,
+  describePlanDowngradeScheduled,
+  describeCreditPurchase,
+  planUpgradeConfirmation,
+  reactivationConfirmation,
+} from '../services/billing/descriptions.js';
 
 const router = express.Router();
 
@@ -356,9 +365,10 @@ const applyCreditTopupOnce = async (session: Stripe.Checkout.Session): Promise<b
   await recordTransaction(sql, {
     userId,
     type: 'credit_purchase',
-    description: legacyCreditType && legacyCreditType !== ISEO_CREDIT_TYPE
-      ? `${quantity} ISEO credits (purchased as "${legacyCreditType}")`
-      : `${quantity} ISEO credits`,
+    // One wording for the whole ledger — see services/billing/descriptions.ts.
+    // The legacy pool label is dropped: it named an internal bucket that no
+    // longer exists and meant nothing to the customer reading the row.
+    description: describeCreditPurchase(quantity),
     amountCents: typeof session.amount_total === 'number' ? session.amount_total : null,
     currency: session.currency || 'usd',
     providerEventId: claimId,
@@ -925,7 +935,12 @@ router.post('/webhook', async (req: Request, res: Response) => {
             // and the charge for the new plan appear as separate, labelled
             // entries rather than a single net figure the customer cannot
             // reconcile against their statement.
-            for (const txn of transactionsFromInvoice(invoice, user_id, plan_id)) {
+            // planResult is already loaded above for the refill; passing the
+            // name lets the row be described in our own wording instead of
+            // Stripe's invoice-line text.
+            for (const txn of transactionsFromInvoice(
+              invoice, user_id, plan_id, planResult[0]?.name ?? null,
+            )) {
               await recordTransaction(sql, txn);
             }
           }
@@ -1845,6 +1860,11 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
  * POST /api/v1/stripe/change-plan
  */
 router.post('/change-plan', async (req: Request, res: Response) => {
+  // Hoisted to the route scope: both are set inside the Stripe branch below but
+  // read again when the response is built, so the confirmation the customer
+  // sees quotes the same figures the ledger row recorded.
+  let proratedCents: number | null = null;
+  let charge: Awaited<ReturnType<typeof chargeProrationNow>> | null = null;
   try {
     // `proration_date` is the timestamp returned by /preview-plan-change. When
     // present it is replayed to Stripe so the customer is charged exactly the
@@ -1981,14 +2001,26 @@ router.post('/change-plan', async (req: Request, res: Response) => {
         (releasedSchedules.length ? ` — released ${releasedSchedules.length} orphaned schedule(s)` : ''),
       );
 
+      // The balance, so the confirmation can say the credits survived — the
+      // thing people most fear losing when they undo a cancellation. Best
+      // effort: a failed read costs one sentence, never the reactivation.
+      let reactivationCredits: number | null = null;
+      try {
+        reactivationCredits = (await getLiveBalance(user_id)).total;
+      } catch (balanceErr) {
+        console.error('⚠️ Could not read the balance for the reactivation notice:', balanceErr);
+      }
+
       return res.json({
         success: true,
-        // Names the plan that is now running, which is the question the user
-        // actually has after pressing Reactivate.
-        // No " plan" suffix: the names in subscription_plans already carry it
-        // ("Pro Plan", "Starter Plan"), so appending one read "Your Pro Plan
-        // plan is active again."
-        message: `${newPlan.name} is active again. Billing continues as normal and you were not charged today.`,
+        // Shared wording with the CMS's own Reactivate Plan button — see
+        // services/billing/descriptions.ts. Reactivation is reachable from two
+        // places and must read identically from both.
+        message: reactivationConfirmation({
+          planName: newPlan.name,
+          nextBillingDate: currentSub.next_billing_date,
+          credits: reactivationCredits,
+        }),
         immediate: true,
         reactivated: true,
         effective_date: new Date().toISOString(),
@@ -2159,7 +2191,6 @@ router.post('/change-plan', async (req: Request, res: Response) => {
         //
         // Computed once and reused by the ledger write below, so the audit row
         // and the customer-visible transaction can never quote two figures.
-        let proratedCents: number | null = null;
         if (isUpgrade) {
           try {
             const upcoming = await stripe.invoices.createPreview({
@@ -2173,6 +2204,48 @@ router.post('/change-plan', async (req: Request, res: Response) => {
           } catch (settleErr) {
             // Never fail a completed plan change over an audit write.
             console.error('⚠️ Could not reconcile the disclosure after the change:', settleErr);
+          }
+        }
+
+        // ── Bill the proration NOW, because that is what we told the customer ──
+        //
+        // `create_prorations` above only ATTACHES the adjustment as a pending
+        // invoice item; Stripe bills it on the next regular invoice. That
+        // contradicted every message the product showed:
+        //
+        //   preview  "You will be charged this prorated amount now"
+        //   dialog   "Prorated charge applied"
+        //   ledger   "(prorated, billed on your next invoice)", status pending
+        //
+        // Three statements about one payment, and only the last was true. The
+        // customer reported exactly that. Nothing settled the pending row
+        // either — when the next invoice paid, its lines arrived under a
+        // different idempotency namespace and became SEPARATE rows, so the
+        // upgrade appeared twice and the first copy stayed pending forever.
+        //
+        // Invoicing here makes the first two true and removes the need for the
+        // third. If it fails, the plan change still stands (Stripe has already
+        // applied it), the charge falls back to the next invoice, and the row
+        // below records `pending` — which is then accurate, not contradictory.
+        if (isUpgrade && stripeSubscription.customer) {
+          charge = await chargeProrationNow(stripe, {
+            customerId: stripeSubscription.customer as string,
+            subscriptionId: currentSub.stripe_subscription_id!,
+            // Namespaced off the caller's key so a retried plan change cannot
+            // bill the proration a second time.
+            idempotencyKey: idempotency_key
+              ? `charge-proration:${user_id}:${idempotency_key}`
+              : undefined,
+          });
+          if (charge.paid) {
+            console.log(`💳 Prorated charge of ${charge.amountCents} collected for user ${user_id}`);
+            // What Stripe actually took beats the preview's estimate.
+            if (charge.amountCents > 0) proratedCents = charge.amountCents;
+          } else {
+            console.warn(
+              `⚠️ Prorated charge not collected for user ${user_id} (${charge.error}); `
+              + 'it stays pending and Stripe will bill it on the next invoice.',
+            );
           }
         }
 
@@ -2216,17 +2289,22 @@ router.post('/change-plan', async (req: Request, res: Response) => {
             await recordTransaction(sql, {
               userId: user_id,
               type: 'plan_upgrade',
-              description:
-                `Upgraded ${currentPlan.name} → ${newPlan.name}`
-                + ' (prorated, billed on your next invoice)',
+              description: describePlanUpgraded(currentPlan.name, newPlan.name),
               amountCents: proratedCents,
-              currency: 'usd',
-              status: 'pending',
+              currency: charge?.currency || 'usd',
+              // The status now REPORTS the charge rather than asserting one.
+              // It reads 'pending' only in the fallback case where collection
+              // genuinely did not happen, so a customer never again sees a row
+              // marked pending for money that has already left their account.
+              status: charge?.paid === false ? 'pending' : 'succeeded',
+              // The paid invoice, so the row carries a real receipt like every
+              // other settled charge does.
+              receiptUrl: charge?.receiptUrl ?? null,
               // Namespaced and pinned to the moment of the change, so a second
               // upgrade in the same cycle records separately.
               providerEventId:
                 `plan_change:${currentSub.stripe_subscription_id}:${new_plan_id}:${Math.floor(Date.now() / 1000)}`,
-              providerObjectId: currentSub.stripe_subscription_id,
+              providerObjectId: charge?.invoiceId || currentSub.stripe_subscription_id,
               planId: new_plan_id,
             });
           } else {
@@ -2237,7 +2315,9 @@ router.post('/change-plan', async (req: Request, res: Response) => {
             await recordTransaction(sql, {
               userId: user_id,
               type: 'plan_downgrade',
-              description: `Downgrade scheduled: ${currentPlan.name} → ${newPlan.name}`,
+              description: describePlanDowngradeScheduled(
+                currentPlan.name, newPlan.name, currentSub.next_billing_date,
+              ),
               amountCents: 0,
               currency: 'usd',
               providerEventId: `plan_downgrade:${currentSub.stripe_subscription_id}:${new_plan_id}`,
@@ -2282,7 +2362,18 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     }
 
     // Update database (only after Stripe succeeds)
-    await changePlan(user_id, new_plan_id, isUpgrade);
+    const { creditsGranted } = await changePlan(user_id, new_plan_id, isUpgrade);
+
+    // Read AFTER the grant, so the confirmation quotes the balance the user
+    // will actually see when the page refreshes behind the dialog.
+    let creditsTotal: number | null = null;
+    try {
+      creditsTotal = (await getLiveBalance(user_id)).total;
+    } catch (balanceErr) {
+      // A missing total costs one sentence of the confirmation; it must never
+      // fail an upgrade that has already been paid for.
+      console.error('⚠️ Could not read the balance for the upgrade confirmation:', balanceErr);
+    }
     console.log(`✅ Database updated successfully`);
 
     // BILL-006 — plan change receipt. Keyed on the disclosure the customer
@@ -2332,8 +2423,18 @@ router.post('/change-plan', async (req: Request, res: Response) => {
 
     res.json({
       success: true,
-      message: isUpgrade 
-        ? 'Plan upgraded! Prorated charge applied. Credits have been added to your account.' 
+      message: isUpgrade
+        ? planUpgradeConfirmation({
+          planName: newPlan.name,
+          // null when collection did not happen, so the copy says "will appear
+          // on your next invoice" instead of asserting a charge that did not
+          // occur. `charge` is null only on the non-upgrade paths.
+          chargedCents: charge && !charge.paid ? null : (proratedCents ?? 0),
+          currency: charge?.currency || 'usd',
+          nextBillingDate: currentSub.next_billing_date,
+          creditsGranted,
+          creditsTotal,
+        })
         : `Plan downgrade scheduled for ${currentSub.next_billing_date}. No charge today.`,
       immediate: isUpgrade,
       effective_date: isUpgrade ? new Date().toISOString() : currentSub.next_billing_date,

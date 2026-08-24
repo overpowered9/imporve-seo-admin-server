@@ -175,23 +175,47 @@ describe('BILL-007 — credit expiry', () => {
     assert.equal((await runNotificationJob(september.sql, creditExpiryJob(14, c), c)).queued, 1);
   });
 
-  test('CONSOLIDATION: one user with several expiring types gets ONE email', async () => {
-    // The candidate query aggregates per user (GROUP BY u.id), so multiple
-    // credit types arrive as one row describing all of them.
+  test('CONSOLIDATION: one user with several expiring batches gets ONE email', async () => {
+    // The candidate query aggregates per user (GROUP BY u.id), so plan and
+    // purchased credits expiring on the same date arrive as one row. The
+    // plan/purchased split is FILTERed rather than grouped precisely so this
+    // stays true — a wider GROUP BY would send one email per source.
     const { sql, queued } = sqlWithConstraints([
-      candidate({ content: 50, images: 40, keywords: 10, expiring_total: 100 }),
+      candidate({ expiring_total: 100, plan_expiring: 60, purchased_expiring: 40 }),
     ]);
     const result = await runNotificationJob(sql, creditExpiryJob(14, cfg()), cfg());
 
     assert.equal(result.queued, 1);
-    assert.equal(queued.size, 1, 'one email, not one per credit type');
+    assert.equal(queued.size, 1, 'one email, not one per credit source');
 
     const payload = creditExpiryJob(14, cfg()).payload(
-      candidate({ content: 50, images: 40, keywords: 10, expiring_total: 100 }), cfg(),
+      candidate({ expiring_total: 100, plan_expiring: 60, purchased_expiring: 40 }), cfg(),
     );
-    assert.match(String(payload.expiringAmount), /50 content/);
-    assert.match(String(payload.expiringAmount), /40 image/);
-    assert.match(String(payload.expiringAmount), /10 keyword/);
+    assert.equal(payload.expiringAmount, '100 credits (60 plan, 40 purchased)');
+  });
+
+  test('names the split that is real, not the three pools that merged', () => {
+    // Was "100 credits (100 content, 100 image, 100 keyword)" — three aliases
+    // for one pooled figure, presented as a breakdown. Plan vs purchased is an
+    // actual distinction; content vs image vs keyword stopped being one.
+    const only = (over: Record<string, unknown>) =>
+      String(creditExpiryJob(14, cfg()).payload(candidate(over), cfg()).expiringAmount);
+
+    assert.equal(only({ expiring_total: 214, plan_expiring: 214, purchased_expiring: 0 }),
+      '214 plan credits');
+    assert.equal(only({ expiring_total: 60, plan_expiring: 0, purchased_expiring: 60 }),
+      '60 purchased credits');
+    // Never claims a per-type breakdown that no longer exists.
+    const mixed = only({ expiring_total: 100, plan_expiring: 60, purchased_expiring: 40 });
+    assert.ok(!/content|image|keyword/.test(mixed), mixed);
+  });
+
+  test('the payload carries the plan/purchased figures for the copy owner', () => {
+    const payload = creditExpiryJob(14, cfg()).payload(
+      candidate({ expiring_total: 100, plan_expiring: 60, purchased_expiring: 40 }), cfg(),
+    );
+    assert.equal(payload.planExpiring, 60);
+    assert.equal(payload.purchasedExpiring, 40);
   });
 
   test('the payload carries every documented variable for the copy owner', () => {
@@ -390,10 +414,42 @@ describe('shared runner', () => {
   test('runAllNotificationJobs covers every configured lead time plus inactivity', async () => {
     const { sql } = sqlWithConstraints([]);
     const results = await runAllNotificationJobs(sql, { dryRun: true });
-    // 14, 3, 0 + inactivity
+    // 14, 3, 0 + inactivity. The credit-expiry passes still APPEAR while the
+    // email is gated — a job that vanished from the output would look like a
+    // bug, and this dry run is how the runbook checks what the scheduler does.
     assert.equal(results.length, 4);
-    assert.deepEqual(results.map((r) => r.name), [
-      'credit_expiry(14d)', 'credit_expiry(3d)', 'credit_expiry(0d)', 'inactivity',
-    ]);
+    assert.deepEqual(
+      results.map((r) => r.name.replace(/ — DISABLED .*/, '')),
+      ['credit_expiry(14d)', 'credit_expiry(3d)', 'credit_expiry(0d)', 'inactivity'],
+    );
+  });
+
+  test('the placeholder credit-expiry email is OFF unless explicitly enabled', async () => {
+    // It queues a template that literally reads "[PLACEHOLDER] Your credits
+    // expire in 14 days", from a live Mailgun domain, to every account that
+    // crosses the threshold. LIFECYCLE_EMAILS_ENABLED does NOT hold it back —
+    // that is set, and the scheduler runs daily.
+    const previous = process.env.ISEO_CREDIT_EXPIRY_EMAILS_ENABLED;
+    delete process.env.ISEO_CREDIT_EXPIRY_EMAILS_ENABLED;
+    try {
+      const { sql, queued } = sqlWithConstraints([candidate({ expiring_total: 100 })]);
+      // dryRun: true deliberately. The gate is checked before the runner, so a
+      // dry run proves it just as well — and runExpirySweep() ignores the
+      // injected sql and writes to the REAL database, so a test that passes
+      // dryRun:false expires production lots. Found the hard way.
+      const results = await runAllNotificationJobs(sql, { dryRun: true });
+      const expiry = results.filter((r) => /^credit_expiry\(/.test(r.name));
+
+      assert.equal(expiry.length, 3, 'the passes are still reported');
+      for (const r of expiry) {
+        assert.match(r.name, /DISABLED/, 'and are visibly marked as off');
+        assert.equal(r.queued, 0);
+        assert.equal(r.wouldEmail.length, 0);
+      }
+      assert.equal(queued.size, 0, 'nothing reached the outbox');
+    } finally {
+      if (previous === undefined) delete process.env.ISEO_CREDIT_EXPIRY_EMAILS_ENABLED;
+      else process.env.ISEO_CREDIT_EXPIRY_EMAILS_ENABLED = previous;
+    }
   });
 });

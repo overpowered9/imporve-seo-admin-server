@@ -462,6 +462,30 @@ export const addPurchasedCredits = async (
       VALUES (${user_id}, 'purchased', ${quantity}, ${quantity},
               NOW() + ${`${PURCHASED_CREDIT_LIFETIME_MONTHS} months`}::interval, ${reason})
     `;
+
+    // ── Every purchase renews the clock on ALL purchased credits ─────────────
+    //
+    // Product rule: purchased credits are valid for 12 months from the date of
+    // purchase, and buying more resets that 12 months for the whole purchased
+    // balance. Previously each top-up was an island with its own expiry, so a
+    // regular customer accumulated a row of near-identical dates and the panel
+    // could not state one honest "expiring" date for what they had bought.
+    //
+    // Only LIVE lots. The sweep zeroes `remaining` on lapse, so a wider
+    // predicate would revive nothing — it would only rewrite dead rows and lose
+    // the record of when they actually died.
+    //
+    // This can only ever EXTEND an expiry: the new date is 12 months out and
+    // every existing live lot expires sooner than that by definition.
+    await sql`
+      UPDATE credit_lots
+      SET    expires_at = NOW() + ${`${PURCHASED_CREDIT_LIFETIME_MONTHS} months`}::interval,
+             updated_at = NOW()
+      WHERE  user_id = ${user_id}
+        AND  source = 'purchased'
+        AND  remaining > 0
+        AND  expires_at > NOW()
+    `;
     await sql`
       INSERT INTO credit_balances (user_id, credit_type, included_remaining, included_allotment, purchased_remaining, cycle_started_at)
       VALUES (${user_id}, ${credit_type}, 0, 0, 0, NOW())
@@ -503,6 +527,47 @@ export const addPurchasedCredits = async (
  * day of the cycle, pay a day's proration, collect a month of credits, then
  * downgrade. The proration factor closes that.
  */
+/**
+ * The expiry shared by THIS cycle's plan credits, or null when the cycle has none.
+ *
+ * ── WHY PLAN EXPIRY IS ANCHORED TO THE CYCLE ────────────────────────────────
+ * Every grant used to set `expires_at = NOW() + PLAN_CREDIT_LIFETIME_MONTHS`,
+ * which is right for a refill (a refill IS the start of a cycle) and wrong for
+ * anything granted part-way through one. An upgrade on day 3 minted credits
+ * expiring three days after the cycle's own — so a single billing cycle could
+ * hold two or three plan expiry dates, days apart, for no reason the customer
+ * could see. Production had exactly that: one account with three plan lots
+ * across two expiry dates, all from the same cycle.
+ *
+ * It also made the product's own promise unverifiable. "Plan credits stay
+ * usable for two billing cycles" is a statement about CYCLES, and credits that
+ * expire on a grant-relative date do not honour it — they drift.
+ *
+ * Anchoring means a cycle has exactly one plan expiry, so a user can hold at
+ * most two, which is what lets the balance panel say "last cycle" and "this
+ * cycle" and be literally correct rather than approximately so.
+ *
+ * Returns null when this cycle has granted nothing yet, so callers fall back to
+ * minting a fresh expiry rather than writing null into a NOT NULL column.
+ */
+async function currentCyclePlanExpiry(tx: any, user_id: number): Promise<Date | null> {
+  const rows = await tx`
+    SELECT MAX(l.expires_at) AS expires_at
+    FROM   credit_lots l
+    WHERE  l.user_id = ${user_id}
+      AND  l.source = 'plan'
+      AND  l.remaining > 0
+      AND  l.expires_at > NOW()
+      -- Granted during the current cycle. cycle_started_at is stamped by every
+      -- refill, so this is the boundary the rest of the system already uses.
+      AND  l.granted_at >= COALESCE(
+             (SELECT cycle_started_at FROM credit_balances
+               WHERE user_id = ${user_id} AND credit_type = ${ISEO_CREDIT_TYPE}),
+             l.granted_at)
+  `;
+  return (rows[0] as any)?.expires_at ?? null;
+}
+
 export const upgradeIncludedCredits = async (
   user_id: number,
   newPlan: any,
@@ -517,11 +582,17 @@ export const upgradeIncludedCredits = async (
    * caller is the only one that still knows the previous plan by this point.
    */
   previousPlanSlug?: string | null,
-): Promise<void> => {
+  // Returns the credits actually granted, so the confirmation shown to the
+  // customer can state the real figure instead of a second, independently
+  // computed guess at it. Previously this returned void and the success message
+  // could only say "Credits have been added" without saying how many.
+): Promise<number> => {
   // Guard the factor — a bad cycle date must never invert or inflate a grant.
   const factor = Number.isFinite(prorationFactor)
     ? Math.min(1, Math.max(0, prorationFactor))
     : 1;
+
+  let totalGranted = 0;
 
   await sql.begin(async sql => {
     for (const creditType of CREDIT_TYPES) {
@@ -542,14 +613,23 @@ export const upgradeIncludedCredits = async (
       // can state this number BEFORE the upgrade and be certain it matches what
       // is granted after it. Two copies of a rounding rule is two answers.
       const bump = creditBumpFor(fullDifference, factor);
+      totalGranted += bump;
 
-      // The upgrade difference is its own plan lot, on the normal plan
-      // lifetime — mid-cycle extra credits should not outlive the cycle's own.
+      // The upgrade difference is its own plan lot, but it EXPIRES WITH THE
+      // CYCLE IT BELONGS TO rather than two months from this instant. The
+      // comment here used to say "mid-cycle extra credits should not outlive
+      // the cycle's own" while the code did precisely that — see
+      // currentCyclePlanExpiry. Falls back to a fresh expiry when the cycle has
+      // granted nothing yet, which is the case for an upgrade off the free tier.
       if (bump > 0) {
+        const cycleExpiry = await currentCyclePlanExpiry(sql, user_id);
         await sql`
           INSERT INTO credit_lots (user_id, source, granted, remaining, expires_at, plan_id, reason)
           VALUES (${user_id}, 'plan', ${bump}, ${bump},
-                  NOW() + ${`${PLAN_CREDIT_LIFETIME_MONTHS} months`}::interval,
+                  COALESCE(
+                    ${cycleExpiry}::timestamptz,
+                    NOW() + ${`${PLAN_CREDIT_LIFETIME_MONTHS} months`}::interval
+                  ),
                   ${newPlan?.id ?? null}, ${reason})
         `;
       }
@@ -575,6 +655,9 @@ export const upgradeIncludedCredits = async (
       }
     }
   });
+
+
+  return totalGranted;
 };
 
 /**
@@ -845,11 +928,20 @@ export const getAllSubscriptionPlans = async () => {
 };
 
 // Change subscription plan (upgrade/downgrade)
+/**
+ * Move a user between plans.
+ *
+ * Returns how many credits the change granted, so the caller can tell the
+ * customer the actual number. It used to return nothing, which is why the
+ * upgrade confirmation could only manage the vague "Credits have been added to
+ * your account" — the route had no way to know how many.
+ */
 export const changePlan = async (
   user_id: number, 
   new_plan_id: number, 
   immediate: boolean = true
-) => {
+): Promise<{ creditsGranted: number }> => {
+  let creditsGranted = 0;
   const currentSub = await getUserSubscription(user_id);
   
   if (!currentSub) {
@@ -914,7 +1006,7 @@ export const changePlan = async (
       const factor = proratedCreditsEnabled()
         ? remainingCycleFraction(cycleRows[0]?.cycle_started_at, currentSub.next_billing_date)
         : 1;
-      await upgradeIncludedCredits(
+      creditsGranted = await upgradeIncludedCredits(
         user_id, newPlan[0], 'Plan upgrade credit bonus', factor, previousPlanSlug,
       );
     }
@@ -940,6 +1032,8 @@ export const changePlan = async (
       WHERE user_id = ${user_id}
     `;
   }
+
+  return { creditsGranted };
 };
 
 // Pause subscription
@@ -1202,6 +1296,47 @@ export async function syncBalanceCache(tx: any, user_id: number): Promise<void> 
   `;
 }
 
+
+/** One row of the balance breakdown: a batch of credits sharing an expiry date. */
+export interface CreditLotBucket {
+  source: 'plan' | 'purchased';
+  /** The day they lapse, as YYYY-MM-DD. A day, not an instant — see below. */
+  expires_on: string;
+  remaining: number;
+}
+
+/**
+ * The live balance broken into the batches the customer actually holds.
+ *
+ * getLiveBalance answers "how much, and when does the soonest batch go". The
+ * panel needs more than that: it lists every batch with its own date, so
+ * somebody can see that 214 credits lapse next month while 580 do not.
+ *
+ * Grouped by UTC DAY rather than by `expires_at` itself. Lots created seconds
+ * apart carry different timestamps but lapse on the same date, and the customer
+ * thinks in dates — one row per day is the honest unit, and it is the same
+ * bucketing the expiry-warning emails already use.
+ *
+ * Ordered soonest-first, which is both the order the panel displays and the
+ * order the credits will actually be spent (FEFO).
+ */
+export const getCreditLotSummary = async (user_id: number): Promise<CreditLotBucket[]> => {
+  const rows = await sql`
+    SELECT source,
+           to_char((expires_at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS expires_on,
+           COALESCE(SUM(remaining), 0)::int AS remaining
+    FROM   credit_lots
+    WHERE  user_id = ${user_id} AND remaining > 0 AND expires_at > NOW()
+    GROUP  BY source, (expires_at AT TIME ZONE 'UTC')::date
+    ORDER  BY (expires_at AT TIME ZONE 'UTC')::date ASC, source ASC
+  `;
+  return (rows as unknown as CreditLotBucket[]).map((r) => ({
+    source: r.source,
+    expires_on: r.expires_on,
+    remaining: Number(r.remaining) || 0,
+  }));
+};
+
 /** What the user can actually spend right now, with the next expiry. */
 export const getLiveBalance = async (user_id: number): Promise<LiveBalance> => {
   const rows = (await sql`
@@ -1211,12 +1346,18 @@ export const getLiveBalance = async (user_id: number): Promise<LiveBalance> => {
     GROUP  BY source
   `) as unknown as Array<{ source: string; n: number }>;
 
+  // Grouped by DAY, not by the raw timestamp. Two lots granted minutes apart —
+  // a refill and an upgrade bonus, say — expire at different instants on the
+  // same date, and grouping by instant split them into two buckets so this
+  // reported only the first. The customer then saw "42 expiring on Oct 19" when
+  // 600 were.
   const next = (await sql`
-    SELECT expires_at, COALESCE(SUM(remaining), 0)::int AS n
+    SELECT (expires_at AT TIME ZONE 'UTC')::date AS expires_at,
+           COALESCE(SUM(remaining), 0)::int AS n
     FROM   credit_lots
     WHERE  user_id = ${user_id} AND remaining > 0 AND expires_at > NOW()
-    GROUP  BY expires_at
-    ORDER  BY expires_at ASC
+    GROUP  BY (expires_at AT TIME ZONE 'UTC')::date
+    ORDER  BY (expires_at AT TIME ZONE 'UTC')::date ASC
     LIMIT  1
   `) as unknown as Array<{ expires_at: Date; n: number }>;
 

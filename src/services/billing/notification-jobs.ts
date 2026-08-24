@@ -88,6 +88,35 @@ export const fmtDate = (d?: string | Date | null): string =>
 export const piecesFrom = (content: number, images: number): number =>
   Math.max(0, Math.min(Math.floor(content || 0), Math.floor(images || 0)));
 
+/**
+ * How the expiring amount is described in the email.
+ *
+ * The old wording was `"100 credits (100 content, 100 image, 100 keyword)"` —
+ * a breakdown that stopped being one when the three credit pools merged into a
+ * single weighted pool. Every figure in those brackets was the same number.
+ *
+ * Plan vs purchased IS a real distinction: plan credits come with the
+ * subscription and lapse with their cycle, purchased ones were paid for
+ * separately and last twelve months. So that is what the email names — and only
+ * when a batch actually mixes the two, which is rare. A batch that is entirely
+ * one kind reads as a sentence rather than a table.
+ */
+export const describeExpiringCredits = (
+  total: number,
+  plan: number,
+  purchased: number,
+): string => {
+  const n = (v: number) => Number(v || 0).toLocaleString();
+  if (plan > 0 && purchased > 0) {
+    return `${n(total)} credits (${n(plan)} plan, ${n(purchased)} purchased)`;
+  }
+  if (purchased > 0) return `${n(purchased)} purchased credits`;
+  if (plan > 0) return `${n(plan)} plan credits`;
+  // Neither side attributed — the total is still true, and saying nothing about
+  // provenance beats guessing at it.
+  return `${n(total)} credits`;
+};
+
 export interface Candidate {
   user_id: number;
   email: string;
@@ -264,12 +293,22 @@ export const creditExpiryJob = (leadDays: number, cfg: NotificationConfig): JobD
     -- Grouped by the DATE, so a user warned about one lot expiring is told the
     -- total going with it rather than receiving one email per lot.
     SELECT u.id AS user_id, u.email, u.name,
-           -- The three aliases are kept so the existing email templates keep
-           -- rendering; each reports the same pooled figure.
+           -- The three legacy aliases are kept so nothing that still reads them
+           -- breaks, but they are NOT a per-type split: the three credit pools
+           -- merged into one weighted pool, so each of these is the same pooled
+           -- figure. The email used to render them as "100 credits (100
+           -- content, 100 image, 100 keyword)", which reads as a breakdown and
+           -- is not one.
            COALESCE(SUM(cl.remaining), 0)::int AS content,
            COALESCE(SUM(cl.remaining), 0)::int AS images,
            COALESCE(SUM(cl.remaining), 0)::int AS keywords,
            COALESCE(SUM(cl.remaining), 0)::int AS expiring_total,
+           -- The split that IS real: plan credits come with the subscription
+           -- and lapse with their cycle, purchased ones were paid for
+           -- separately. FILTER rather than a wider GROUP BY, which would send
+           -- one email per source and break the one-email-per-user guarantee.
+           COALESCE(SUM(cl.remaining) FILTER (WHERE cl.source = 'plan'), 0)::int AS plan_expiring,
+           COALESCE(SUM(cl.remaining) FILTER (WHERE cl.source = 'purchased'), 0)::int AS purchased_expiring,
            -- What survives this expiry: everything in later lots.
            COALESCE((
              SELECT SUM(later.remaining)::int FROM credit_lots later
@@ -301,8 +340,15 @@ export const creditExpiryJob = (leadDays: number, cfg: NotificationConfig): JobD
 
   payload: (c, config) => ({
     firstName: firstNameOf(c.name, c.email),
-    expiringAmount: `${Number(c.expiring_total).toLocaleString()} credits`
-      + ` (${c.content} content, ${c.images} image, ${c.keywords} keyword)`,
+    // Names the split that exists (plan vs purchased) rather than the three
+    // pools that no longer do. Falls back to the bare total when a batch is
+    // entirely one kind, so the common case reads as a sentence and not a
+    // table: "214 plan credits", not "214 credits (214 plan, 0 purchased)".
+    expiringAmount: describeExpiringCredits(
+      Number(c.expiring_total), Number(c.plan_expiring), Number(c.purchased_expiring),
+    ),
+    planExpiring: Number(c.plan_expiring) || 0,
+    purchasedExpiring: Number(c.purchased_expiring) || 0,
     expiryDate: fmtDate(c.reset_at),
     remainingAfter: `${Number(c.remaining_after).toLocaleString()} credits`,
     pieces: piecesFrom(c.content, c.images),
@@ -412,8 +458,40 @@ export async function runAllNotificationJobs(
   const cfg = loadNotificationConfig();
   const results: JobResult[] = [];
 
-  // BILL-007 — one pass per configured lead time.
+  // ── BILL-007 — one pass per configured lead time ─────────────────────────
+  //
+  // GATED SEPARATELY from LIFECYCLE_EMAILS_ENABLED, because the template this
+  // queues still reads "[PLACEHOLDER] Your credits expire in 14 days" and the
+  // runbook's claim that the lifecycle gate keeps it off is no longer true —
+  // LIFECYCLE_EMAILS_ENABLED is set, the scheduler runs daily, and the only
+  // reason nothing has been sent is that the job matches EXACTLY N days out and
+  // no account has yet been that close to expiry. The first one to cross 14
+  // days would have received placeholder copy from a live domain.
+  //
+  // Scoped to this job alone so the inactivity job and the rest of the
+  // lifecycle machinery keep working. Dry runs still report exactly who would
+  // be emailed, so the trigger stays demonstrable while it is switched off.
+  //
+  // Flip ISEO_CREDIT_EXPIRY_EMAILS_ENABLED=true once the real copy is in
+  // email.service.ts (creditsExpiringPlaceholder).
+  const creditExpiryEmailsEnabled =
+    String(process.env.ISEO_CREDIT_EXPIRY_EMAILS_ENABLED || 'false').toLowerCase() === 'true';
+
   for (const leadDays of cfg.creditExpiryLeadDays) {
+    if (!creditExpiryEmailsEnabled) {
+      // Reported rather than skipped silently: a job that vanishes from the
+      // output looks like a bug, and the runbook's dry run is how anyone
+      // checks what this scheduler does.
+      results.push({
+        name: `credit_expiry(${leadDays}d) — DISABLED (ISEO_CREDIT_EXPIRY_EMAILS_ENABLED)`,
+        scanned: 0,
+        queued: 0,
+        skippedDuplicate: 0,
+        errors: 0,
+        wouldEmail: [],
+      });
+      continue;
+    }
     const result = await runNotificationJob(sql, creditExpiryJob(leadDays, cfg), cfg, options);
     result.name = `credit_expiry(${leadDays}d)`;
     results.push(result);

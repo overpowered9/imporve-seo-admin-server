@@ -43,8 +43,16 @@ Replace only the strings. Every variable is already computed and passed in.
 Both templates must keep their `html` **and** `text` parts. A receipt that
 renders empty in a plain-text client is a receipt the customer did not get.
 
-⚠️ `LIFECYCLE_EMAILS_ENABLED` stays **false** until this copy is final — the
-placeholder subjects literally read `[PLACEHOLDER]`.
+⚠️ The placeholder subjects literally read `[PLACEHOLDER]`, so this copy must be
+final before the credit-expiry email is switched on.
+
+**This document used to say `LIFECYCLE_EMAILS_ENABLED` keeps it off. Do not rely
+on that.** It was found set to `true` in a live environment with the scheduler
+running daily; nothing had been sent only because no account had yet come within
+the lead window. The credit-expiry job now has its own gate,
+`ISEO_CREDIT_EXPIRY_EMAILS_ENABLED`, which defaults to **false whether or not it
+is set** — an unset variable in a new environment is off, not on. That is the
+flag to flip when the copy lands.
 
 ---
 
@@ -53,7 +61,8 @@ placeholder subjects literally read `[PLACEHOLDER]`.
 | Variable | Default | Effect |
 |---|---|---|
 | `BILLING_EMAILS_ENABLED` | **`true`** | Outbox worker. Set `false` to halt delivery; jobs still queue |
-| `LIFECYCLE_EMAILS_ENABLED` | `false` | Notification scheduler. Keep off until copy is final |
+| `LIFECYCLE_EMAILS_ENABLED` | `false` | Notification scheduler as a whole (credit-expiry + inactivity) |
+| `ISEO_CREDIT_EXPIRY_EMAILS_ENABLED` | `false` | **The credit-expiry email specifically.** Off unless explicitly `true`. Flip only after the placeholder copy is replaced |
 | `LEDGER_MONITOR_ENABLED` | `false` | Hourly ledger gap check. Turn on *after* the transactions backfill |
 | `CREDIT_EXPIRY_LEAD_DAYS` | `14,3,0` | Lead times. Signed off. Comma-separated days |
 | `INACTIVITY_EMAIL_DAYS` | `14` | Consecutive inactive days before the nudge |

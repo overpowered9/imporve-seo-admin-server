@@ -21,7 +21,8 @@ import {
   regenerateApiKey,
   reconcileTrialCredits,
   effectiveTrialEnd,
-  getLiveBalance
+  getLiveBalance,
+  getCreditLotSummary
 } from '../models/user.models.js';
 
 const router = express.Router();
@@ -302,26 +303,51 @@ router.delete('/websites/:website_id', async (req, res) => {
 });
 
 /**
- * Real credit CONSUMPTION per type.
+ * Real credit CONSUMPTION per action, with the generation counts behind it.
  * GET /api/v1/users/credit-usage/:user_id
  *
- * Bug 12: the dashboard showed "0 credits used" after several projects had
- * been run. It derived usage arithmetically as
- * `included_allotment - included_remaining`, which silently collapses to 0
- * whenever `included_allotment` is 0 — true for balance rows created before the
- * bucket columns existed, and whenever the plan lookup it fell back to didn't
- * resolve. It also ignored anything paid for out of PURCHASED credits entirely,
- * so a user spending top-ups always read as 0 used.
+ * ── WHY THIS WAS REWRITTEN ──────────────────────────────────────────────────
+ * The reported symptom: "I generated content and used 6 credits, but plan usage
+ * doesn't show it." The balance dropped correctly; the usage panel stayed at
+ * zero. TWO independent faults each zeroed the answer on their own, which is
+ * why fixing either alone would have looked like it had not worked:
  *
- * This counts what actually happened instead. `credit_transactions` rows with a
- * `generation_id` are consumption events written by deductCredits — one row per
- * generation, whichever bucket paid for it. Grants, refills, purchases and
- * trial suspensions have no generation_id and are excluded, so an expiry sweep
- * can never be mistaken for usage.
+ *  1. The query read `credit_transactions ... AND generation_id IS NOT NULL`.
+ *     The modern content-v2 path reserves credits BEFORE calling the model, so
+ *     the generation row does not exist yet and no id is passed. Every v2 charge
+ *     therefore writes generation_id NULL and was filtered out before counting.
  *
- * Returns both:
- *   cycle    — since cycle_started_at, what "X of Y used" should reconcile with
- *   lifetime — all time, so a brand-new cycle doesn't imply the user never generated
+ *  2. It then did `GROUP BY credit_type` and kept rows whose type was one of
+ *     content/images/keywords. Migration 011 collapsed those into a single
+ *     weighted pool, so credit_type is now always the literal 'iseo' — matching
+ *     none of the three keys. Even a surviving legacy row was discarded.
+ *
+ * The deeper mistake is that both read the CREDIT ledger to answer a question
+ * about ACTIONS. credit_transactions records money-shaped facts — how many
+ * credits left which bucket — and since the pool collapse it carries no action
+ * discriminator at all. `user_generations` is the table that knows what was
+ * actually made, so that is what this now counts. It also yields the generation
+ * COUNTS ("12 posts, 8 images") that the credits alone can never give.
+ *
+ * ── WHERE THE PER-GENERATION COST COMES FROM ────────────────────────────────
+ * content-v2 stamps `metadata.billed = { action, variant, cost }` on the row, so
+ * the price paid is recorded with the thing it paid for. Legacy v1 rows predate
+ * that and have no `billed` block, but they DO pass generation_id, so their cost
+ * is recovered from the ledger by the correlated subquery. New rows take the
+ * first branch, old rows the second, and a row that somehow has neither counts
+ * as a generation costing 0 rather than dropping out of the count entirely.
+ *
+ * NOTE ON THE JSON SHAPE: `metadata` is written with JSON.stringify into a jsonb
+ * column, which stores a jsonb *string* containing JSON rather than an object —
+ * so `metadata->'billed'` is null on every row in the database. Unwrapping with
+ * `#>> '{}'` is what makes it readable. Both shapes are handled so that fixing
+ * the write later cannot break this read.
+ *
+ * Returns, per action (content / images / keywords):
+ *   credits     — credits spent this cycle
+ *   generations — how many were produced this cycle
+ * plus `lifetime` on the same shape, so a freshly reset cycle does not imply the
+ * user has never generated anything.
  */
 router.get('/credit-usage/:user_id', async (req, res) => {
   try {
@@ -331,7 +357,7 @@ router.get('/credit-usage/:user_id', async (req, res) => {
     }
 
     // One cycle start per user; balances are refilled together, so the newest
-    // cycle_started_at is the current cycle for every type.
+    // cycle_started_at is the current cycle.
     const cycleRows = await sql`
       SELECT MAX(cycle_started_at) AS cycle_started_at
       FROM   credit_balances
@@ -339,29 +365,66 @@ router.get('/credit-usage/:user_id', async (req, res) => {
     `;
     const cycleStart = (cycleRows[0] as any)?.cycle_started_at || null;
 
-    // delta is negative for debits; negate to report a positive "used" count.
+    // Only successful generations are usage. A failed run is refunded, so
+    // counting it would show credits spent that the user still holds.
     const rows = await sql`
-      SELECT credit_type,
-             COALESCE(SUM(-delta) FILTER (
+      WITH priced AS (
+        SELECT
+          CASE WHEN ug.type LIKE 'content%' THEN 'content'
+               WHEN ug.type LIKE 'image%'   THEN 'images'
+               ELSE 'keywords' END AS action,
+          ug.created_at,
+          COALESCE(
+            -- content-v2: the price is stamped on the generation itself.
+            (CASE
+               WHEN jsonb_typeof(ug.metadata) = 'string' THEN (ug.metadata #>> '{}')::jsonb
+               WHEN jsonb_typeof(ug.metadata) = 'object' THEN ug.metadata
+             END -> 'billed' ->> 'cost')::int,
+            -- legacy v1: recover it from the ledger row that names this id.
+            (SELECT SUM(-ct.delta)::int
+               FROM credit_transactions ct
+              WHERE ct.generation_id = ug.id::text AND ct.delta < 0),
+            0
+          ) AS cost
+        FROM user_generations ug
+        WHERE ug.user_id = ${user_id}
+          AND ug.status = 'success'
+      )
+      SELECT action,
+             COALESCE(SUM(cost) FILTER (
                WHERE ${cycleStart}::timestamptz IS NULL OR created_at >= ${cycleStart}::timestamptz
-             ), 0)::int AS used_cycle,
-             COALESCE(SUM(-delta), 0)::int AS used_lifetime
-      FROM   credit_transactions
-      WHERE  user_id = ${user_id}
-        AND  delta < 0
-        AND  generation_id IS NOT NULL
-      GROUP  BY credit_type
+             ), 0)::int AS credits_cycle,
+             COUNT(*) FILTER (
+               WHERE ${cycleStart}::timestamptz IS NULL OR created_at >= ${cycleStart}::timestamptz
+             )::int AS generations_cycle,
+             COALESCE(SUM(cost), 0)::int AS credits_lifetime,
+             COUNT(*)::int              AS generations_lifetime
+      FROM   priced
+      GROUP  BY action
     `;
 
-    const empty = { content: 0, images: 0, keywords: 0 };
-    const cycle: Record<string, number> = { ...empty };
-    const lifetime: Record<string, number> = { ...empty };
+    const blank = () => ({
+      content: { credits: 0, generations: 0 },
+      images: { credits: 0, generations: 0 },
+      keywords: { credits: 0, generations: 0 },
+    });
+    const cycle = blank();
+    const lifetime = blank();
+
     for (const r of rows as any[]) {
-      if (r.credit_type in cycle) {
-        cycle[r.credit_type] = Number(r.used_cycle) || 0;
-        lifetime[r.credit_type] = Number(r.used_lifetime) || 0;
-      }
+      const action = r.action as keyof ReturnType<typeof blank>;
+      if (!(action in cycle)) continue;
+      cycle[action] = {
+        credits: Number(r.credits_cycle) || 0,
+        generations: Number(r.generations_cycle) || 0,
+      };
+      lifetime[action] = {
+        credits: Number(r.credits_lifetime) || 0,
+        generations: Number(r.generations_lifetime) || 0,
+      };
     }
+
+    const totalCycleCredits = Object.values(cycle).reduce((n, a) => n + a.credits, 0);
 
     res.json({
       success: true,
@@ -369,6 +432,7 @@ router.get('/credit-usage/:user_id', async (req, res) => {
         cycle,
         lifetime,
         cycle_started_at: cycleStart,
+        total_cycle_credits: totalCycleCredits,
       },
     });
   } catch (error) {
@@ -397,10 +461,24 @@ router.get('/credits/:user_id', async (req, res) => {
     // the CMS came to be summing three stale rows in the first place.
     const balance = await getLiveBalance(user_id);
 
+    // The same balance split into the batches that share an expiry date, so the
+    // panel can list them individually instead of collapsing everything into
+    // one plan figure and one purchased figure. Added ALONGSIDE `balance` for
+    // the same reason `balance` was added alongside `data`: existing callers
+    // keep working, and a CMS that has not been redeployed simply ignores it.
+    const lots = await getCreditLotSummary(user_id);
+
+    // Which cycle the user is in, so the panel can tell this cycle's plan
+    // credits from last cycle's without guessing from the dates.
+    const cycleStartedAt = (credits as any[])
+      .find((c) => c.credit_type === 'iseo')?.cycle_started_at ?? null;
+
     res.json({
       success: true,
       data: credits,
       balance,
+      lots,
+      cycle_started_at: cycleStartedAt,
     });
   } catch (error) {
     console.error('Get user credits error:', error);

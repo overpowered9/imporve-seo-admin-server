@@ -101,4 +101,11 @@ add_stripe_price_id.sql
 !/src/scripts/run-notification-jobs.ts
 !/src/scripts/drain-email-outbox.ts
 !/src/scripts/backfill-credit-purchase-receipts.ts
+!/src/scripts/backfill-credit-expiry.ts
+# Ships despite being a development aid: package.json registers `seed:expiring`,
+# and an npm entry point pointing at a file that was silently dropped from the
+# deploy is the exact failure this whole block exists to prevent. It grants
+# credits nobody paid for, so it demands an explicit --user, tags every lot it
+# creates, and --remove deletes exactly those.
+!/src/scripts/seed-expiring-credits.ts
 /claude reference

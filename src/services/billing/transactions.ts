@@ -35,6 +35,11 @@
  * ordering assumption, no distributed lock.
  */
 import type { SqlLike } from './payment-methods.js';
+import {
+  describeSubscriptionStarted,
+  describeSubscriptionRenewed,
+  describePlanUpgraded,
+} from './descriptions.js';
 
 export type TransactionType =
   | 'credit_purchase'
@@ -209,6 +214,16 @@ export function transactionsFromInvoice(
   invoice: any,
   userId: number,
   planId: number | null = null,
+  /**
+   * The plan this invoice is for.
+   *
+   * Passed in because the row's wording should come from OUR catalogue, not
+   * from Stripe's invoice-line text. Without it the ledger showed lines like
+   * "1 × ImproveSEO Subscription (at $25.00 / month)" — Stripe's internal
+   * product wording leaking into a customer-facing statement, in a grammar
+   * shared with nothing else in the column.
+   */
+  planName: string | null = null,
 ): RecordTransactionInput[] {
   const lines = invoice?.lines?.data ?? [];
   const currency = invoice.currency || 'usd';
@@ -247,12 +262,19 @@ export function transactionsFromInvoice(
       : reason === 'subscription_update' ? 'plan_upgrade'
         : 'renewal';
 
+  // One wording for the whole ledger — see ./descriptions.ts. The Stripe line
+  // description is the last resort, used only when we cannot name the plan.
+  const description = type === 'subscription_create'
+    ? (planName ? describeSubscriptionStarted(planName) : 'Subscription started')
+    : type === 'renewal'
+      ? (planName ? describeSubscriptionRenewed(planName) : 'Subscription renewed')
+      // A subscription_update invoice IS the prorated upgrade being billed.
+      : (planName ? describePlanUpgraded(null, planName) : 'Plan upgraded (prorated)');
+
   return [{
     userId,
     type,
-    description:
-      lines[0]?.description
-      || (type === 'renewal' ? 'Subscription renewal' : 'Subscription charge'),
+    description,
     amountCents: invoice.amount_paid ?? invoice.amount_due ?? 0,
     currency,
     status: (invoice.status === 'paid' ? 'succeeded' : 'pending') as TransactionStatus,
