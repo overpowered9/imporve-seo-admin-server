@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import { createFakeSql } from '../../test/helpers/fake-sql.js';
 import { createFakeStripe } from '../../test/helpers/fake-stripe.js';
 import {
+  groupProrationLines,
   isProrationLine,
   sumProrationLines,
   describeProrationLines,
@@ -99,6 +100,9 @@ describe('describeProrationLines', () => {
     assert.deepEqual(described[0], {
       description: 'Unused time on Grow after 18 Aug 2026',
       amount_cents: -1200,
+      // Null, not absent: this fixture predates Stripe sending a period, and
+      // the grouper has to cope with exactly that shape.
+      period_start: null,
     });
   });
 });
@@ -273,5 +277,96 @@ describe('stale proration_date classification', () => {
   test('a network error is not misread as a stale quote', () => {
     assert.equal(isStaleQuote(new Error('socket hang up')), false);
     assert.equal(isStaleQuote(null), false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Grouping a double upgrade
+//
+// Stripe bills each subscription change as a PAIR — a credit for time unused on
+// the old plan, a charge for time remaining on the new one. Change plan twice in
+// a period and the preview carries four lines, which the confirmation dialog was
+// listing raw for the customer to net out themselves.
+//
+// The amounts below are a real production disclosure: user 36 moved Grow →
+// Optimize on 21 Aug for $15.24, then Optimize → Scale on 24 Aug for $22.19,
+// and was quoted $37.43.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const AUG_24 = 1787529600; // the change being previewed
+const AUG_21 = 1787270400; // an earlier change in the same period
+
+const DOUBLE_UPGRADE = [
+  { description: 'Unused time on ImproveSEO Subscription after 24 Aug 2026', amount_cents: -2264, period_start: AUG_24 },
+  { description: 'Remaining time on ImproveSEO Subscription after 24 Aug 2026', amount_cents: 4483, period_start: AUG_24 },
+  { description: 'Unused time on ImproveSEO Subscription after 21 Aug 2026', amount_cents: -934, period_start: AUG_21 },
+  { description: 'Remaining time on ImproveSEO Subscription after 21 Aug 2026', amount_cents: 2458, period_start: AUG_21 },
+];
+
+describe('groupProrationLines', () => {
+  test('nets each change into one figure', () => {
+    const groups = groupProrationLines(DOUBLE_UPGRADE, AUG_24);
+    assert.equal(groups.length, 2);
+    assert.equal(groups[0].amount_cents, 2219, 'this change: 4483 - 2264');
+    assert.equal(groups[1].amount_cents, 1524, 'the earlier one: 2458 - 934');
+  });
+
+  test('THE INVARIANT: the groups still add up to the total', () => {
+    // The whole point of regrouping is that it changes the presentation and
+    // nothing else. If these ever disagree the dialog is lying about a bill.
+    const groups = groupProrationLines(DOUBLE_UPGRADE, AUG_24);
+    const grouped = groups.reduce((n, g) => n + g.amount_cents, 0);
+    const raw = DOUBLE_UPGRADE.reduce((n, l) => n + l.amount_cents, 0);
+    assert.equal(grouped, raw);
+    assert.equal(grouped, 3743);
+  });
+
+  test('the change being made now comes first and is flagged', () => {
+    const groups = groupProrationLines(DOUBLE_UPGRADE, AUG_24);
+    assert.equal(groups[0].is_current, true);
+    assert.equal(groups[0].at, AUG_24);
+    assert.equal(groups[1].is_current, false);
+    // Exactly one, or the dialog cannot tell the customer which decision is
+    // theirs to make right now.
+    assert.equal(groups.filter((g) => g.is_current).length, 1);
+  });
+
+  test('keeps the charge and the credit halves apart', () => {
+    // A single upgrade shows them itemised; only a multi-change quote nets
+    // them. Both numbers have to survive the grouping for that to be possible.
+    const [current] = groupProrationLines(DOUBLE_UPGRADE, AUG_24);
+    assert.equal(current.charge_cents, 4483);
+    assert.equal(current.credit_cents, -2264);
+  });
+
+  test('tolerates a proration_date that drifted by seconds', () => {
+    // /change-plan retries WITHOUT the quoted date when Stripe calls it stale,
+    // and prices at "now" instead. An exact match would then flag the WRONG
+    // group as current and label this change as an old one.
+    const groups = groupProrationLines(DOUBLE_UPGRADE, AUG_24 + 45);
+    assert.equal(groups[0].at, AUG_24);
+    assert.equal(groups[0].is_current, true);
+  });
+
+  test('a single change is one group', () => {
+    const groups = groupProrationLines(DOUBLE_UPGRADE.slice(0, 2), AUG_24);
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].amount_cents, 2219);
+    assert.equal(groups[0].is_current, true);
+  });
+
+  test('lines with no period still render as the current change', () => {
+    // The pre-2025 payload, and every fixture written before period_start
+    // existed. Treating them as "some earlier change" would push the customer's
+    // own decision out of the headline.
+    const groups = groupProrationLines(describeProrationLines(CLOVER_LINES), null);
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].is_current, true);
+    assert.equal(groups[0].amount_cents, 2413);
+    assert.equal(groups[0].at, null);
+  });
+
+  test('no lines, no groups', () => {
+    assert.deepEqual(groupProrationLines([], AUG_24), []);
   });
 });

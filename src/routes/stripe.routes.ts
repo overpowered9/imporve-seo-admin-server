@@ -120,6 +120,8 @@ import {
   settleDisclosure,
   isProrationLine,
   chargeProrationNow,
+  groupProrationLines,
+  nameChangeGroups,
   type ProrationQuote,
 } from '../services/billing/proration.js';
 import {
@@ -1816,6 +1818,37 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
       currentSub.next_billing_date,
     );
 
+    // ── What the dialog needs to explain the bill ────────────────────────────
+    //
+    // Grouped by the change that produced each pair of lines, so a second
+    // upgrade in the same period reads as two decisions rather than four
+    // accounting entries, and named from our own disclosure records because
+    // Stripe's line says only "ImproveSEO Subscription".
+    const changes = await nameChangeGroups(
+      sql,
+      user_id,
+      groupProrationLines(quote.lines, quote.prorationDate),
+    );
+
+    // The balance the grant lands on. Read here rather than in the dialog: that
+    // component's rule is that it computes nothing, because a figure it worked
+    // out itself is a figure that can disagree with the invoice.
+    let balanceAfter: number | null = null;
+    try {
+      balanceAfter = (await getLiveBalance(user_id)).total + creditGrant.granted_now;
+    } catch (balanceErr) {
+      // Costs one clause of the copy, never the quote.
+      console.error('⚠️ Could not read the balance for the upgrade preview:', balanceErr);
+    }
+
+    // Whole days left, for "the N days left in this period". Ceil so a change
+    // made with a few hours to run still reads as "1 day" rather than "0".
+    const daysRemaining = currentSub.next_billing_date
+      ? Math.max(0, Math.ceil(
+        (new Date(currentSub.next_billing_date).getTime() - Date.now()) / 86_400_000,
+      ))
+      : null;
+
     return serve({
       is_upgrade: true,
       is_first_subscription: false,
@@ -1834,11 +1867,15 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
         ? 'You will be charged this prorated amount now, covering the rest of the current billing period. Your credits are topped up straight away.'
         : 'No charge is due now — the unused portion of your current plan covers the change.',
       lines: quote.lines,
+      changes,
+      days_remaining: daysRemaining,
       payment_method: paymentMethod,
       credits: {
         granted_now: creditGrant.granted_now,
         full_difference: creditGrant.full_difference,
         new_allotment: creditGrant.new_allotment,
+        previous_allotment: creditGrant.previous_allotment,
+        balance_after: balanceAfter,
         prorated: creditGrant.prorated,
       },
     });
