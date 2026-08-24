@@ -30,7 +30,12 @@ const migrations = [
   ['006 — users.default_payment_method_* (BILL-001 local default)', '../migrations/006-default-payment-method.js'],
   ['007 — email_sends + suppression columns (BILL-006, BILL-008)', '../migrations/007-email-sends.js'],
   ['008 — websites.last_connected_at (real plugin connection signal)', '../migrations/008-website-last-connected.js'],
+  ['014 — websites.heartbeat_at (plugin checks in on its own)', '../migrations/014-website-heartbeat.js'],
 ] as const;
+// NOTE: 009–013 are absent from this list and were before 014 was added. Left
+// alone deliberately rather than fixed in passing — whoever added them either
+// applied them by hand or excluded them on purpose, and guessing wrong here
+// means handing someone SQL to run against production.
 
 const rule = '-- ' + '─'.repeat(72);
 

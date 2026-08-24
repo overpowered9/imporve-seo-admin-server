@@ -6,7 +6,19 @@ export interface AuthenticatedRequest extends Request {
   website?: any;
 }
 
-export const validateApiAccess = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+/**
+ * Authenticate a plugin request by API Key + Site Code.
+ *
+ * `stampConnection` exists for exactly one caller: POST /users/disconnect, the
+ * plugin reporting that its credentials have just been removed. That request is
+ * authenticated like any other, so the default behaviour would stamp the site
+ * as connected on its way in — and because the stamp is fire-and-forget, the
+ * UPDATE can land AFTER the handler has cleared it, leaving a site the user
+ * just disconnected showing as Active. Not stamping is the only ordering that
+ * is correct without awaiting a write on the generation hot path.
+ */
+const authenticate = ({ stampConnection }: { stampConnection: boolean }) =>
+  async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   try {
     const api_key = req.headers['x-api-key'] as string;
     const site_code = req.headers['x-site-code'] as string;
@@ -51,13 +63,23 @@ export const validateApiAccess = async (req: AuthenticatedRequest, res: Response
     // CMS can flip a site to "Active" the moment setup succeeds instead of
     // waiting for its first generation.
     //
+    // `x-plugin-heartbeat: 1` marks an UNPROMPTED check-in — the plugin's
+    // hourly ping, sent whether or not it has work to do. That is a different
+    // fact from "the plugin called us", and the CMS needs both: it may only
+    // hold a site's SILENCE against it once that site has proved it would
+    // otherwise have spoken. See migration 014 and utils/websiteStatus.js.
+    //
+    // A presence check rather than a version string, so the plugin can announce
+    // the capability without the two sides agreeing a version scheme.
+    const heartbeat = String(req.headers['x-plugin-heartbeat'] ?? '') === '1';
+
     // Deliberately NOT awaited: this is bookkeeping for a status chip, and a
     // slow or failed write must never delay or break a customer's content
     // generation. touchWebsiteConnection swallows its own errors, including
-    // Postgres 42703 when migration 008 has not run yet (same tolerance the
-    // address endpoints use), so the catch here is only a backstop against an
-    // unexpected synchronous throw.
-    void touchWebsiteConnection(website.id);
+    // Postgres 42703 when migration 008 or 014 has not run yet (same tolerance
+    // the address endpoints use), so the catch here is only a backstop against
+    // an unexpected synchronous throw.
+    if (stampConnection) void touchWebsiteConnection(website.id, { heartbeat });
 
     // Attach user and website to request
     req.user = user;
@@ -72,6 +94,11 @@ export const validateApiAccess = async (req: AuthenticatedRequest, res: Response
     });
   }
 };
+
+export const validateApiAccess = authenticate({ stampConnection: true });
+
+/** Same authentication, but does not record a connection. See `authenticate`. */
+export const validateApiAccessWithoutStamp = authenticate({ stampConnection: false });
 
 /**
  * Legacy pre-flight credit check, retained for the older generation routes only.

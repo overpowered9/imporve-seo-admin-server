@@ -42,6 +42,14 @@ export interface Website {
   // Optional because a database that has not run migration 008 yet simply will
   // not return the column — see touchWebsiteConnection for the writer.
   last_connected_at?: Date | null;
+  /**
+   * When the plugin last sent an UNPROMPTED check-in (migration 014).
+   *
+   * Non-null proves the plugin on this site heartbeats, which is what licenses
+   * the CMS to treat silence as a disconnection. NULL means an older build that
+   * only calls us when it has work — see utils/websiteStatus.js in the CMS.
+   */
+  heartbeat_at?: Date | null;
 }
 
 export interface CreditBalance {
@@ -1626,8 +1634,12 @@ export const getUserWebsites = async (user_id: number): Promise<Website[]> => {
     // `SELECT *` above returns every column, but this mapper is an explicit
     // allow-list, so a new column reaches the CMS only once it is named here.
     // Pre-migration-008 databases have no such column and yield null, which the
-    // CMS reads as "never connected" and falls back to its generations signal.
+    // CMS reads as "never connected".
     last_connected_at: r.last_connected_at ?? null,
+    // Pre-migration-014 yields null here too, which the CMS reads as "older
+    // plugin build" and so declines to hold this site's silence against it.
+    // That is the correct reading either way: no heartbeat has been recorded.
+    heartbeat_at: r.heartbeat_at ?? null,
   })) as Website[];
 };
 
@@ -1648,8 +1660,31 @@ export const getUserWebsites = async (user_id: number): Promise<Website[]> => {
  *    run yet — the same deploy-before-migrate tolerance the address endpoints
  *    use — so shipping this code ahead of the migration is safe.
  */
-export const touchWebsiteConnection = async (website_id: number): Promise<void> => {
+export const touchWebsiteConnection = async (
+  website_id: number,
+  opts: { heartbeat?: boolean } = {},
+): Promise<void> => {
   try {
+    if (opts.heartbeat) {
+      // A heartbeat additionally records the CAPABILITY (migration 014), and
+      // that bit must land on the very first one. Hence `heartbeat_at IS NULL`
+      // in the WHERE: without it, a heartbeat arriving within five minutes of a
+      // generation would be thrown away by the throttle above and the site
+      // would look like an older build until the next hour — or indefinitely,
+      // on a busy site that never has a quiet five minutes.
+      await sql`
+        UPDATE websites
+        SET last_connected_at = NOW(), heartbeat_at = NOW()
+        WHERE id = ${website_id}
+          AND (
+            heartbeat_at IS NULL
+            OR last_connected_at IS NULL
+            OR last_connected_at < NOW() - INTERVAL '5 minutes'
+          )
+      `;
+      return;
+    }
+
     await sql`
       UPDATE websites
       SET last_connected_at = NOW()
@@ -1657,9 +1692,36 @@ export const touchWebsiteConnection = async (website_id: number): Promise<void> 
         AND (last_connected_at IS NULL OR last_connected_at < NOW() - INTERVAL '5 minutes')
     `;
   } catch (error: any) {
-    if (error?.code === '42703') return; // migration 008 has not run yet
+    // 42703 = undefined_column: migration 008 (or 014) has not run yet.
+    if (error?.code === '42703') return;
     console.warn('Failed to stamp website connection (non-fatal):', error?.message ?? error);
   }
+};
+
+/**
+ * Forget that this website was ever connected.
+ *
+ * Called when the plugin tells us it is going away — the API Key or Site Code
+ * has just been cleared on the settings page, or the plugin was deactivated.
+ * That report is what makes the CMS accurate IMMEDIATELY in the case a user is
+ * most likely to check: they remove their credentials and go straight to the
+ * dashboard to confirm. Without it they would wait out the CMS's silence
+ * window instead.
+ *
+ * Both columns are cleared. Leaving `heartbeat_at` set would claim the site is
+ * still running a heartbeating plugin when we have just been told the opposite,
+ * and would then hold that against a site that reconnects on an older build.
+ *
+ * Unlike touchWebsiteConnection this one is AWAITED by its caller and does not
+ * swallow errors: it is the entire purpose of the request that triggers it, so
+ * a failure has to be reported rather than silently dropped.
+ */
+export const clearWebsiteConnection = async (website_id: number): Promise<void> => {
+  await sql`
+    UPDATE websites
+    SET last_connected_at = NULL, heartbeat_at = NULL
+    WHERE id = ${website_id}
+  `;
 };
 
 

@@ -1,7 +1,7 @@
 import express, { type Response as ExpressResponse } from 'express';
 import { z } from 'zod';
 import sql from '../data/db.js';
-import { validateApiAccess } from '../middleware/apiAuth.middleware.js';
+import { validateApiAccess, validateApiAccessWithoutStamp } from '../middleware/apiAuth.middleware.js';
 import { publicPricing } from '../services/credit-pricing.js';
 import { 
   findUserByEmail,
@@ -22,10 +22,58 @@ import {
   reconcileTrialCredits,
   effectiveTrialEnd,
   getLiveBalance,
-  getCreditLotSummary
+  getCreditLotSummary,
+  clearWebsiteConnection
 } from '../models/user.models.js';
 
 const router = express.Router();
+
+/**
+ * The plugin reporting that it is going away.
+ *
+ * Called when the API Key or Site Code is cleared on the settings page, and on
+ * plugin deactivation. Removing credentials is otherwise invisible to us — the
+ * plugin simply stops calling, and silence takes a while to become conclusive.
+ * This is what makes the CMS accurate immediately in the case a user is most
+ * likely to check.
+ *
+ * ── WHY THIS LIVES HERE AND NOT ON /websites ────────────────────────────────
+ * /websites requires a Supabase JWT for every route (see websites.routes.ts).
+ * The plugin has no JWT; it holds an API Key and a Site Code, which is what
+ * validateApiAccess consumes — the same pair it already sends to /users/status.
+ *
+ * ── WHY THIS CANNOT BE ABUSED ───────────────────────────────────────────────
+ * validateApiAccess has already proved the caller holds a valid API key AND a
+ * site code belonging to that same user. So the only site a caller can
+ * disconnect is one they could equally well connect, delete, or generate
+ * against. It clears a status timestamp and nothing else: no content, no
+ * credits, no credentials. Reconnecting is one request.
+ *
+ * TWO ordering hazards, both handled:
+ *
+ *  • The plugin must send this while it still HAS the old credentials.
+ *    WordPress's update_option_* hooks hand it the previous value, so it can
+ *    report the disconnection on its way out.
+ *
+ *  • Authenticating normally would STAMP this site as connected, and because
+ *    that write is fire-and-forget it could land after the clear below. Hence
+ *    validateApiAccessWithoutStamp.
+ */
+router.post('/disconnect', validateApiAccessWithoutStamp, async (req, res) => {
+  try {
+    const website = (req as any).website;
+    await clearWebsiteConnection(website.id);
+    res.json({ success: true, data: { website_id: website.id, connected: false } });
+  } catch (error: any) {
+    // 42703 = undefined_column, i.e. migration 014 has not run on this database
+    // yet. There is nothing to clear, so the plugin's report is satisfied.
+    if (error?.code === '42703') {
+      return res.json({ success: true, data: { connected: false } });
+    }
+    console.error('Failed to clear website connection:', error);
+    res.status(500).json({ success: false, error: 'Failed to record disconnection' });
+  }
+});
 
 // User status endpoint for WordPress plugin connection testing
 router.get('/status', validateApiAccess, async (req, res) => {
