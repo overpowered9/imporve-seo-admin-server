@@ -36,7 +36,8 @@
     "migrate:iseo-credits": "tsx src/migrations/011-iseo-credit-pool.ts",
     "migrate:credit-lots": "tsx src/migrations/012-credit-lots.ts",
     "migrate:yearly-plans": "tsx src/migrations/013-yearly-plans.ts",
-    "migrate:website-heartbeat": "tsx src/migrations/014-website-heartbeat.ts"
+    "migrate:website-heartbeat": "tsx src/migrations/014-website-heartbeat.ts",
+    "migrate:website-limits": "tsx src/migrations/015-plan-website-limits.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",

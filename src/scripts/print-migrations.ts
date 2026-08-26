@@ -31,6 +31,7 @@ const migrations = [
   ['007 — email_sends + suppression columns (BILL-006, BILL-008)', '../migrations/007-email-sends.js'],
   ['008 — websites.last_connected_at (real plugin connection signal)', '../migrations/008-website-last-connected.js'],
   ['014 — websites.heartbeat_at (plugin checks in on its own)', '../migrations/014-website-heartbeat.js'],
+  ['015 — website_limit for Grow (2) and Optimize (3)', '../migrations/015-plan-website-limits.js'],
 ] as const;
 // NOTE: 009–013 are absent from this list and were before 014 was added. Left
 // alone deliberately rather than fixed in passing — whoever added them either
