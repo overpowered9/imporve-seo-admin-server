@@ -17,6 +17,7 @@ import {
   describeCreditPurchase, describeRefund, describeCreditAdjustment,
   describePaymentFailed, describeCreditsExpired,
   planUpgradeConfirmation,
+  planDowngradeConfirmation,
   reactivationConfirmation,
 } from './descriptions.js';
 
@@ -37,10 +38,10 @@ describe('the requested catalogue, line for line', () => {
       'Plan downgrade scheduled — Optimize → Grow, effective Sep 19, 2026',
     );
     assert.equal(describePlanDowngraded('Optimize', 'Grow'), 'Plan downgraded — Optimize → Grow');
-    assert.equal(describeCreditPurchase(60), 'Credit purchase — 60 credits');
+    assert.equal(describeCreditPurchase(60), 'Credit pack purchase — 60 credits');
     assert.equal(
       describeCreditPurchase(60, true),
-      'Credit purchase — 60 credits (Free plan rate)',
+      'Credit pack purchase — 60 credits (Free plan rate)',
     );
     assert.equal(describeRefund(), 'Refund — issued by support');
     assert.equal(
@@ -112,7 +113,7 @@ describe('dates and edge cases', () => {
   });
 
   test('large credit counts are grouped for legibility', () => {
-    assert.equal(describeCreditPurchase(1500), 'Credit purchase — 1,500 credits');
+    assert.equal(describeCreditPurchase(1500), 'Credit pack purchase — 1,500 credits');
     assert.equal(describeCreditsExpired(-1200), 'Credits expired — 1,200 credits');
   });
 
@@ -122,6 +123,135 @@ describe('dates and edge cases', () => {
 
   test('payment failure keeps its existing wording', () => {
     assert.equal(describePaymentFailed(), 'Payment failed — subscription suspended');
+  });
+});
+
+describe('plans are named the way the customer knows them', () => {
+  // subscription_plans.name still holds the ORIGINAL names. Every screen, and
+  // every line QA specified, uses the current ones. Without the mapping the
+  // ledger reads "Upgraded Starter Plan → Pro Plan" — which is what production
+  // actually contains, and what nobody recognises.
+  test('the real database names map to the product names', () => {
+    assert.equal(describeSubscriptionStarted('Starter Plan'), 'Subscription started — Optimize plan');
+    assert.equal(describeSubscriptionStarted('Pro Plan'), 'Subscription started — Scale plan');
+    assert.equal(describeSubscriptionStarted('Grow'), 'Subscription started — Grow plan');
+  });
+
+  test('a transition names both ends correctly', () => {
+    assert.equal(
+      describePlanUpgraded('Grow', 'Starter Plan'),
+      'Plan upgraded — Grow → Optimize (prorated)',
+    );
+    assert.equal(
+      describePlanDowngraded('Pro Plan', 'Starter Plan'),
+      'Plan downgraded — Scale → Optimize',
+    );
+  });
+
+  test('matching is case-insensitive and ignores the "Plan" suffix', () => {
+    for (const variant of ['Pro', 'pro', 'Pro Plan', 'PRO PLAN', '  Pro  ']) {
+      assert.equal(describeSubscriptionStarted(variant), 'Subscription started — Scale plan', variant);
+    }
+  });
+
+  test('slugs resolve too, since callers are not consistent about which they pass', () => {
+    assert.equal(describeSubscriptionStarted('basic'), 'Subscription started — Grow plan');
+    assert.equal(describeSubscriptionStarted('starter'), 'Subscription started — Optimize plan');
+  });
+
+  test('an unknown plan keeps its own name rather than becoming a placeholder', () => {
+    // A plan added to the table later should read as itself, not "Unknown".
+    assert.equal(
+      describeSubscriptionStarted('Agency Plan'),
+      'Subscription started — Agency plan',
+    );
+  });
+});
+
+describe('the downgrade confirmation', () => {
+  // An account renewing 20 Sep: the change lands ON that date, so the Optimize
+  // plan's last day is the 19th, and both the new plan and the payment start on
+  // the 20th.
+  const base = {
+    fromPlan: 'Optimize',
+    toPlan: 'Grow',
+    nextBillingDate: '2026-09-20T00:00:00Z',
+    nextAmountCents: 950,
+    currency: 'usd',
+  };
+
+  test('reads exactly as specified', () => {
+    assert.equal(
+      planDowngradeConfirmation(base),
+      'You stay on the Optimize plan until Sep 19, 2026.'
+      + ' The Grow plan starts on Sep 20, 2026.\n'
+      + 'No charge today. Your next payment is $9.50 on Sep 20, 2026.\n'
+      + 'Your current credits are unaffected and keep their existing expiry dates.',
+    );
+  });
+
+  test('never prints a raw Date, which is the bug it replaces', () => {
+    // The old line interpolated the Date object itself, so customers read
+    // "Sun Sep 20 2026 00:00:00 GMT+0000 (Coordinated Universal Time)".
+    const msg = planDowngradeConfirmation({
+      ...base, nextBillingDate: new Date('2026-09-20T00:00:00Z'),
+    });
+    assert.ok(!/GMT|Coordinated Universal Time|00:00:00/.test(msg), msg);
+    assert.ok(msg.includes('Sep 19, 2026') && msg.includes('Sep 20, 2026'));
+  });
+
+  test('crossing a month boundary', () => {
+    const msg = planDowngradeConfirmation({ ...base, nextBillingDate: '2026-10-01T00:00:00Z' });
+    assert.ok(msg.includes('until Sep 30, 2026'), msg);
+    assert.ok(msg.includes('starts on Oct 1, 2026'), msg);
+  });
+
+  test('crossing a year boundary', () => {
+    const msg = planDowngradeConfirmation({ ...base, nextBillingDate: '2027-01-01T00:00:00Z' });
+    assert.ok(msg.includes('until Dec 31, 2026'), msg);
+    assert.ok(msg.includes('starts on Jan 1, 2027'), msg);
+  });
+
+  test('a leap day is not skipped', () => {
+    const msg = planDowngradeConfirmation({ ...base, nextBillingDate: '2028-03-01T00:00:00Z' });
+    assert.ok(msg.includes('until Feb 29, 2028'), msg);
+  });
+
+  test('without a date it degrades to a phrase, never to "Invalid Date"', () => {
+    const msg = planDowngradeConfirmation({ ...base, nextBillingDate: null });
+    assert.equal(
+      msg,
+      'You stay on the Optimize plan until the end of your billing period.'
+      + ' The Grow plan starts then.\n'
+      + 'No charge today.\n'
+      + 'Your current credits are unaffected and keep their existing expiry dates.',
+    );
+    assert.ok(!/Invalid|NaN|null|undefined/.test(msg));
+  });
+
+  test('without plan names it still says something true', () => {
+    const msg = planDowngradeConfirmation({ ...base, fromPlan: null, toPlan: undefined });
+    assert.ok(msg.startsWith('You stay on your current plan until Sep 19, 2026.'), msg);
+    assert.ok(msg.includes('Your new plan starts on Sep 20, 2026.'), msg);
+  });
+
+  test('"Grow Plan" and "Grow" produce the same sentence', () => {
+    // The database stores both shapes, and the copy already says "plan".
+    assert.equal(
+      planDowngradeConfirmation({ ...base, toPlan: 'Grow Plan' }),
+      planDowngradeConfirmation(base),
+    );
+  });
+
+  test('the credit reassurance survives every degraded input', () => {
+    // "Am I about to lose the credits I paid for?" is the actual fear behind a
+    // downgrade, and the sentence this replaces never addressed it.
+    for (const over of [{}, { nextBillingDate: null }, { fromPlan: null, toPlan: null }]) {
+      assert.ok(
+        planDowngradeConfirmation({ ...base, ...over })
+          .includes('Your current credits are unaffected and keep their existing expiry dates.'),
+      );
+    }
   });
 });
 

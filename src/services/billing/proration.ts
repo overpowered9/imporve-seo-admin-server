@@ -137,6 +137,14 @@ export interface ProrationQuote {
   payment_method?: { brand: string | null; last4: string | null } | null;
   /** What this change does to the credit balance. Null when it changes nothing. */
   credits?: CreditDisclosure | null;
+  /**
+   * The balance the customer holds RIGHT NOW, before this change.
+   *
+   * Set on the scheduled-downgrade quote, whose whole reassurance is that the
+   * credits already bought survive the change. Null when the balance could not
+   * be read, so the dialog drops that clause rather than claiming zero.
+   */
+  current_credits?: number | null;
   disclosure_id?: string;
 }
 

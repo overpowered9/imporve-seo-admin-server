@@ -36,12 +36,46 @@
  * print a placeholder — "Subscription started" is a true, readable line;
  * "Subscription started — your plan plan" is neither.
  */
+/**
+ * The name the CUSTOMER knows a plan by.
+ *
+ * ── WHY A MAPPING IS NEEDED AT ALL ──────────────────────────────────────────
+ * `subscription_plans.name` holds the ORIGINAL names — "Starter Plan" and
+ * "Pro Plan" — while every screen in the product, and every line QA specified,
+ * calls those plans **Optimize** and **Scale**. Without this, feeding real rows
+ * through the catalogue produces text no customer recognises, which is exactly
+ * what the production ledger shows:
+ *
+ *     Upgraded Starter Plan → Pro Plan (prorated, …)
+ *     Downgrade scheduled: Pro Plan → Starter Plan
+ *
+ * Keyed on both name and slug, canonically (case-insensitive, trailing "Plan"
+ * dropped), so "Pro", "pro", "Pro Plan" and "PRO PLAN" all resolve. This is the
+ * same table the CMS uses in utils/planUtils.js — the two must agree, or the
+ * confirmation dialog names a plan differently from the card just clicked.
+ */
+const PLAN_DISPLAY_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  grow: 'Grow',
+  basic: 'Grow',
+  starter: 'Optimize',
+  premium: 'Optimize',
+  pro: 'Scale',
+  enterprise: 'Scale',
+  free: 'Free',
+});
+
+/** Case-insensitive, and the decorative trailing "Plan" removed. */
+const canonicalPlanKey = (value: string | null | undefined): string =>
+  String(value ?? '').trim().replace(/\s+plan$/i, '').toLowerCase();
+
 const planLabel = (name: string | null | undefined): string => {
   const trimmed = String(name ?? '').trim();
   if (!trimmed) return '';
-  // "Grow Plan" and "Grow" are the same plan; the suffix is noise in a sentence
-  // that already says the word "plan".
-  return trimmed.replace(/\s+plan$/i, '');
+  // An unknown plan keeps its own name rather than becoming "Unknown" — a new
+  // plan added to the table should read as itself, not as a placeholder.
+  // The suffix is dropped either way: it is noise in a sentence that already
+  // says the word "plan".
+  return PLAN_DISPLAY_NAMES[canonicalPlanKey(trimmed)] ?? trimmed.replace(/\s+plan$/i, '');
 };
 
 /** `<Event> — <plan> plan`, or just `<Event>` when the plan is unknown. */
@@ -71,6 +105,36 @@ const dayLabel = (value: Date | string | null | undefined): string | null => {
   return d.toLocaleDateString('en-US', {
     month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC',
   });
+};
+
+/**
+ * The last day the customer still holds their CURRENT plan.
+ *
+ * A scheduled change lands ON the renewal date — that is when the new plan
+ * starts and when money moves — so the old plan's last day is the day before.
+ *
+ * The subtraction is done in UTC (setUTCDate on a UTC-read date), not by
+ * building a local Date. `next_billing_date` is stored midnight UTC, and for
+ * anyone west of Greenwich a local-time subtraction lands on the previous day
+ * before it even starts, silently reporting a date two days early.
+ */
+const dayBeforeLabel = (value: Date | string | null | undefined): string | null => {
+  if (!value) return null;
+  const d = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  d.setUTCDate(d.getUTCDate() - 1);
+  return dayLabel(d);
+};
+
+/** Minor units to a display string, falling back if the currency code is junk. */
+const formatMoneyCents = (cents: number, currency = 'usd'): string => {
+  const code = (currency || 'usd').toUpperCase();
+  try {
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency: code })
+      .format(cents / 100);
+  } catch {
+    return `$${(cents / 100).toFixed(2)}`;
+  }
 };
 
 export const describeTrialStarted = (days: number): string =>
@@ -131,7 +195,7 @@ export const describePlanDowngraded = (
  * needs to see why the amounts differ.
  */
 export const describeCreditPurchase = (credits: number, atFreeRate = false): string =>
-  `Credit purchase — ${credits.toLocaleString()} credits${atFreeRate ? ' (Free plan rate)' : ''}`;
+  `Credit pack purchase — ${credits.toLocaleString()} credits${atFreeRate ? ' (Free plan rate)' : ''}`;
 
 export const describeRefund = (): string => 'Refund — issued by support';
 
@@ -225,6 +289,73 @@ export function planUpgradeConfirmation(params: {
   } else if (typeof params.creditsTotal === 'number') {
     lines.push(`You have ${params.creditsTotal.toLocaleString()} credits.`);
   }
+
+  return lines.join('\n');
+}
+
+/**
+ * The confirmation shown after a downgrade is scheduled.
+ *
+ * ── WHAT THIS REPLACES ──────────────────────────────────────────────────────
+ * A template string that interpolated a Date object directly:
+ *
+ *   `Plan downgrade scheduled for ${currentSub.next_billing_date}. No charge today.`
+ *
+ * which put "Sun Sep 20 2026 00:00:00 GMT+0000 (Coordinated Universal Time)"
+ * in front of the customer. The upgrade beside it had gone through
+ * planUpgradeConfirmation for months; the downgrade was never given the same
+ * treatment.
+ *
+ * Three lines, each answering one question in the order it gets asked:
+ *   1. when do I lose the plan I am on, and when does the new one begin
+ *   2. am I being charged, and what will I pay next
+ *   3. what happens to the credits I already have
+ *
+ * ── TWO DATES, ON PURPOSE ───────────────────────────────────────────────────
+ * The change lands ON the renewal date, so that is when the new plan starts and
+ * when the next payment is taken. The only date that differs is "you stay on X
+ * until", which is the day before — see dayBeforeLabel. Collapsing them to one
+ * date would either claim the old plan ends a day early or that the new plan
+ * starts a day late.
+ */
+export function planDowngradeConfirmation(params: {
+  fromPlan: string | null | undefined;
+  toPlan: string | null | undefined;
+  nextBillingDate?: Date | string | null;
+  nextAmountCents?: number | null;
+  currency?: string;
+}): string {
+  const from = planLabel(params.fromPlan);
+  const to = planLabel(params.toPlan);
+  const starts = dayLabel(params.nextBillingDate);
+  const lastDay = dayBeforeLabel(params.nextBillingDate);
+
+  const lines: string[] = [];
+
+  // Line 1. Degrades one clause at a time rather than all-or-nothing: knowing
+  // the plan names is useful even when the date is missing, and vice versa.
+  const staysOn = from ? `You stay on the ${from} plan` : 'You stay on your current plan';
+  const newPlanStarts = to ? `The ${to} plan starts` : 'Your new plan starts';
+  lines.push(
+    lastDay && starts
+      ? `${staysOn} until ${lastDay}. ${newPlanStarts} on ${starts}.`
+      : `${staysOn} until the end of your billing period. ${newPlanStarts} then.`,
+  );
+
+  // Line 2. "No charge today" leads because it is the first thing anyone checks
+  // after committing to a billing change.
+  const amount = params.nextAmountCents;
+  lines.push(
+    typeof amount === 'number' && Number.isFinite(amount) && starts
+      ? `No charge today. Your next payment is ${formatMoneyCents(amount, params.currency)} on ${starts}.`
+      : 'No charge today.',
+  );
+
+  // Line 3. Unconditional, and the reason this function exists as much as the
+  // date formatting does: "am I about to lose the credits I paid for?" is what
+  // people actually fear when they downgrade, and the old sentence never
+  // answered it.
+  lines.push('Your current credits are unaffected and keep their existing expiry dates.');
 
   return lines.join('\n');
 }

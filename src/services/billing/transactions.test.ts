@@ -10,6 +10,8 @@ import { createFakeSql } from '../../test/helpers/fake-sql.js';
 import {
   recordTransaction,
   transactionsFromInvoice,
+  subscriptionIdFromInvoice,
+  isRenewalInvoice,
   receiptUrlFromSession,
   fetchCheckoutReceiptUrl,
   readLedger,
@@ -99,6 +101,79 @@ describe('recordTransaction', () => {
       amountCents: 9900, currency: 'usd', providerEventId: 'evt_1',
     });
     assert.deepEqual(result, { recorded: false, duplicate: false });
+  });
+});
+
+describe('subscriptionIdFromInvoice', () => {
+  // The regression this function exists for: both webhook branches guarded on
+  // `invoice.subscription`, which does not exist on API version 2025-10-29.
+  // The guard never opened, so renewals never refilled credits and failed
+  // payments never suspended anyone — silently, because `as any` hid it.
+  test('reads the current shape, where it lives under parent', () => {
+    assert.equal(
+      subscriptionIdFromInvoice({
+        parent: { subscription_details: { subscription: 'sub_new' } },
+      }),
+      'sub_new',
+    );
+  });
+
+  test('still reads the legacy top-level field', () => {
+    // Stripe replays historical events, and a payload is serialised at the API
+    // version in force when the event was CREATED — not the account's current
+    // one. Dropping this fallback would re-break every redelivered event.
+    assert.equal(subscriptionIdFromInvoice({ subscription: 'sub_old' }), 'sub_old');
+  });
+
+  test('prefers the current shape when both are present', () => {
+    assert.equal(
+      subscriptionIdFromInvoice({
+        subscription: 'sub_old',
+        parent: { subscription_details: { subscription: 'sub_new' } },
+      }),
+      'sub_new',
+    );
+  });
+
+  test('unwraps an expanded object', () => {
+    assert.equal(
+      subscriptionIdFromInvoice({
+        parent: { subscription_details: { subscription: { id: 'sub_expanded' } } },
+      }),
+      'sub_expanded',
+    );
+  });
+
+  test('null for a one-off invoice, and for junk', () => {
+    // Must be null, not undefined: the caller uses it as a guard and then as a
+    // query parameter, and `undefined` in a tagged template is not a safe null.
+    assert.equal(subscriptionIdFromInvoice({ billing_reason: 'manual' }), null);
+    assert.equal(subscriptionIdFromInvoice({ parent: null }), null);
+    assert.equal(subscriptionIdFromInvoice({}), null);
+    assert.equal(subscriptionIdFromInvoice(null), null);
+  });
+});
+
+describe('isRenewalInvoice — which invoices grant a fresh allotment', () => {
+  // refillPlanCredits adds a WHOLE allotment and re-stamps cycle_started_at.
+  // Every invoice attached to a subscription reaches the webhook, so without
+  // this gate an upgrade would receive its prorated difference AND a full
+  // month's credits, with the cycle anchor moved to mid-period.
+  test('only a subscription_cycle invoice is a renewal', () => {
+    assert.equal(isRenewalInvoice({ billing_reason: 'subscription_cycle' }), true);
+  });
+
+  for (const reason of ['subscription_create', 'subscription_update', 'manual', 'subscription_threshold']) {
+    test(`${reason} does not refill`, () => {
+      assert.equal(isRenewalInvoice({ billing_reason: reason }), false);
+    });
+  }
+
+  test('an absent billing_reason does not refill', () => {
+    // Fail closed. Granting a month of credits we were not asked for is worse
+    // than granting them late, and the renewal case always carries the reason.
+    assert.equal(isRenewalInvoice({}), false);
+    assert.equal(isRenewalInvoice(null), false);
   });
 });
 

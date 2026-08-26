@@ -80,17 +80,22 @@ const envSchema = z.object({
   //
   // Sized in PIECES OF CONTENT, not round credit numbers: at ~19 credits for a
   // finished piece (article 10 + image 5 + keyword list 1, plus a 30%/40% rerun
-  // allowance) these are roughly 3, 5 and 10 pieces.
+  // allowance) these are roughly 3 and 7 pieces.
+  //
+  // TWO PRICES EACH. `_PRICE_CENTS` is the subscriber rate; `_PRICE_CENTS_FREE`
+  // is what a free-plan or trial account pays. See CreditPackage.
   //
   // Prices are required rather than defaulted, for the same reason the deduction
   // table is: a deploy missing a package price would otherwise sell credits for
-  // nothing. Missing keys abort boot and are named in the error.
+  // nothing. Missing keys abort boot and are named in the error — and that now
+  // includes the free rate, so half-configuring the tiers cannot quietly charge
+  // everyone the discounted price.
   ISEO_PACKAGE_SMALL_CREDITS: positiveInt('ISEO_PACKAGE_SMALL_CREDITS'),
   ISEO_PACKAGE_SMALL_PRICE_CENTS: positiveInt('ISEO_PACKAGE_SMALL_PRICE_CENTS'),
+  ISEO_PACKAGE_SMALL_PRICE_CENTS_FREE: positiveInt('ISEO_PACKAGE_SMALL_PRICE_CENTS_FREE'),
   ISEO_PACKAGE_MEDIUM_CREDITS: positiveInt('ISEO_PACKAGE_MEDIUM_CREDITS'),
   ISEO_PACKAGE_MEDIUM_PRICE_CENTS: positiveInt('ISEO_PACKAGE_MEDIUM_PRICE_CENTS'),
-  ISEO_PACKAGE_LARGE_CREDITS: positiveInt('ISEO_PACKAGE_LARGE_CREDITS'),
-  ISEO_PACKAGE_LARGE_PRICE_CENTS: positiveInt('ISEO_PACKAGE_LARGE_PRICE_CENTS'),
+  ISEO_PACKAGE_MEDIUM_PRICE_CENTS_FREE: positiveInt('ISEO_PACKAGE_MEDIUM_PRICE_CENTS_FREE'),
 });
 
 /**
@@ -146,16 +151,34 @@ const grants: Readonly<Record<PlanSlug, number>> = Object.freeze({
   pro: env.ISEO_GRANT_PRO,
 });
 
-/** A purchasable top-up. `id` is the stable key the CMS sends. */
+/**
+ * A purchasable top-up. `id` is the stable key the CMS sends.
+ *
+ * ── TWO PRICES, ONE PACK ────────────────────────────────────────────────────
+ * The same credits cost less on a paid plan: the top-up is a convenience for a
+ * subscriber who ran out mid-cycle, and full price for someone using top-ups
+ * INSTEAD of subscribing. `describeCreditPurchase(credits, atFreeRate)` was
+ * written for this and had never been able to use its flag, because until now
+ * there was only one price.
+ *
+ * Which price applies is decided by the SERVER from the user's plan, never by
+ * the caller — see creditPackPrice.
+ */
 export interface CreditPackage {
   id: CreditPackageId;
   credits: number;
+  /** Subscriber rate. */
   price_cents: number;
+  /** Free-plan and trial rate. Always the higher of the two. */
+  price_cents_free: number;
   /** Roughly how many finished pieces this buys, for the storefront label. */
   approx_pieces: number;
 }
 
-const PACKAGE_IDS = ['small', 'medium', 'large'] as const;
+// 'large' retired: the storefront now sells two sizes. Credits already bought
+// under it are unaffected — a purchase grants a LOT, it does not hold a
+// reference to a catalogue entry.
+const PACKAGE_IDS = ['small', 'medium'] as const;
 export type CreditPackageId = (typeof PACKAGE_IDS)[number];
 
 /**
@@ -176,12 +199,44 @@ export const creditsPerPiece = (): number =>
 
 /** The top-up packages, frozen. Ordered smallest first for the storefront. */
 const packages: readonly CreditPackage[] = Object.freeze([
-  { id: 'small', credits: env.ISEO_PACKAGE_SMALL_CREDITS, price_cents: env.ISEO_PACKAGE_SMALL_PRICE_CENTS },
-  { id: 'medium', credits: env.ISEO_PACKAGE_MEDIUM_CREDITS, price_cents: env.ISEO_PACKAGE_MEDIUM_PRICE_CENTS },
-  { id: 'large', credits: env.ISEO_PACKAGE_LARGE_CREDITS, price_cents: env.ISEO_PACKAGE_LARGE_PRICE_CENTS },
+  {
+    id: 'small',
+    credits: env.ISEO_PACKAGE_SMALL_CREDITS,
+    price_cents: env.ISEO_PACKAGE_SMALL_PRICE_CENTS,
+    price_cents_free: env.ISEO_PACKAGE_SMALL_PRICE_CENTS_FREE,
+  },
+  {
+    id: 'medium',
+    credits: env.ISEO_PACKAGE_MEDIUM_CREDITS,
+    price_cents: env.ISEO_PACKAGE_MEDIUM_PRICE_CENTS,
+    price_cents_free: env.ISEO_PACKAGE_MEDIUM_PRICE_CENTS_FREE,
+  },
 ].map((p) => Object.freeze({ ...p, approx_pieces: Math.max(1, Math.round(p.credits / creditsPerPiece())) })) as CreditPackage[]);
 
 export const creditPackages = (): readonly CreditPackage[] => packages;
+
+/**
+ * What this pack costs THIS customer.
+ *
+ * ── THE ONLY PLACE THE TIER IS CHOSEN ───────────────────────────────────────
+ * Every caller — the storefront that quotes a price and the route that charges
+ * one — goes through here, so the two cannot disagree about what a customer
+ * owes. `isSubscriber` must be derived from the account on the server; a tier
+ * taken from a request body is a discount anyone can ask for.
+ *
+ * Defaults to the FREE (higher) rate when the caller does not know: quoting
+ * someone the subscriber price and then charging them more is the one failure
+ * mode worth ruling out by construction.
+ */
+export const creditPackPrice = (pkg: CreditPackage, isSubscriber: boolean): number =>
+  (isSubscriber === true ? pkg.price_cents : pkg.price_cents_free);
+
+/**
+ * The catalogue as this customer sees it, with `price_cents` resolved to their
+ * tier — so the CMS renders a price rather than picking one.
+ */
+export const creditPackagesForPlan = (isSubscriber: boolean): CreditPackage[] =>
+  packages.map((p) => ({ ...p, price_cents: creditPackPrice(p, isSubscriber) }));
 
 /** One package by id, or null. The route answers 400 on null rather than guessing. */
 export const creditPackageById = (id: string | null | undefined): CreditPackage | null =>

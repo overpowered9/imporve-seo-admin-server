@@ -6,6 +6,11 @@ import {
   PLAN_CREDIT_LIFETIME_MONTHS,
   PURCHASED_CREDIT_LIFETIME_MONTHS,
 } from '../config/credits.config.js';
+// The ledger, for the two lifecycle events that happen here rather than in a
+// route: the trial starting and the trial ending. No cycle — transactions.ts
+// pulls only descriptions.js and a type.
+import { recordTransaction } from '../services/billing/transactions.js';
+import { describeTrialStarted, describeTrialEnded } from '../services/billing/descriptions.js';
 export interface User {
   id: number;
   email: string;
@@ -898,6 +903,26 @@ export const reconcileTrialCredits = async (
   `;
   if (pending.length > 0) {
     await suspendPlanCredits(user.id, 'Trial expired');
+
+    // Written HERE, inside the one-time suspension, not beside the `return true`
+    // below. This function runs on every authenticated plugin request and keeps
+    // returning true for the whole life of an expired-trial account; only this
+    // branch happens once, because it is what drives included_remaining to 0.
+    //
+    // The event id still pins it to the trial's own end date, so a re-entry
+    // (say, credits granted and expired again) upserts rather than duplicating.
+    try {
+      await recordTransaction(sql, {
+        userId: user.id,
+        type: 'plan_downgrade',
+        description: describeTrialEnded(),
+        amountCents: null,
+        status: 'succeeded',
+        providerEventId: `trial_ended:${user.id}:${effectiveTrialEnd(user)?.toISOString() ?? 'na'}`,
+      });
+    } catch (err) {
+      console.warn('Could not record the trial-ended activity row (non-fatal):', err);
+    }
   }
   return true;
 };
@@ -1764,7 +1789,7 @@ export const findWebsiteByUserAndDomain = async (user_id: number, domain: string
  * Every signup gets this: TRIAL_DAYS of access to the free-plan credits.
  */
 export const startUserTrial = async (user_id: number): Promise<void> => {
-  await sql`
+  const started = await sql`
     UPDATE users
     SET
       trial_started_at = NOW(),
@@ -1772,6 +1797,29 @@ export const startUserTrial = async (user_id: number): Promise<void> => {
       updated_at       = NOW()
     WHERE id = ${user_id} AND trial_started_at IS NULL
   `;
+
+  // Account Activity's first line. Gated on the UPDATE's row count rather than
+  // written unconditionally: this function is called on every signup path and
+  // is deliberately idempotent, so a second call matches no row and must not
+  // announce a trial that started weeks ago.
+  //
+  // Failing to log must never fail a signup — the trial is already started by
+  // the statement above, and a missing history row is not worth turning a
+  // successful registration into an error.
+  if (started.count > 0) {
+    try {
+      await recordTransaction(sql, {
+        userId: user_id,
+        type: 'plan_grant',
+        description: describeTrialStarted(TRIAL_DAYS),
+        amountCents: null,
+        status: 'succeeded',
+        providerEventId: `trial_started:${user_id}`,
+      });
+    } catch (err) {
+      console.warn('Could not record the trial-started activity row (non-fatal):', err);
+    }
+  }
 };
 export const findUserByAuthId = async (auth_user_id: string): Promise<User | null> => {
   const result = await sql`

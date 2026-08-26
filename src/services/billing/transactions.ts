@@ -210,6 +210,57 @@ export async function fetchCheckoutReceiptUrl(
  * with its own event id derived from the line id — which keeps every row
  * individually idempotent.
  */
+/**
+ * The subscription an invoice belongs to, or null for a one-off invoice.
+ *
+ * ── WHY THIS IS NOT JUST `invoice.subscription` ─────────────────────────────
+ * It was, at two call sites, written as `(invoice as any).subscription`. On the
+ * API version this account is pinned to (2025-10-29.clover) that field does not
+ * exist — Stripe moved it under `parent.subscription_details`. The cast to
+ * `any` is what stopped the compiler saying so, and the field silently read
+ * `undefined` on every invoice.
+ *
+ * Both webhook branches guarded on it, so both were unreachable: renewals never
+ * refilled plan credits, renewals wrote no ledger row, and failed payments
+ * neither suspended an account nor recorded anything. None of it errored — the
+ * guard simply never opened.
+ *
+ * The legacy field is still read as a fallback. Stripe replays historical
+ * events, webhook payloads are serialised at the API version in force when the
+ * event was CREATED, and nothing here should depend on the account's version
+ * staying where it is.
+ */
+export function subscriptionIdFromInvoice(invoice: any): string | null {
+  const parent = invoice?.parent?.subscription_details?.subscription;
+  const legacy = invoice?.subscription;
+  // Either may arrive expanded into an object rather than an id string.
+  const pick = (v: any): string | null =>
+    (typeof v === 'string' ? v : (typeof v?.id === 'string' ? v.id : null));
+  return pick(parent) ?? pick(legacy);
+}
+
+/**
+ * Does this invoice represent a new billing period starting?
+ *
+ * ONLY `subscription_cycle` grants a fresh monthly allotment. The distinction
+ * matters because refillPlanCredits adds a whole allotment AND re-stamps
+ * cycle_started_at, and three other kinds of invoice are attached to a
+ * subscription:
+ *
+ *   subscription_create  the first invoice — checkout has already granted
+ *   subscription_update  a proration from a plan change
+ *   manual               our own invoice from chargeProrationNow
+ *
+ * An upgrade adds the DIFFERENCE between the two plans, via
+ * upgradeIncludedCredits, at the moment the plan changes. Refilling on its
+ * invoice too would hand out a second, full allowance on top of that and move
+ * the cycle anchor to the middle of the period — so the customer's balance and
+ * every date derived from the cycle would both be wrong.
+ */
+export function isRenewalInvoice(invoice: any): boolean {
+  return invoice?.billing_reason === 'subscription_cycle';
+}
+
 export function transactionsFromInvoice(
   invoice: any,
   userId: number,

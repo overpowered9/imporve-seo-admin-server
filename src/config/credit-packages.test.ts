@@ -26,11 +26,11 @@ const VALID: Record<string, string> = {
   ISEO_GRANT_STARTER: '580',
   ISEO_GRANT_PRO: '1150',
   ISEO_PACKAGE_SMALL_CREDITS: '60',
-  ISEO_PACKAGE_SMALL_PRICE_CENTS: '399',
-  ISEO_PACKAGE_MEDIUM_CREDITS: '100',
-  ISEO_PACKAGE_MEDIUM_PRICE_CENTS: '599',
-  ISEO_PACKAGE_LARGE_CREDITS: '200',
-  ISEO_PACKAGE_LARGE_PRICE_CENTS: '1099',
+  ISEO_PACKAGE_SMALL_PRICE_CENTS: '400',
+  ISEO_PACKAGE_SMALL_PRICE_CENTS_FREE: '500',
+  ISEO_PACKAGE_MEDIUM_CREDITS: '140',
+  ISEO_PACKAGE_MEDIUM_PRICE_CENTS: '800',
+  ISEO_PACKAGE_MEDIUM_PRICE_CENTS_FREE: '1000',
 };
 
 let saved: Record<string, string | undefined> = {};
@@ -75,22 +75,60 @@ describe('credit packages', () => {
     process.env.ISEO_COST_CONTENT_MEDIUM = VALID.ISEO_COST_CONTENT_MEDIUM;
   });
 
-  test('the three packages are ~3, ~5 and ~10 pieces', async () => {
+  test('the two packages are ~3 and ~7 pieces', async () => {
     const { creditPackages } = (await load()) as any;
-    const [small, medium, large] = creditPackages();
-    assert.equal(small.approx_pieces, 3);
-    assert.equal(medium.approx_pieces, 5);
-    assert.equal(large.approx_pieces, 11); // 200 / 19, rounded — labelled honestly
+    const packs = creditPackages();
+    assert.equal(packs.length, 2, 'the storefront sells two sizes');
+    const [small, medium] = packs;
     assert.equal(small.credits, 60);
-    assert.equal(large.price_cents, 1099);
+    assert.equal(small.approx_pieces, 3);   // 60 / 19, rounded
+    assert.equal(medium.credits, 140);
+    assert.equal(medium.approx_pieces, 7);  // 140 / 19, rounded
   });
 
   test('bigger packages are better value per credit', async () => {
     const { creditPackages } = (await load()) as any;
     const rate = (p: any) => p.price_cents / p.credits;
-    const [s, m, l] = creditPackages();
+    const [s, m] = creditPackages();
     assert.ok(rate(m) < rate(s), 'medium must beat small per credit');
-    assert.ok(rate(l) < rate(m), 'large must beat medium per credit');
+  });
+
+  test('subscribers pay less than free accounts, in both sizes', async () => {
+    // The reason two prices exist: a top-up is a convenience for a subscriber
+    // who ran out mid-cycle, and full price for someone using top-ups INSTEAD
+    // of subscribing.
+    const { creditPackages } = (await load()) as any;
+    for (const p of creditPackages()) {
+      assert.ok(
+        p.price_cents < p.price_cents_free,
+        `${p.id}: subscriber rate ${p.price_cents} must beat free rate ${p.price_cents_free}`,
+      );
+    }
+  });
+
+  test('creditPackPrice picks the tier, and defaults to the dearer one', async () => {
+    const { creditPackages, creditPackPrice } = (await load()) as any;
+    const [small] = creditPackages();
+    assert.equal(creditPackPrice(small, true), 400);
+    assert.equal(creditPackPrice(small, false), 500);
+    // Anything that is not a subscriber pays the free rate. Quoting the
+    // discount and then charging more is the failure worth ruling out.
+    assert.equal(creditPackPrice(small, undefined as any), 500);
+    assert.equal(creditPackPrice(small, null as any), 500);
+  });
+
+  test('creditPackagesForPlan resolves price_cents to the tier', async () => {
+    const { creditPackagesForPlan } = (await load()) as any;
+    assert.deepEqual(creditPackagesForPlan(true).map((p: any) => p.price_cents), [400, 800]);
+    assert.deepEqual(creditPackagesForPlan(false).map((p: any) => p.price_cents), [500, 1000]);
+  });
+
+  test('a missing FREE price aborts boot rather than charging everyone the discount', async () => {
+    // Half-configured tiers must not silently fall back to the subscriber rate.
+    const saved = process.env.ISEO_PACKAGE_SMALL_PRICE_CENTS_FREE;
+    delete process.env.ISEO_PACKAGE_SMALL_PRICE_CENTS_FREE;
+    await assert.rejects(() => load(), /ISEO_PACKAGE_SMALL_PRICE_CENTS_FREE/);
+    process.env.ISEO_PACKAGE_SMALL_PRICE_CENTS_FREE = saved;
   });
 
   test('top-ups never undercut the subscription rate', async () => {

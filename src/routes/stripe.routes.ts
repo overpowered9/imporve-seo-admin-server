@@ -26,8 +26,11 @@ import {
 import {
   grantForPlanSlug,
   creditPackages,
+  creditPackagesForPlan,
   creditPackageById,
+  creditPackPrice,
   creditsPerPiece,
+  PURCHASED_CREDIT_LIFETIME_MONTHS,
   type CreditPackage,
 } from '../config/credits.config.js';
 
@@ -111,6 +114,8 @@ import {
 import {
   recordTransaction,
   transactionsFromInvoice,
+  subscriptionIdFromInvoice,
+  isRenewalInvoice,
   fetchCheckoutReceiptUrl,
   readLedger,
 } from '../services/billing/transactions.js';
@@ -128,7 +133,12 @@ import {
   describePlanUpgraded,
   describePlanDowngradeScheduled,
   describeCreditPurchase,
+  describePaymentFailed,
+  describeSubscriptionCancelled,
+  describeSubscriptionReactivated,
+  describeRefund,
   planUpgradeConfirmation,
+  planDowngradeConfirmation,
   reactivationConfirmation,
 } from '../services/billing/descriptions.js';
 
@@ -320,16 +330,6 @@ const activateSubscriptionInDb = async (params: {
 const applyCreditTopupOnce = async (session: Stripe.Checkout.Session): Promise<boolean> => {
   const claimId = `topup_${session.id}`;
 
-  const claim = await sql`
-    INSERT INTO stripe_webhook_events (event_id, event_type, processed)
-    VALUES (${claimId}, 'credit_topup', false)
-    ON CONFLICT (event_id) DO NOTHING
-    RETURNING event_id
-  `;
-
-  // Someone else already claimed (and is applying / has applied) this session.
-  if (claim.length === 0) return false;
-
   const userId = parseInt(session.metadata?.user_id || '0');
   // Whatever type the checkout was created with, the credits land in the single ISEO pool.
   // Sessions started BEFORE the pool collapse carry 'images' | 'content' | 'keywords' in their
@@ -341,53 +341,201 @@ const applyCreditTopupOnce = async (session: Stripe.Checkout.Session): Promise<b
   const quantity = parseInt(session.metadata?.quantity || '0');
 
   if (!userId || !legacyCreditType || !quantity) {
+    // Claim the id purely to mark it dealt with, so a redelivery of the same
+    // malformed session does not retry forever.
     await sql`
-      UPDATE stripe_webhook_events
-      SET processed = true, processed_at = NOW(), error_message = 'missing credit_topup metadata'
-      WHERE event_id = ${claimId}
+      INSERT INTO stripe_webhook_events (event_id, event_type, processed, processed_at, error_message)
+      VALUES (${claimId}, 'credit_topup', true, NOW(), 'missing credit_topup metadata')
+      ON CONFLICT (event_id) DO UPDATE
+        SET processed = true, processed_at = NOW(), error_message = 'missing credit_topup metadata'
     `;
     return false;
   }
 
-  // Add to the PURCHASED bucket so these credits persist across billing cycles
-  // and are never wiped by a monthly refill.
-  await addPurchasedCredits(userId, creditType, quantity, 'Credit purchase via Stripe');
-
-  // BILL-004 — the manual credit purchase from the ticket's reproduction, which
-  // previously left no trace in any billing record. Keyed on the SESSION, the
-  // same claim this function already holds, so the webhook and /verify-session
-  // cannot produce two rows.
   // The webhook payload carries payment_intent as a bare id, so the receipt has
   // to be fetched. Without this every credit purchase landed in the ledger with
   // a null receipt_url and downloaded to an Account Activity CSV with an empty
   // Receipt column — on exactly the rows people expense. Returns null rather
-  // than throwing: the credits above are already granted and paid for.
+  // than throwing: a missing receipt must not block credits already paid for.
   const receiptUrl = await fetchCheckoutReceiptUrl(stripe, session.id);
 
-  await recordTransaction(sql, {
+  const granted = await grantCreditPack({
     userId,
-    type: 'credit_purchase',
-    // One wording for the whole ledger — see services/billing/descriptions.ts.
-    // The legacy pool label is dropped: it named an internal bucket that no
-    // longer exists and meant nothing to the customer reading the row.
-    description: describeCreditPurchase(quantity),
+    credits: quantity,
+    claimId,
     amountCents: typeof session.amount_total === 'number' ? session.amount_total : null,
     currency: session.currency || 'usd',
-    providerEventId: claimId,
     providerObjectId: session.id,
     receiptUrl,
-    creditType,
-    creditDelta: quantity,
+    // Stamped when the session was created, from the plan resolved server-side
+    // at that moment — not re-derived here, where the customer may since have
+    // subscribed and would retro-actively relabel a purchase they made on the
+    // free rate.
+    atFreeRate: session.metadata?.at_free_rate === 'true',
+  });
+
+  if (!granted) return false;
+
+  console.log(`✅ Applied top-up of ${quantity} ${creditType} credits to user ${userId} (session ${session.id})`);
+  return true;
+};
+
+/**
+ * Grant a bought credit pack, exactly once.
+ *
+ * The same body as applyCreditTopupOnce, with the Checkout Session lifted out
+ * so a purchase paid on a saved card can grant identically. That path has no
+ * session — it has a paid invoice — and duplicating the claim/grant/ledger
+ * sequence for it would be two implementations of "the customer paid, give them
+ * the credits", which is the last thing that should exist twice.
+ *
+ * `claimId` is the idempotency key: a repeat call with the same id is a no-op
+ * and returns false, which is what makes a redelivered webhook safe.
+ */
+const grantCreditPack = async (params: {
+  userId: number;
+  credits: number;
+  claimId: string;
+  amountCents: number | null;
+  currency: string | null;
+  providerObjectId: string | null;
+  receiptUrl: string | null;
+  atFreeRate: boolean;
+}): Promise<boolean> => {
+  const claim = await sql`
+    INSERT INTO stripe_webhook_events (event_id, event_type, processed)
+    VALUES (${params.claimId}, 'credit_topup', false)
+    ON CONFLICT (event_id) DO NOTHING
+    RETURNING event_id
+  `;
+
+  // Someone else already claimed (and is applying / has applied) this purchase.
+  if (claim.length === 0) return false;
+
+  // Purchased, not plan: these persist across billing cycles and are never
+  // wiped by a monthly refill.
+  await addPurchasedCredits(params.userId, ISEO_CREDIT_TYPE, params.credits, 'Credit purchase via Stripe');
+
+  await recordTransaction(sql, {
+    userId: params.userId,
+    type: 'credit_purchase',
+    // atFreeRate finally carries a real value — see credits.config.ts. Two
+    // purchases of the same size can now legitimately cost different amounts,
+    // and the row says which rate applied.
+    description: describeCreditPurchase(params.credits, params.atFreeRate),
+    amountCents: params.amountCents,
+    currency: params.currency || 'usd',
+    providerEventId: params.claimId,
+    providerObjectId: params.providerObjectId,
+    receiptUrl: params.receiptUrl,
+    creditType: ISEO_CREDIT_TYPE,
+    creditDelta: params.credits,
   });
 
   await sql`
     UPDATE stripe_webhook_events
     SET processed = true, processed_at = NOW()
-    WHERE event_id = ${claimId}
+    WHERE event_id = ${params.claimId}
   `;
 
-  console.log(`✅ Applied top-up of ${quantity} ${creditType} credits to user ${userId} (session ${session.id})`);
   return true;
+};
+
+/** What a saved-card charge did, or why it could not happen. */
+interface CreditPackCharge {
+  paid: boolean;
+  receiptUrl: string | null;
+  reason: string | null;
+}
+
+/**
+ * Charge a credit pack to the card we already hold.
+ *
+ * Modelled on chargeProrationNow: an invoice, not a bare PaymentIntent. Two
+ * reasons — it is the pattern upgrades already use to charge a stored card, and
+ * it produces a hosted invoice, so the ledger row gets a real receipt link.
+ * A PaymentIntent would leave that column null on exactly the rows people
+ * expense.
+ *
+ * ── EVERY FAILURE FALLS BACK, NONE SURFACES ─────────────────────────────────
+ * No customer, no card on file, a decline, or a card that needs 3-D Secure all
+ * return `paid: false` with a reason. The caller then issues a Checkout session
+ * and the customer completes the purchase there, where Stripe handles
+ * authentication and card entry for us.
+ *
+ * That last case is the one that matters: `invoices.pay` cannot perform 3-D
+ * Secure, so a card requiring it would otherwise strand a paying customer at a
+ * dead "payment failed" — for a card that works perfectly well.
+ *
+ * The grant is claimed on the INVOICE id, so the invoice.payment_succeeded
+ * webhook cannot grant the same pack a second time.
+ */
+const chargeCreditPackOnCard = async (params: {
+  userId: number;
+  pkg: CreditPackage;
+  amountCents: number;
+  paymentMethodId: string | null;
+}): Promise<CreditPackCharge> => {
+  const nope = (reason: string): CreditPackCharge => ({ paid: false, receiptUrl: null, reason });
+
+  try {
+    const rows = await sql`SELECT stripe_customer_id FROM users WHERE id = ${params.userId}`;
+    const customerId = rows[0]?.stripe_customer_id as string | undefined;
+    if (!customerId) return nope('no stripe customer');
+
+    // A card must already be on file. Passing an explicit one is advisory: the
+    // customer's local default is used when the CMS does not name one, which is
+    // the same record the upgrade flow and the Settings page read.
+    const paymentMethod = params.paymentMethodId
+      ?? (await getLocalDefaultPaymentMethod(sql, params.userId))?.id
+      ?? null;
+    if (!paymentMethod) return nope('no card on file');
+
+    await stripe.invoiceItems.create({
+      customer: customerId,
+      amount: params.amountCents,
+      currency: 'usd',
+      description: `${params.pkg.credits.toLocaleString()} ISEO Credits`
+        + ` — about ${params.pkg.approx_pieces} piece${params.pkg.approx_pieces === 1 ? '' : 's'}`
+        + ` of local SEO content with AI image`,
+    });
+
+    const draft = await stripe.invoices.create({
+      customer: customerId,
+      auto_advance: false,
+      collection_method: 'charge_automatically',
+      default_payment_method: paymentMethod,
+      description: 'ImproveSEO credit pack',
+    });
+    if (!draft.id) return nope('invoice not created');
+
+    const paid = await stripe.invoices.pay(draft.id);
+    if (paid.status !== 'paid') return nope(`invoice status ${paid.status}`);
+
+    const receiptUrl = paid.hosted_invoice_url || paid.invoice_pdf || null;
+
+    await grantCreditPack({
+      userId: params.userId,
+      credits: params.pkg.credits,
+      claimId: `topup_invoice_${paid.id}`,
+      amountCents: paid.amount_paid ?? params.amountCents,
+      currency: paid.currency || 'usd',
+      providerObjectId: paid.id ?? null,
+      receiptUrl,
+      // Only subscribers reach this path; the free rate is Checkout-only.
+      atFreeRate: false,
+    });
+
+    console.log(
+      `✅ Charged ${params.amountCents} for ${params.pkg.credits} credits to user ${params.userId}`
+      + ` on file (invoice ${paid.id})`,
+    );
+    return { paid: true, receiptUrl, reason: null };
+  } catch (err: any) {
+    // Declines, authentication_required, Stripe unreachable — all the same to
+    // the caller: the card route did not work, use Checkout.
+    return nope(err?.code || err?.message || String(err));
+  }
 };
 
 /**
@@ -438,8 +586,14 @@ const createCheckoutSessionSchema = z.object({
 
 const buyCreditSchema = z.object({
   user_id: z.number(),
-  // The current shape: pick one of the configured packages.
+  // The current shape: pick one of the configured packages. 'large' is still
+  // ACCEPTED so a stale tab gets the route's own "unknown package" message
+  // listing what is on sale, rather than a bare schema rejection.
   package_id: z.enum(['small', 'medium', 'large']).optional(),
+  // Which saved card to charge, for a subscriber paying inside the modal.
+  // Advisory only: the customer's default is used when absent, and the tier is
+  // never inferred from its presence.
+  payment_method_id: z.string().optional(),
   // 'iseo' is the real pool. The three legacy labels are still accepted so a CMS that has not
   // been redeployed keeps working; handleCreditTopup maps whatever arrives onto the pool.
   credit_type: z.enum(['iseo', 'images', 'content', 'keywords']).default('iseo'),
@@ -523,11 +677,43 @@ router.post('/create-checkout-session', async (req: Request, res: Response) => {
  * `credits_per_piece` is included so the info icon on the balance panel can
  * explain the weighting without shipping its own arithmetic.
  */
-router.get('/credit-packages', (_req: Request, res: Response) => {
+/**
+ * Does this account pay for a plan?
+ *
+ * The single answer to "which credit-pack tier applies", derived HERE from the
+ * account rather than accepted from the caller. A tier taken from a request
+ * body is a discount anyone can ask for.
+ *
+ * Fails to `false` — the dearer, free-plan rate — on any doubt, including a
+ * failed lookup. Quoting the subscriber price and then charging more is the one
+ * outcome worth ruling out by construction; the opposite mistake costs us a
+ * dollar and is visible in the ledger.
+ */
+const isSubscriberAccount = async (user_id: number): Promise<boolean> => {
+  try {
+    const sub = await getUserSubscription(user_id);
+    return Boolean(sub) && isLiveStatus(sub.status);
+  } catch (err) {
+    console.warn(`Could not resolve the plan tier for user ${user_id}; using the free rate:`, err);
+    return false;
+  }
+};
+
+router.get('/credit-packages', async (req: Request, res: Response) => {
+  // Optional: an unattributed caller is quoted the free (higher) rate, so the
+  // discount can never be advertised to someone who will not be charged it.
+  const requested = Number(req.query.user_id);
+  const isSubscriber = Number.isFinite(requested) && requested > 0
+    ? await isSubscriberAccount(requested)
+    : false;
+
   res.json({
     success: true,
     data: {
-      packages: creditPackages(),
+      // `price_cents` is already resolved to this customer's tier, so the CMS
+      // renders a price rather than choosing between two.
+      packages: creditPackagesForPlan(isSubscriber),
+      is_subscriber: isSubscriber,
       credits_per_piece: creditsPerPiece(),
       // The real per-action price table, so the CMS can say what a balance is
       // good for ("enough for 1 AI image") without shipping a second copy of
@@ -544,7 +730,9 @@ router.get('/credit-packages', (_req: Request, res: Response) => {
  */
 router.post('/buy-credits', async (req: Request, res: Response) => {
   try {
-    const { user_id, package_id, quantity, success_url, cancel_url } = buyCreditSchema.parse(req.body);
+    const {
+      user_id, package_id, quantity, success_url, cancel_url, payment_method_id,
+    } = buyCreditSchema.parse(req.body);
     if (await blockedForMissingAddress(user_id, res)) return;
 
     // Get user email
@@ -565,7 +753,7 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
     // unit ("one content credit") that stopped meaning anything when the pools
     // collapsed into one weighted pool.
     //
-    // Now: three fixed packages sized in PIECES OF CONTENT, priced from the
+    // Now: two fixed packages sized in PIECES OF CONTENT, priced from the
     // fail-closed config so a deploy missing a price refuses to boot rather
     // than selling credits for nothing.
     //
@@ -583,6 +771,44 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
       });
     }
 
+    // ── The price is decided HERE, from the account ──────────────────────────
+    // Never from the request body. The CMS is told a price so it can render
+    // one; it is not asked which price to charge, because then the discount is
+    // available to anyone who can edit a fetch call.
+    const isSubscriber = await isSubscriberAccount(user_id);
+    const amountCents = creditPackPrice(pkg, isSubscriber);
+
+    // ── Subscribers pay on the card we already hold ─────────────────────────
+    // A top-up mid-cycle should not throw a paying customer out to a hosted
+    // checkout page to re-enter a card Stripe already has. Falls through to
+    // Checkout below when there is no usable card, or when the card needs
+    // 3-D Secure — see chargeCreditPackOnCard.
+    if (isSubscriber) {
+      const charged = await chargeCreditPackOnCard({
+        userId: user_id, pkg, amountCents, paymentMethodId: payment_method_id ?? null,
+      });
+
+      if (charged.paid) {
+        return res.json({
+          success: true,
+          data: {
+            paid: true,
+            amount: amountCents,
+            quantity: pkg.credits,
+            package_id: pkg.id,
+            approx_pieces: pkg.approx_pieces,
+            receipt_url: charged.receiptUrl,
+            // No `url`: nothing to redirect to. The CMS closes the dialog and
+            // refreshes the balance.
+          },
+        });
+      }
+
+      console.warn(
+        `Card charge unavailable for user ${user_id} (${charged.reason}); falling back to Checkout.`,
+      );
+    }
+
     // Create Stripe checkout session for one-time payment
     const session = await stripe.checkout.sessions.create({
       customer_email: userEmail,
@@ -593,11 +819,16 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
             currency: 'usd',
             product_data: {
               name: `${pkg.credits.toLocaleString()} ISEO Credits`,
+              // `approx_pieces` is derived from the live cost table (see
+              // credits.config.ts), so this count follows a pricing change
+              // instead of going stale. The lifetime comes from the constant
+              // for the same reason — a hardcoded "12 months" here would
+              // outlive the policy it describes.
               description:
-                `Enough for about ${pkg.approx_pieces} piece${pkg.approx_pieces === 1 ? '' : 's'} of content`
-                + ' (article, AI image and keyword list). Valid for 12 months.',
+                `Enough for about ${pkg.approx_pieces} piece${pkg.approx_pieces === 1 ? '' : 's'} of local SEO content`
+                + ` with AI image. Credits valid for ${PURCHASED_CREDIT_LIFETIME_MONTHS} months.`,
             },
-            unit_amount: pkg.price_cents,
+            unit_amount: amountCents,
           },
           quantity: 1,
         },
@@ -612,6 +843,10 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
         credit_type: ISEO_CREDIT_TYPE,
         quantity: pkg.credits.toString(),
         package_id: pkg.id,
+        // Which tier was charged, so the ledger row can say "(Free plan rate)"
+        // and support can explain why two identical-looking purchases cost
+        // different amounts.
+        at_free_rate: (!isSubscriber).toString(),
         purchase_type: 'credit_topup'
       }
     });
@@ -619,9 +854,10 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
     res.json({
       success: true,
       data: {
+        paid: false,
         session_id: session.id,
         url: session.url,
-        amount: pkg.price_cents,
+        amount: amountCents,
         quantity: pkg.credits,
         package_id: pkg.id,
         approx_pieces: pkg.approx_pieces,
@@ -913,37 +1149,63 @@ router.post('/webhook', async (req: Request, res: Response) => {
       case 'invoice.payment_succeeded': {
         const invoice = event.data.object as Stripe.Invoice;
         
-        if ((invoice as any).subscription) {
+        // subscriptionIdFromInvoice, not invoice.subscription — that field does
+        // not exist on this account's API version, which is what made this
+        // entire branch dead code. See the helper for the full story.
+        const paidSubscriptionId = subscriptionIdFromInvoice(invoice);
+
+        if (paidSubscriptionId) {
           // Find user by subscription ID
           const subResult = await sql`
-            SELECT user_id, plan_id FROM subscriptions 
-            WHERE stripe_subscription_id = ${(invoice as any).subscription as string}
+            SELECT user_id, plan_id FROM subscriptions
+            WHERE stripe_subscription_id = ${paidSubscriptionId}
           `;
 
           if (subResult.length > 0) {
             const { user_id, plan_id } = subResult[0];
 
-            // Refill credits for monthly billing.
-            // ⚠️ BUSINESS LOGIC: Use-it-or-lose-it applies to PLAN credits only — they
-            // reset to the plan allotment each cycle. Purchased top-ups are preserved.
+            // ── Refill ONLY on a genuine renewal ────────────────────────────
+            // Every invoice attached to a subscription lands here, including
+            // the proration invoice an upgrade raises. Refilling on that one
+            // would grant a full second allowance on top of the difference
+            // upgradeIncludedCredits has already added, and re-stamp
+            // cycle_started_at to mid-period. isRenewalInvoice keeps this to
+            // billing_reason === 'subscription_cycle'.
             const planResult = await sql`SELECT * FROM subscription_plans WHERE id = ${plan_id}`;
-            if (planResult.length > 0) {
+            if (isRenewalInvoice(invoice) && planResult.length > 0) {
               await refillPlanCredits(user_id, planResult[0], 'Monthly plan credits refill');
               console.log(`✅ Monthly plan credits refilled for user ${user_id} (invoice paid)`);
             }
 
-            // BILL-004 — the authoritative money record. An upgrade invoice
-            // yields one row per proration line so the credit for unused time
-            // and the charge for the new plan appear as separate, labelled
-            // entries rather than a single net figure the customer cannot
-            // reconcile against their statement.
+            // ── Record only the invoices no other path owns ─────────────────
+            // Renewals and first invoices reach the ledger nowhere else, so
+            // they are recorded here.
+            //
+            // Plan changes are NOT. The change-plan route already writes one
+            // `plan_change:…` row on the day it happens, carrying the amount
+            // actually collected and the receipt — see the long note at that
+            // call site. It was written when `create_prorations` merely queued
+            // pending invoice items and no invoice appeared until the next
+            // cycle; chargeProrationNow now raises and pays one immediately, so
+            // without this guard a single upgrade would produce three ledger
+            // rows: our "Plan upgraded — Optimize → Scale (prorated)" plus
+            // Stripe's two raw proration lines. That is the same four-line wall
+            // the confirmation dialog was rebuilt to remove, reappearing in
+            // Account Activity — and QA's spec lists exactly one line per event.
+            //
             // planResult is already loaded above for the refill; passing the
             // name lets the row be described in our own wording instead of
             // Stripe's invoice-line text.
-            for (const txn of transactionsFromInvoice(
-              invoice, user_id, plan_id, planResult[0]?.name ?? null,
-            )) {
-              await recordTransaction(sql, txn);
+            const ownedElsewhere =
+              invoice.billing_reason === 'subscription_update'
+              || invoice.billing_reason === 'manual';
+
+            if (!ownedElsewhere) {
+              for (const txn of transactionsFromInvoice(
+                invoice, user_id, plan_id, planResult[0]?.name ?? null,
+              )) {
+                await recordTransaction(sql, txn);
+              }
             }
           }
         }
@@ -953,10 +1215,13 @@ router.post('/webhook', async (req: Request, res: Response) => {
       case 'invoice.payment_failed': {
         const invoice = event.data.object as Stripe.Invoice;
         
-        if ((invoice as any).subscription) {
+        // Same fix as the success branch above: this guard could never open.
+        const failedSubscriptionId = subscriptionIdFromInvoice(invoice);
+
+        if (failedSubscriptionId) {
           const subResult = await sql`
-            SELECT user_id FROM subscriptions 
-            WHERE stripe_subscription_id = ${(invoice as any).subscription as string}
+            SELECT user_id FROM subscriptions
+            WHERE stripe_subscription_id = ${failedSubscriptionId}
           `;
 
           if (subResult.length > 0) {
@@ -978,7 +1243,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
             await recordTransaction(sql, {
               userId,
               type: 'payment_failed',
-              description: 'Payment failed — subscription suspended',
+              description: describePaymentFailed(),
               amountCents: (invoice as any).amount_due ?? null,
               currency: invoice.currency || 'usd',
               status: 'failed',
@@ -992,9 +1257,55 @@ router.post('/webhook', async (req: Request, res: Response) => {
         break;
       }
 
+      case 'charge.refunded': {
+        const charge = event.data.object as Stripe.Charge;
+
+        // ── Refunds happen in the Stripe dashboard, not in this product ──────
+        // There is no refund endpoint here and no admin screen for one; support
+        // issues them directly in Stripe. So the only way a refund can reach the
+        // customer's Account Activity is by listening for it, which is what this
+        // does. Without it the money left the account with no explanation in the
+        // one place the customer looks for explanations.
+        const owner = await sql`
+          SELECT id FROM users WHERE stripe_customer_id = ${charge.customer as string} LIMIT 1
+        `;
+
+        if (owner.length > 0) {
+          // NEGATIVE, because the ledger's convention is that amountCents is
+          // signed from the customer's perspective — a refund is money coming
+          // back, and rendering it as a positive charge would read as a second
+          // payment taken.
+          const refunded = charge.amount_refunded ?? 0;
+
+          await recordTransaction(sql, {
+            userId: owner[0].id,
+            type: 'refund',
+            description: describeRefund(),
+            amountCents: -Math.abs(refunded),
+            currency: charge.currency || 'usd',
+            status: 'refunded',
+            // Keyed on the refunded TOTAL, not just the charge: Stripe fires
+            // this event again for each partial refund, and each one is a
+            // distinct row the customer should see. recordTransaction dedupes
+            // on providerEventId, so a redelivery of the same event is a no-op
+            // while a genuine second refund is not.
+            providerEventId: `charge_refunded:${charge.id}:${refunded}`,
+            providerObjectId: charge.id,
+            receiptUrl: charge.receipt_url ?? null,
+          });
+
+          console.log(`✅ Refund of ${refunded} recorded for user ${owner[0].id}`);
+        } else {
+          console.warn(
+            `⚠️ charge.refunded for customer ${charge.customer} with no matching user row — not recorded.`,
+          );
+        }
+        break;
+      }
+
       case 'setup_intent.succeeded': {
         const setupIntent = event.data.object as Stripe.SetupIntent;
-        
+
         // When a setup intent succeeds, it means a payment method was added
         if (setupIntent.customer && setupIntent.payment_method) {
           const customerId = setupIntent.customer as string;
@@ -1756,7 +2067,19 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
 
     // ── Downgrade: scheduled, not prorated, so nothing is owed today ───────
     if (!isUpgrade) {
+      // The balance the dialog reassures them about: "your current 1,240
+      // credits will remain unaffected". Best effort — a failed read costs one
+      // clause of the sentence, never the quote, and the CMS drops the clause
+      // rather than printing "your current 0 credits" at someone who has some.
+      let currentCredits: number | null = null;
+      try {
+        currentCredits = (await getLiveBalance(user_id)).total;
+      } catch (balanceErr) {
+        console.error('⚠️ Could not read the balance for the downgrade quote:', balanceErr);
+      }
+
       return serve({
+        current_credits: currentCredits,
         is_upgrade: false,
         is_first_subscription: false,
         prorated: false,
@@ -2037,6 +2360,22 @@ router.post('/change-plan', async (req: Request, res: Response) => {
         `✅ Reactivated subscription for user ${user_id} (${newPlan.name})` +
         (releasedSchedules.length ? ` — released ${releasedSchedules.length} orphaned schedule(s)` : ''),
       );
+
+      // Account Activity: the counterpart to the cancellation row written by
+      // /cancel-subscription. Without it the ledger shows an account being
+      // cancelled and then simply continuing to bill, with nothing explaining
+      // why. No money moves — see the cancellation row for why that is null
+      // rather than 0 — and the key matches the cancellation's period so the
+      // pair reads as one reversible decision.
+      await recordTransaction(sql, {
+        userId: user_id,
+        type: 'plan_grant',
+        description: describeSubscriptionReactivated(newPlan.name),
+        amountCents: null,
+        status: 'succeeded',
+        providerEventId: `reactivate:${currentSub.stripe_subscription_id ?? user_id}:${currentSub.next_billing_date ?? 'na'}`,
+        planId: currentSub.plan_id ?? null,
+      });
 
       // The balance, so the confirmation can say the credits survived — the
       // thing people most fear losing when they undo a cancellation. Best
@@ -2472,7 +2811,17 @@ router.post('/change-plan', async (req: Request, res: Response) => {
           creditsGranted,
           creditsTotal,
         })
-        : `Plan downgrade scheduled for ${currentSub.next_billing_date}. No charge today.`,
+        // Was `Plan downgrade scheduled for ${currentSub.next_billing_date}.` —
+        // a Date interpolated straight into a template string, which showed the
+        // customer "Sun Sep 20 2026 00:00:00 GMT+0000 (Coordinated Universal
+        // Time)". Now formatted, and it answers what happens to their credits.
+        : planDowngradeConfirmation({
+          fromPlan: currentPlan.name,
+          toPlan: newPlan.name,
+          nextBillingDate: currentSub.next_billing_date,
+          nextAmountCents: newPlan.price_cents,
+          currency: 'usd',
+        }),
       immediate: isUpgrade,
       effective_date: isUpgrade ? new Date().toISOString() : currentSub.next_billing_date,
       new_plan: newPlan.name
@@ -2600,6 +2949,21 @@ router.post('/cancel-subscription', async (req: Request, res: Response) => {
 
     // Mark in database
     await cancelSubscription(user_id);
+
+    // The cancellation belongs in Account Activity. It moves no money, so
+    // amountCents is null — the ledger's contract for a credit-only or
+    // informational event; a 0 would render as "$0.00" and read as a charge.
+    // Keyed on the period it ends, so cancelling and reactivating twice within
+    // one period produces one row rather than a pile of identical ones.
+    await recordTransaction(sql, {
+      userId: user_id,
+      type: 'plan_downgrade',
+      description: describeSubscriptionCancelled(subscription.plan_name),
+      amountCents: null,
+      status: 'succeeded',
+      providerEventId: `cancel:${subscription.stripe_subscription_id ?? user_id}:${subscription.next_billing_date ?? 'na'}`,
+      planId: subscription.plan_id ?? null,
+    });
 
     // BUG 11 — confirm the cancellation in writing, with the date access ends.
     // This is the email customers most expect and its absence reads as "did my
