@@ -2,6 +2,9 @@ import express, { type Response as ExpressResponse } from 'express';
 import { z } from 'zod';
 import sql from '../data/db.js';
 import { validateApiAccess, validateApiAccessWithoutStamp } from '../middleware/apiAuth.middleware.js';
+// Dashboard-user authentication, for endpoints that serve one customer's own
+// data. Same middleware /websites uses.
+import { requireSupabaseUser, type SupabaseAuthedRequest } from '../middleware/supabaseAuth.middleware.js';
 import { publicPricing } from '../services/credit-pricing.js';
 import { 
   findUserByEmail,
@@ -553,6 +556,71 @@ router.get('/subscription/:user_id', async (req, res) => {
       success: false,
       error: 'Failed to get user subscription'
     });
+  }
+});
+
+/**
+ * Monthly article counts for the Overview "Content Growth" chart.
+ * GET /api/v1/users/content-growth/:user_id
+ *
+ * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+ * The CMS used to build this chart by querying `user_generations` through
+ * Supabase from the BROWSER, selecting and filtering a `credit_type` column.
+ * That column does not exist on this table, so Postgres answered 42703 on every
+ * poll, the CMS caught it, returned null, and fell through to a second path
+ * that was itself reading a response shape the server does not send. The panel
+ * showed "No content generated yet" to an account with 126 articles, and
+ * nothing anywhere failed loudly.
+ *
+ * Aggregating here fixes the immediate bug and removes the arrangement that
+ * caused it: the browser no longer needs to know this table's schema, so the
+ * next column change cannot break the chart silently.
+ *
+ * ── WHAT COUNTS AS CONTENT ──────────────────────────────────────────────────
+ * `type LIKE 'content%'` — the same rule /credit-usage applies to the same
+ * table, so "a piece of content" means one thing across the product. Images
+ * (`image_v2`) and keyword lists are deliberately excluded: this chart is the
+ * customer's article output, and counting every row would have reported 178
+ * where the honest answer is 120.
+ *
+ * ── NO ROW CEILING ──────────────────────────────────────────────────────────
+ * GROUP BY in SQL, not in JavaScript over a capped page. The path this replaces
+ * read at most 1000 rows, which silently truncated both the totals and the
+ * anchor month for prolific accounts.
+ *
+ * Returns [{ month: 'YYYY-MM', count: N }] ascending — the shape
+ * buildContentGrowthFromAggregated already consumes.
+ */
+router.get('/content-growth/:user_id', requireSupabaseUser, async (req: SupabaseAuthedRequest, res) => {
+  try {
+    // Identity comes from the TOKEN. The :user_id segment is kept because the
+    // CMS sends it, but it is checked rather than trusted — this endpoint
+    // returns one customer's publishing history and must not serve it to
+    // anyone who can type a different number. (The neighbouring
+    // /credit-usage/:user_id and /generations/:user_id predate this and take
+    // the id from the path unchecked; that is worth closing separately.)
+    const requested = parseInt(req.params.user_id);
+    if (!Number.isNaN(requested) && requested !== req.appUser!.id) {
+      return res.status(403).json({ success: false, error: 'Not authorized for this account.' });
+    }
+
+    const rows = await sql`
+      SELECT to_char(created_at, 'YYYY-MM') AS month,
+             COUNT(*)::int                  AS count
+      FROM   user_generations
+      WHERE  user_id = ${req.appUser!.id}
+        AND  type LIKE 'content%'
+      GROUP  BY 1
+      ORDER  BY 1
+    `;
+
+    res.json({
+      success: true,
+      data: (rows as any[]).map((r) => ({ month: String(r.month), count: Number(r.count) })),
+    });
+  } catch (error) {
+    console.error('Content growth error:', error);
+    res.status(500).json({ success: false, error: 'Failed to load content growth' });
   }
 });
 
