@@ -491,8 +491,33 @@ const chargeCreditPackOnCard = async (params: {
       ?? null;
     if (!paymentMethod) return nope('no card on file');
 
+    // ── THE INVOICE COMES FIRST, AND THE ITEM NAMES IT ──────────────────────
+    // The obvious order — create the item, then create an invoice and let it
+    // sweep whatever is pending — is what shipped, and it gave credits away.
+    // `invoices.create` does NOT pull in pending invoice items unless told to,
+    // so it produced an invoice with ZERO lines and a total of $0;
+    // `invoices.pay` succeeded on it, the customer got the credits for nothing,
+    // and the $4 item stayed pending, waiting to appear on their next renewal
+    // invoice weeks later with no explanation.
+    //
+    // Creating the invoice first and attaching the item BY ID removes the sweep
+    // from the picture. Nothing here now depends on a default that varies by
+    // API version.
+    const draft = await stripe.invoices.create({
+      customer: customerId,
+      auto_advance: false,
+      collection_method: 'charge_automatically',
+      default_payment_method: paymentMethod,
+      description: 'ImproveSEO credit pack',
+      // This invoice is for the single item attached below and must never
+      // absorb unrelated pending items belonging to this customer.
+      pending_invoice_items_behavior: 'exclude',
+    });
+    if (!draft.id) return nope('invoice not created');
+
     await stripe.invoiceItems.create({
       customer: customerId,
+      invoice: draft.id,
       amount: params.amountCents,
       currency: 'usd',
       description: `${params.pkg.credits.toLocaleString()} ISEO Credits`
@@ -500,17 +525,24 @@ const chargeCreditPackOnCard = async (params: {
         + ` of local SEO content with AI image`,
     });
 
-    const draft = await stripe.invoices.create({
-      customer: customerId,
-      auto_advance: false,
-      collection_method: 'charge_automatically',
-      default_payment_method: paymentMethod,
-      description: 'ImproveSEO credit pack',
-    });
-    if (!draft.id) return nope('invoice not created');
+    // ── NEVER PAY AN INVOICE THAT IS NOT THE AMOUNT WE MEANT TO CHARGE ──────
+    // The check that would have caught the bug above in production rather than
+    // in a customer's ledger. A $0 invoice is not a free credit pack; it means
+    // the item did not attach. Bail out, void the empty invoice, and let the
+    // caller fall back to Checkout where the customer pays properly.
+    const finalized = await stripe.invoices.finalizeInvoice(draft.id);
+    if ((finalized.amount_due ?? 0) !== params.amountCents) {
+      try { await stripe.invoices.voidInvoice(draft.id); } catch { /* already gone */ }
+      return nope(`invoice total ${finalized.amount_due} != expected ${params.amountCents}`);
+    }
 
     const paid = await stripe.invoices.pay(draft.id);
     if (paid.status !== 'paid') return nope(`invoice status ${paid.status}`);
+    // And again after the money moves, because amount_paid is what the ledger
+    // records and a zero there is exactly what the customer reported seeing.
+    if ((paid.amount_paid ?? 0) !== params.amountCents) {
+      return nope(`paid ${paid.amount_paid} != expected ${params.amountCents}`);
+    }
 
     const receiptUrl = paid.hosted_invoice_url || paid.invoice_pdf || null;
 
