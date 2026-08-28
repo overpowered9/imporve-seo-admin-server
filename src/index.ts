@@ -24,6 +24,12 @@ dotenv.config();
 
 const app = express();
 
+// Render terminates TLS at a single proxy hop and passes the caller's address in
+// X-Forwarded-For. Without this, req.ip is the proxy's address for every request, which would
+// collapse the per-IP login rate limiter into one shared bucket — letting any one caller
+// exhaust it and lock every operator out of the admin panel.
+app.set('trust proxy', 1);
+
 // CORS configuration - Allow all origins for API access
 const corsOptions = {
   origin: true, // Allow all origins
@@ -45,9 +51,33 @@ app.use(express.urlencoded({ extended: true }));
 // Serve uploaded files
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
-// Debug middleware to log requests
+// Debug middleware to log requests.
+//
+// Bodies are redacted before logging. This previously printed req.body verbatim, which wrote
+// every customer's plaintext password to the logs on each /auth/login and /auth/signup, and
+// would now do the same for the admin password. Anyone with log access had the credentials.
+const REDACTED_KEYS = new Set([
+  'password',
+  'newPassword',
+  'currentPassword',
+  'token',
+  'access_token',
+  'refresh_token',
+  'api_key',
+  'apiKey',
+]);
+
+function redactBody(body: unknown): unknown {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
+    out[key] = REDACTED_KEYS.has(key) ? '[redacted]' : value;
+  }
+  return out;
+}
+
 app.use((req, res, next) => {
-  console.log(`${req.method} ${req.path}`, req.body);
+  console.log(`${req.method} ${req.path}`, redactBody(req.body));
   next();
 });
 

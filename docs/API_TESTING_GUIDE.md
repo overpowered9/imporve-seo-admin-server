@@ -10,7 +10,9 @@ Run everything against a **Render preview** first. Several endpoints spend real 
 export BASE=https://imporve-seo-admin-server-nzbm.onrender.com
 export API_KEY=<user's api_key>          # plugin auth
 export SITE_CODE=<user's site_code>      # plugin auth
-export ADMIN_JWT=<Supabase JWT of an ADMIN_EMAILS account>
+export ADMIN_TOKEN=$(curl -s -X POST "$BASE/api/v1/auth/admin-login" \
+  -H 'Content-Type: application/json' -d '{"password":"<ADMIN_PASSWORD>"}' \
+  | sed -E 's/.*"token":"([^"]+)".*/\1/')
 ```
 
 ---
@@ -26,9 +28,10 @@ confusing 401.
 | **Admin** | `Authorization: Bearer <supabase-jwt>` | Admin panel | `requireAdmin` |
 | **User** | `Authorization: Bearer <supabase-jwt>` | user-cms dashboard | `requireSupabaseUser` |
 
-> **Admin ≠ any logged-in user.** `requireAdmin` verifies the JWT *and* checks the email against the
-> `ADMIN_EMAILS` allowlist. A valid JWT for a non-admin returns **403**, not 401. If `ADMIN_EMAILS`
-> is unset, **nobody** is an admin and every admin route 403s — that is deliberate.
+> **Admin ≠ any logged-in user.** Admin access is one shared password (`ADMIN_PASSWORD`),
+> exchanged at `POST /api/v1/auth/admin-login` for a signed session token. A customer’s Supabase
+> JWT carries no admin rights at all and gets **401** on admin routes. If `ADMIN_PASSWORD` is
+> unset, nobody can sign in and every admin route returns **503** — that is deliberate.
 
 ---
 
@@ -135,9 +138,9 @@ done
 curl -s -o /dev/null -w "bogus token: %{http_code}\n" \
   -H "Authorization: Bearer not-a-real-token" "$BASE/api/admin/prompt-templates"
 
-# 403 (not 401) for a REAL user JWT that is not on ADMIN_EMAILS.
-curl -s -o /dev/null -w "non-admin JWT: %{http_code}\n" \
-  -H "Authorization: Bearer $NON_ADMIN_JWT" "$BASE/api/admin/prompt-templates"
+# 401 for a REAL customer JWT: customer login grants no admin rights whatsoever.
+curl -s -o /dev/null -w "customer JWT: %{http_code}\n" \
+  -H "Authorization: Bearer $USER_JWT" "$BASE/api/admin/prompt-templates"
 
 # The one that mattered most: credit granting must be closed.
 curl -s -o /dev/null -w "gift-credits unauth: %{http_code}\n" -X POST \
@@ -263,8 +266,9 @@ the migrations against production data, and the WordPress plugin end to end.
    exactly (`free`, `basic`, `starter`, `pro`). An unmatched slug silently falls back to the FREE
    grant rather than failing loudly, so adding a plan without its key under-grants that plan's
    customers. Worth converting to a startup check that every plan row has a key.
-6. **No admin role in the database.** Admin is an env allowlist (`ADMIN_EMAILS`). Moving to a
-   `users.is_admin` column later only requires changing `isAdminEmail()`.
+6. **No admin identity at all.** Admin is one shared password (`ADMIN_PASSWORD`); there are no
+   admin accounts, so actions cannot be attributed to a person. Moving to per-user admins means
+   introducing real accounts, not editing config.
 
 ---
 
@@ -273,8 +277,9 @@ the migrations against production data, and the WordPress plugin end to end.
 | Symptom | Cause |
 |---|---|
 | Server exits on boot naming an `ISEO_*` var | That var is missing/malformed. Working as designed — set it. |
-| Admin routes 403 for everyone | `ADMIN_EMAILS` unset or the email is not on it. |
-| Admin routes 401 with a real login | User JWT sent to an admin route, or expired token. |
+| Admin routes 503 for everyone | `ADMIN_PASSWORD` unset on the server. |
+| Admin routes 401 after signing in | Session token expired, or `ADMIN_PASSWORD` was rotated. |
+| Admin sign-in 429s | Rate limit: 10 attempts per IP per 15 min. Wait it out. |
 | Every generation 402s | Migration 011 not run, so no `iseo` row exists. |
 | Regen always charged full price | `target_key` missing from the request, or migration 010 not run. |
 | `custom_instruction` seems ignored | Check `data.prompt_used`. If it lacks `Photograph exactly this scene:`, the deploy predates this release. |

@@ -2,6 +2,8 @@ import express from 'express';
 import { z } from 'zod';
 import crypto from 'crypto';
 import { supabaseAdmin } from '../services/supabase.service.js';
+import { checkAdminPassword, issueAdminToken } from '../middleware/adminAuth.middleware.js';
+import { rateLimitPerIp } from '../middleware/rateLimit.middleware.js';
 import sql from '../data/db.js';
 import { findUserByEmail, findUserByOAuth, createUser, createOAuthUser, updateUserOAuthData, initializeUserCredits, ensureSignupGrant, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, getUserWebsites, getUserWithPlan, startUserTrial, type User } from '../models/user.models.js';
 
@@ -19,6 +21,48 @@ const loginSchema = z.object({
   email: z.string().email(),
   password: z.string()
 });
+
+const adminLoginSchema = z.object({
+  password: z.string().min(1),
+});
+
+/**
+ * POST /api/v1/auth/admin-login
+ *
+ * Exchange the static ADMIN_PASSWORD for a short-lived admin session token. This is the only
+ * way into the admin panel; it is deliberately separate from /login, which authenticates
+ * ordinary customers against Supabase and has nothing to do with admin access.
+ *
+ * Rate limited per IP because one shared password is the whole security of the admin surface.
+ */
+router.post(
+  '/admin-login',
+  rateLimitPerIp({
+    limit: 10,
+    windowMs: 15 * 60 * 1000,
+    message: 'Too many sign-in attempts. Please wait a few minutes and try again.',
+  }),
+  async (req, res) => {
+    try {
+      const { password } = adminLoginSchema.parse(req.body);
+
+      if (!checkAdminPassword(password)) {
+        // Deliberately identical whether the password was wrong or the server has no
+        // ADMIN_PASSWORD configured: distinguishing them tells an attacker which deploys
+        // are worth attacking. The startup warning is where an operator learns it is unset.
+        return res.status(401).json({ success: false, error: 'Incorrect password' });
+      }
+
+      const { token, expiresAt } = issueAdminToken();
+      res.json({ success: true, data: { token, expiresAt } });
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        error: error instanceof Error ? error.message : 'Admin login failed',
+      });
+    }
+  },
+);
 
 // Signup with email verification
 router.post('/signup', async (req, res) => {

@@ -9,7 +9,7 @@ Follow the steps **in order**. Steps 1–3 are configuration, 4–6 are the depl
 >
 > If this service is ever migrated to a blueprint, move the nine `ISEO_COST_*` integers from step 1
 > into `render.yaml` as `envVars` defaults — they are integrity-sensitive, not secret, so committing
-> them is fine. Secrets and `ADMIN_EMAILS` must stay dashboard-managed either way.
+> them is fine. Secrets and `ADMIN_PASSWORD` must stay dashboard-managed either way.
 
 ---
 
@@ -60,21 +60,35 @@ All thirteen are **PM-tunable**: changing one is an env edit plus a redeploy. No
 hash identifies which price table the deploy is running, without printing prices into the logs. If
 you see the config error instead, it names the offending variable.
 
-## 2. `ADMIN_EMAILS` — REQUIRED for the admin panel
+## 2. `ADMIN_PASSWORD` — REQUIRED for the admin panel
 
 ```
-ADMIN_EMAILS=someone@yourdomain.com,someone-else@yourdomain.com
+ADMIN_PASSWORD=<a long random string>
 ```
 
-This does **not** block boot, but the admin panel is unusable until it is set: every `/api/admin` and
-`/api/v1/admin/users` route returns **403** for everyone, including you.
+This does **not** block boot, but the admin panel is unusable until it is set: admin sign-in
+returns 401 and every `/api/admin` and `/api/v1/admin/users` route returns **503** for everyone,
+including you.
 
-It fails closed on purpose. Before this change those routes had no authentication at all, so anyone
-who could reach the host could grant themselves unlimited credits. An empty allowlist means nobody is
-an admin, which is the safe end to fail towards.
+It fails closed on purpose. Before authentication existed, those routes had no auth at all, so
+anyone who could reach the host could grant themselves unlimited credits. No password configured
+means nobody is an admin, which is the safe end to fail towards.
 
-Comma-separated, matched case-insensitively against the caller's Supabase account email. The caller
-must also hold a valid Supabase JWT — being on the list is not by itself sufficient.
+The panel has **no admin accounts** — one shared password is the whole mechanism. Sign-in exchanges
+it at `POST /api/v1/auth/admin-login` for a signed session token, valid 12 hours by default.
+
+Because it is a single shared secret guarding every credit-granting route, make it long and random
+(a password manager's 32-character output is ideal). The server warns at boot if it is under 12
+characters. Sign-in is rate limited to 10 attempts per IP per 15 minutes.
+
+**Rotating it** — change the variable and redeploy. Every outstanding session token is signed with
+the password, so rotation immediately invalidates all of them and everyone signs in again. That is
+also how you revoke access from someone who should no longer have it.
+
+Optional: `ADMIN_SESSION_HOURS` (default `12`) sets how long a session lasts.
+
+> `ADMIN_EMAILS` no longer controls access. It is still read, but only to decide who receives
+> operator notification emails (credit-expiry sweeps and similar). Setting it grants nothing.
 
 ## 3. Secret keys
 

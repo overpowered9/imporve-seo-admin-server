@@ -46,7 +46,7 @@ must stay that way.
 | # | Step | Blocked on | If skipped |
 |---|---|---|---|
 | 1 | Set 13 `ISEO_*` vars on Render | Render login | **Server will not boot — full outage** |
-| 2 | Set `ADMIN_EMAILS` | Render login + your decision on who | Admin panel 403s for everyone |
+| 2 | Set `ADMIN_PASSWORD` | Render login | Admin panel rejects everyone |
 | 3 | Redeploy the backend | Render login | Nothing below works; security holes stay open |
 | 4 | Run 2 migrations | Step 3 first + a backup | Every generation returns 402 |
 | 5 | Pull the plugin update in WordPress | WP admin login | Regen always full price; custom instructions never sent |
@@ -93,15 +93,20 @@ So `pro = 1150` ≈ 115 medium articles/month.
 ### Step 2 — Admin access
 
 ```
-ADMIN_EMAILS=you@yourdomain.com,colleague@yourdomain.com
+ADMIN_PASSWORD=<a long random string>
 ```
 
-Comma-separated, case-insensitive, matched against the Supabase account email. **Whoever is not on
-this list cannot use the admin panel**, so include yourself.
+There are **no admin accounts** — the panel is protected by this one shared password. Anyone who
+knows it is an admin; anyone who does not cannot get in. Until it is set, nobody can sign in.
 
-This does not block boot, but until it is set every admin route returns 403 — including to you.
-That is intentional: before this release those routes had **no authentication at all**, so anyone
-on the internet could grant themselves unlimited credits.
+Make it long and random (use a password manager). It guards every credit-granting route, so treat
+it like a production secret: never commit it, and share it only with people who need panel access.
+
+To revoke someone's access, change this value and redeploy — that signs everyone out immediately.
+
+This does not block boot, but until it is set nobody can sign in and every admin route returns 503
+— including for you. That is intentional: before this release those routes had **no authentication
+at all**, so anyone on the internet could grant themselves unlimited credits.
 
 ### Step 3 — Redeploy the backend
 
@@ -197,8 +202,8 @@ Full command list in `docs/API_TESTING_GUIDE.md`. The four that matter most:
 3. **A wizard reload before regenerating charges full price.** The regeneration key is minted per
    wizard session. Deliberate — failing towards full price is the safe direction.
 4. **Rate limit is per server instance.** With N instances the effective ceiling is 120×N/min.
-5. **Admin is an env allowlist, not a database role.** Changing admins means editing `ADMIN_EMAILS`
-   and redeploying.
+5. **Admin is one shared password, not per-person accounts.** There is no way to tell two
+   operators apart, and revoking one person means rotating `ADMIN_PASSWORD` for everyone.
 6. **Image fidelity is not guaranteed.** The prompt now instructs the model to depict the user's
    scene and not substitute a different subject, and that wording is tested — but how closely the
    image model obeys is an empirical question. If `prompt_used` is correct and the image still

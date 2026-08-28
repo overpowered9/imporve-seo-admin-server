@@ -167,7 +167,9 @@ router.post('/prompt-templates/:templateId/versions', requireAdmin, async (req, 
 
     const newVersion = await promptService.createTemplateVersion(templateId, {
       prompt,
-      createdBy: (req as any).adminId,
+      // Always the literal 'admin': the static-password model has no per-person identity.
+      // Falls back for safety — createdBy is a required String on the schema.
+      createdBy: (req as any).adminId || 'admin',
       metadata: {
         notes,
         expectedOutput

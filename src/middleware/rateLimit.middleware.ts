@@ -15,7 +15,7 @@
  * If either limitation ever matters, replace this with a Redis/Postgres-backed limiter rather than
  * tightening the numbers here.
  */
-import { Response, NextFunction } from 'express';
+import { Request, Response, NextFunction } from 'express';
 import { AuthenticatedRequest } from './apiAuth.middleware.js';
 
 interface Bucket {
@@ -62,6 +62,49 @@ export function rateLimitPerUser({ limit, windowMs, message }: RateLimitOptions)
     if (!userId) return next();
 
     const key = String(userId);
+    const now = Date.now();
+    const bucket = buckets.get(key);
+
+    if (!bucket || bucket.resetAt <= now) {
+      buckets.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+
+    if (bucket.count >= limit) {
+      const retryAfterSec = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+      res.setHeader('Retry-After', String(retryAfterSec));
+      return res.status(429).json({
+        success: false,
+        error: message || 'Too many requests. Please slow down and try again shortly.',
+        retry_after_seconds: retryAfterSec,
+      });
+    }
+
+    bucket.count += 1;
+    next();
+  };
+}
+
+/**
+ * Limit an UNAUTHENTICATED route per client IP.
+ *
+ * Exists for POST /auth/admin-login, which guards a single shared static password. Without a
+ * ceiling that password is open to unlimited online guessing, and one password is the whole
+ * security of the admin surface — so a cap matters far more here than the per-user limiter's
+ * cost control does.
+ *
+ * Requires `app.set('trust proxy', ...)` to be correct, or req.ip is the proxy's address and
+ * every caller lands in one shared bucket. index.ts sets it for Render's single hop.
+ *
+ * Inherits the per-process and fixed-window limitations documented at the top of this file.
+ * Both are worse here than for the per-user limiter — several instances multiply the ceiling,
+ * so treat this as a brute-force *ceiling*, not a guarantee. It buys enough time for a strong
+ * password to hold; it does not make a weak one safe.
+ */
+export function rateLimitPerIp({ limit, windowMs, message }: RateLimitOptions) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    // Namespaced so an IP key can never collide with a user id key in the shared map.
+    const key = `ip:${req.ip || req.socket?.remoteAddress || 'unknown'}`;
     const now = Date.now();
     const bucket = buckets.get(key);
 
