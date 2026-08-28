@@ -145,4 +145,21 @@ describe('migration 016 — the signup trigger', () => {
     assert.match(MIGRATION_SQL, /CREATE OR REPLACE FUNCTION public\.handle_new_user/i);
     assert.match(MIGRATION_SQL, /SECURITY DEFINER/i);
   });
+
+  test('the body EXPLAINS what it stopped doing, and the check tolerates that', async () => {
+    // Both halves matter, and they pull against each other.
+    //
+    // The comment has to name the dead credit types, or the next person to read
+    // this function has no idea why it grants nothing. But `up()` verifies the
+    // migration by reading the function back out of the database with
+    // pg_get_functiondef, which returns comments too — so a naive match reports
+    // the explanation as the problem. It did exactly that on the first real run:
+    // the migration applied correctly and the script exited 1 saying it had not.
+    //
+    // A self-check that cries wolf is worse than none, so this pins the
+    // comment's presence AND the fact that stripping comments is what the check
+    // is done against.
+    assert.match(MIGRATION_SQL, /-- .*seed 'images'\/'content'\/'keywords' rows/);
+    assert.doesNotMatch(EXECUTABLE, /'images'/);
+  });
 });

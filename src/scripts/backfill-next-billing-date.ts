@@ -51,7 +51,8 @@ async function main() {
     : '🔍 DRY RUN — nothing will be written. Re-run with --apply.\n');
 
   const rows = await sql`
-    SELECT s.user_id, u.email, s.status, s.next_billing_date, s.stripe_subscription_id
+    SELECT s.user_id, u.email, s.status, s.next_billing_date, s.stripe_subscription_id,
+           s.pending_plan_id, s.pending_plan_effective_date
     FROM   subscriptions s
     JOIN   users u ON u.id = s.user_id
     WHERE  s.stripe_subscription_id IS NOT NULL
@@ -60,6 +61,7 @@ async function main() {
 
   let corrected = 0;
   let alreadyRight = 0;
+  let scheduledMoved = 0;
   const unreadable: string[] = [];
 
   for (const row of rows) {
@@ -92,10 +94,39 @@ async function main() {
       `  [${row.status}, ${subscription.id}]`,
     );
 
+    // ── A scheduled downgrade rides on this date ────────────────────────────
+    // pending_plan_effective_date is written as a COPY of next_billing_date
+    // (see changePlan: `pending_plan_effective_date = next_billing_date`), so
+    // moving one without the other would leave a downgrade scheduled a day
+    // BEFORE the renewal it is supposed to coincide with — a new bug, created
+    // by the fix for the old one.
+    //
+    // Only when the two currently agree, which is the signal that it was
+    // derived rather than set deliberately. A date someone chose for their own
+    // reasons is left where it is and reported.
+    const scheduled = row.pending_plan_effective_date
+      ? dayOf(row.pending_plan_effective_date)
+      : null;
+    const moveScheduled = row.pending_plan_id != null && scheduled !== null && scheduled === stored;
+    if (row.pending_plan_id != null) {
+      if (moveScheduled) {
+        scheduledMoved += 1;
+        console.log(`    scheduled plan change moves with it: ${scheduled} → ${actual}`);
+      } else {
+        console.log(
+          `    ⚠️  pending plan change effective ${scheduled ?? '(none)'} does NOT match the stored ` +
+          'billing date — left as it is, check it by hand',
+        );
+      }
+    }
+
     if (apply) {
       await sql`
         UPDATE subscriptions
-        SET    next_billing_date = TO_TIMESTAMP(${periodEnd}::double precision)
+        SET    next_billing_date = TO_TIMESTAMP(${periodEnd}::double precision),
+               pending_plan_effective_date = ${moveScheduled
+                 ? sql`TO_TIMESTAMP(${periodEnd}::double precision)`
+                 : sql`pending_plan_effective_date`}
         WHERE  user_id = ${row.user_id}
       `;
     }
@@ -103,7 +134,10 @@ async function main() {
 
   console.log(
     `\n${rows.length} subscription(s) checked — ` +
-    `${corrected} ${apply ? 'corrected' : 'to correct'}, ${alreadyRight} already right.`,
+    `${corrected} ${apply ? 'corrected' : 'to correct'}, ${alreadyRight} already right` +
+    (scheduledMoved > 0
+      ? `, ${scheduledMoved} scheduled plan change(s) ${apply ? 'moved' : 'to move'} with them.`
+      : '.'),
   );
 
   if (unreadable.length > 0) {

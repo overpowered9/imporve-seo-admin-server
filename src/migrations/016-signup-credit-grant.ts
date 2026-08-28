@@ -118,9 +118,17 @@ export async function up(): Promise<{ seedsLegacyTypes: boolean; createsUser: bo
     LIMIT  1
   `;
   const def = String((rows[0] as any)?.def ?? '');
+  // Comments stripped before matching. pg_get_functiondef returns the body
+  // VERBATIM, comments included, and the body carries a note explaining what
+  // this function stopped doing — a note that necessarily names the three dead
+  // credit types. Matching the raw text reports the explanation as the thing it
+  // is warning about, which is what this check did on its first real run.
+  // Assert about the SQL that RUNS; the prose beside it is not behaviour.
+  const executable = def.replace(/--[^\n]*/g, '');
   return {
-    seedsLegacyTypes: /'(images|content|keywords)'/.test(def),
-    createsUser: /INSERT INTO public\.users/i.test(def),
+    seedsLegacyTypes: /'(images|content|keywords)'/.test(executable)
+      || /INSERT INTO public\.credit_balances/i.test(executable),
+    createsUser: /INSERT INTO public\.users/i.test(executable),
   };
 }
 
