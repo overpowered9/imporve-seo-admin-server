@@ -26,7 +26,8 @@ import {
   effectiveTrialEnd,
   getLiveBalance,
   getCreditLotSummary,
-  clearWebsiteConnection
+  clearWebsiteConnection,
+  ensureSignupGrant
 } from '../models/user.models.js';
 
 const router = express.Router();
@@ -188,6 +189,15 @@ router.post('/by-email', async (req, res) => {
         error: 'User not found'
       });
     }
+
+    // ── Provision the signup grant, if it never happened ──────────────────
+    // This is the first API call of every CMS session, and for an account
+    // created through supabase.auth.signUp() it is the FIRST time the API sees
+    // that account at all — the users row was written by a database trigger.
+    // Before this, such an account had no credit lot, so it showed a zero
+    // balance and every generation was refused. No-op for everyone else: one
+    // existence check and nothing more. See ensureSignupGrant.
+    await ensureSignupGrant(user);
 
     // Void any expired trial (plan) credits before reading, so the dashboard shows the
     // truthful post-expiry balance (plan credits zeroed, purchased preserved).

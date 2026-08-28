@@ -211,6 +211,55 @@ export async function fetchCheckoutReceiptUrl(
  * individually idempotent.
  */
 /**
+ * Settle plan-change rows that were waiting on this invoice.
+ *
+ * ── THE GAP THIS CLOSES ─────────────────────────────────────────────────────
+ * A plan change is recorded on the day it happens. When the proration cannot be
+ * collected there and then, that row is written `pending` with no receipt,
+ * because at that moment there is no payment and nothing to link to.
+ *
+ * Nothing ever changed that. The money arrived later, on the next subscription
+ * invoice, and the row stayed pending for good — so Account Activity and its
+ * CSV export showed a charge with a blank Receipt column indefinitely, which
+ * reads as a missing link rather than as "not collected yet". QA reported
+ * exactly that.
+ *
+ * Matching is on the SUBSCRIPTION, not on an invoice id, because the pending
+ * row cannot know which future invoice will carry it — `provider_object_id`
+ * holds the subscription precisely when no invoice existed. An invoice with
+ * proration lines settles whatever plan changes were outstanding for that
+ * subscription, and two changes settled by one invoice legitimately share its
+ * receipt.
+ *
+ * `receipt_url` is COALESCEd so a row that somehow already has one keeps it:
+ * the first receipt is the one closest to the event.
+ */
+export async function settlePendingPlanChanges(
+  sql: SqlLike,
+  params: {
+    userId: number;
+    subscriptionId: string;
+    receiptUrl: string | null;
+    /** The invoice's timestamp; only rows that predate it can be settled by it. */
+    paidAt: Date;
+  },
+): Promise<number> {
+  const rows = await sql`
+    UPDATE billing_transactions
+       SET status      = 'succeeded',
+           receipt_url = COALESCE(receipt_url, ${params.receiptUrl}),
+           updated_at  = NOW()
+     WHERE user_id            = ${params.userId}
+       AND type               = 'plan_upgrade'
+       AND status             = 'pending'
+       AND provider_object_id = ${params.subscriptionId}
+       AND created_at        <= ${params.paidAt}
+    RETURNING id
+  `;
+  return (rows as any[]).length;
+}
+
+/**
  * The subscription an invoice belongs to, or null for a one-off invoice.
  *
  * ── WHY THIS IS NOT JUST `invoice.subscription` ─────────────────────────────

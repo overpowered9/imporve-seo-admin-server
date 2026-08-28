@@ -238,14 +238,33 @@ export const __planLabel = planLabel;
  * failed to bill them. `chargedCents` of null means collection did not happen
  * now, so the sentence must not claim it did.
  */
-export function planUpgradeConfirmation(params: {
+export interface UpgradeConfirmationParams {
   planName: string | null | undefined;
   chargedCents: number | null;
   currency?: string;
   nextBillingDate?: Date | string | null;
   creditsGranted?: number;
   creditsTotal?: number | null;
-}): string {
+}
+
+/**
+ * The same confirmation as PARAGRAPHS, with the facts emphasised.
+ *
+ * Each paragraph leads with what the reader is scanning for and then explains
+ * it: the plan they are now on, the amount taken, the credits received. The
+ * lead is bold and the explanation is not, so the three answers can be found
+ * without reading the sentences around them.
+ *
+ * "No charge today" is bold wherever it appears — here, on both downgrade
+ * dialogs and on the reactivation — because it is the same question every time
+ * and it should not have to be hunted for on one screen and not another.
+ *
+ * planUpgradeConfirmation is derived FROM this, so the string and the structure
+ * can never disagree about what the message says.
+ */
+export function planUpgradeConfirmationParts(
+  params: UpgradeConfirmationParams,
+): MessageParagraph[] {
   const money = (cents: number) => {
     const code = (params.currency || 'usd').toUpperCase();
     try {
@@ -257,8 +276,11 @@ export function planUpgradeConfirmation(params: {
   };
 
   const plan = planLabel(params.planName);
-  const lines: string[] = [
-    plan ? `You're now on the ${plan} plan` : "You're now on your new plan",
+  const paragraphs: MessageParagraph[] = [
+    plan
+      // The plan name is the emphasis: it is the single fact that changed.
+      ? [{ text: "You're now on the " }, { text: `${plan} plan`, strong: true }]
+      : [{ text: "You're now on your new plan" }],
   ];
 
   const when = dayLabel(params.nextBillingDate);
@@ -266,18 +288,21 @@ export function planUpgradeConfirmation(params: {
 
   if (params.chargedCents === null) {
     // Collection is deferred — say so rather than claim a charge that has not
-    // happened. This is the honest version of the old sentence.
-    lines.push(
-      `The prorated amount for the rest of this billing cycle will appear on your next invoice.${resumes}`,
-    );
+    // happened. This is the honest version of the old sentence. Nothing is
+    // emphasised: there is no figure yet to pick out.
+    paragraphs.push([{
+      text: `The prorated amount for the rest of this billing cycle will appear on your next invoice.${resumes}`,
+    }]);
   } else if (params.chargedCents > 0) {
-    lines.push(
-      `We charged ${money(params.chargedCents)} — the prorated amount for the rest of this billing cycle.${resumes}`,
-    );
+    paragraphs.push([
+      { text: `We charged ${money(params.chargedCents)}`, strong: true },
+      { text: ` — the prorated amount for the rest of this billing cycle.${resumes}` },
+    ]);
   } else {
-    lines.push(
-      `No charge today — the unused part of your previous plan covered the change.${resumes}`,
-    );
+    paragraphs.push([
+      { text: 'No charge today', strong: true },
+      { text: ` — the unused part of your previous plan covered the change.${resumes}` },
+    ]);
   }
 
   const granted = params.creditsGranted ?? 0;
@@ -285,12 +310,27 @@ export function planUpgradeConfirmation(params: {
     const total = typeof params.creditsTotal === 'number'
       ? ` You now have a total of ${params.creditsTotal.toLocaleString()} credits.`
       : '';
-    lines.push(`${granted.toLocaleString()} credits added.${total}`);
+    paragraphs.push([
+      { text: `${granted.toLocaleString()} credits added.`, strong: true },
+      ...(total ? [{ text: total }] : []),
+    ]);
   } else if (typeof params.creditsTotal === 'number') {
-    lines.push(`You have ${params.creditsTotal.toLocaleString()} credits.`);
+    paragraphs.push([{ text: `You have ${params.creditsTotal.toLocaleString()} credits.` }]);
   }
 
-  return lines.join('\n');
+  return paragraphs;
+}
+
+/**
+ * The confirmation as a plain string, for anything that cannot render segments.
+ *
+ * Derived from the parts above rather than written twice, so the two cannot
+ * drift into saying different things.
+ */
+export function planUpgradeConfirmation(params: UpgradeConfirmationParams): string {
+  return planUpgradeConfirmationParts(params)
+    .map((paragraph) => paragraph.map((seg) => seg.text).join(''))
+    .join('\n');
 }
 
 /**
@@ -318,46 +358,89 @@ export function planUpgradeConfirmation(params: {
  * date would either claim the old plan ends a day early or that the new plan
  * starts a day late.
  */
-export function planDowngradeConfirmation(params: {
+export interface MessageSegment {
+  text: string;
+  /** Rendered bold by the CMS. See RichMessage in the CMS. */
+  strong?: boolean;
+}
+/** One paragraph, as the segments it is made of. */
+export type MessageParagraph = MessageSegment[];
+
+export interface DowngradeConfirmationParams {
   fromPlan: string | null | undefined;
   toPlan: string | null | undefined;
   nextBillingDate?: Date | string | null;
   nextAmountCents?: number | null;
   currency?: string;
-}): string {
+}
+
+/**
+ * The same confirmation as PARAGRAPHS, with the money sentence emphasised.
+ *
+ * ── WHY STRUCTURE AND NOT A STRING ──────────────────────────────────────────
+ * The CMS rendered the string below with `whiteSpace: 'pre-line'`, which gets
+ * line breaks and nothing else: the three lines sat flush together, and no part
+ * of one could be weighted. "No charge today." is the first thing anyone reads
+ * after committing to a billing change, so it carries weight — and that cannot
+ * be expressed in a string without the renderer pattern-matching on the wording,
+ * which would break silently the moment the wording changed.
+ *
+ * planDowngradeConfirmation is derived FROM this, so the string and the
+ * structure can never disagree about what the message says.
+ */
+export function planDowngradeConfirmationParts(
+  params: DowngradeConfirmationParams,
+): MessageParagraph[] {
   const from = planLabel(params.fromPlan);
   const to = planLabel(params.toPlan);
   const starts = dayLabel(params.nextBillingDate);
   const lastDay = dayBeforeLabel(params.nextBillingDate);
 
-  const lines: string[] = [];
+  const paragraphs: MessageParagraph[] = [];
 
-  // Line 1. Degrades one clause at a time rather than all-or-nothing: knowing
-  // the plan names is useful even when the date is missing, and vice versa.
+  // 1. Degrades one clause at a time rather than all-or-nothing: knowing the
+  // plan names is useful even when the date is missing, and vice versa.
   const staysOn = from ? `You stay on the ${from} plan` : 'You stay on your current plan';
   const newPlanStarts = to ? `The ${to} plan starts` : 'Your new plan starts';
-  lines.push(
-    lastDay && starts
+  paragraphs.push([{
+    text: lastDay && starts
       ? `${staysOn} until ${lastDay}. ${newPlanStarts} on ${starts}.`
       : `${staysOn} until the end of your billing period. ${newPlanStarts} then.`,
-  );
+  }]);
 
-  // Line 2. "No charge today" leads because it is the first thing anyone checks
-  // after committing to a billing change.
+  // 2. "No charge today." leads AND is emphasised, because it is the first
+  // thing anyone checks after committing to a billing change.
   const amount = params.nextAmountCents;
-  lines.push(
-    typeof amount === 'number' && Number.isFinite(amount) && starts
-      ? `No charge today. Your next payment is ${formatMoneyCents(amount, params.currency)} on ${starts}.`
-      : 'No charge today.',
+  const money = typeof amount === 'number' && Number.isFinite(amount) && starts
+    ? ` Your next payment is ${formatMoneyCents(amount, params.currency)} on ${starts}.`
+    : '';
+  paragraphs.push(
+    money
+      ? [{ text: 'No charge today.', strong: true }, { text: money }]
+      : [{ text: 'No charge today.', strong: true }],
   );
 
-  // Line 3. Unconditional, and the reason this function exists as much as the
-  // date formatting does: "am I about to lose the credits I paid for?" is what
+  // 3. Unconditional, and the reason this function exists as much as the date
+  // formatting does: "am I about to lose the credits I paid for?" is what
   // people actually fear when they downgrade, and the old sentence never
   // answered it.
-  lines.push('Your current credits are unaffected and keep their existing expiry dates.');
+  paragraphs.push([
+    { text: 'Your current credits are unaffected and keep their existing expiry dates.' },
+  ]);
 
-  return lines.join('\n');
+  return paragraphs;
+}
+
+/**
+ * The confirmation as a plain string, for anything that cannot render segments.
+ *
+ * Derived from the parts above rather than written twice, so the two cannot
+ * drift into saying different things.
+ */
+export function planDowngradeConfirmation(params: DowngradeConfirmationParams): string {
+  return planDowngradeConfirmationParts(params)
+    .map((paragraph) => paragraph.map((seg) => seg.text).join(''))
+    .join('\n');
 }
 
 /**

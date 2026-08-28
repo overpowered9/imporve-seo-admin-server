@@ -17,7 +17,9 @@ import {
   describeCreditPurchase, describeRefund, describeCreditAdjustment,
   describePaymentFailed, describeCreditsExpired,
   planUpgradeConfirmation,
+  planUpgradeConfirmationParts,
   planDowngradeConfirmation,
+  planDowngradeConfirmationParts,
   reactivationConfirmation,
 } from './descriptions.js';
 
@@ -252,6 +254,105 @@ describe('the downgrade confirmation', () => {
           .includes('Your current credits are unaffected and keep their existing expiry dates.'),
       );
     }
+  });
+});
+
+describe('the upgrade confirmation, as paragraphs', () => {
+  const base = {
+    planName: 'Optimize',
+    chargedCents: 1524,
+    currency: 'usd',
+    nextBillingDate: '2026-09-19T00:00:00Z',
+    creditsGranted: 360,
+    creditsTotal: 994,
+  };
+  const strong = (parts: any[]) =>
+    parts.flat().filter((x: any) => x.strong).map((x: any) => x.text);
+
+  test('each paragraph leads with the fact and explains it after', () => {
+    assert.deepEqual(strong(planUpgradeConfirmationParts(base)), [
+      'Optimize plan',      // the single thing that changed
+      'We charged $15.24',  // what was taken
+      '360 credits added.', // what arrived
+    ]);
+  });
+
+  test('three paragraphs, so the lines can breathe', () => {
+    assert.equal(planUpgradeConfirmationParts(base).length, 3);
+  });
+
+  test('"No charge today" is emphasised here too, as it is everywhere else', () => {
+    // Same question on every billing screen; it should not have to be hunted
+    // for on one and not another.
+    assert.deepEqual(
+      strong(planUpgradeConfirmationParts({ ...base, chargedCents: 0 })),
+      ['Optimize plan', 'No charge today', '360 credits added.'],
+    );
+  });
+
+  test('a deferred charge emphasises no figure, because there is none yet', () => {
+    const parts = planUpgradeConfirmationParts({ ...base, chargedCents: null });
+    assert.deepEqual(strong(parts), ['Optimize plan', '360 credits added.']);
+    assert.match(parts[1].map((s: any) => s.text).join(''), /will appear on your next invoice/);
+  });
+
+  test('the STRING is derived from the parts, so the two cannot disagree', () => {
+    const flattened = planUpgradeConfirmationParts(base)
+      .map((p) => p.map((s) => s.text).join(''))
+      .join('\n');
+    assert.equal(planUpgradeConfirmation(base), flattened);
+  });
+
+  test('an unknown plan name has nothing to bold and still reads', () => {
+    const parts = planUpgradeConfirmationParts({ ...base, planName: null });
+    assert.equal(parts[0].map((s) => s.text).join(''), "You're now on your new plan");
+    assert.ok(!strong(parts).includes('plan'));
+  });
+});
+
+describe('the downgrade confirmation, as paragraphs', () => {
+  const base = {
+    fromPlan: 'Optimize',
+    toPlan: 'Grow',
+    nextBillingDate: '2026-09-20T00:00:00Z',
+    nextAmountCents: 950,
+    currency: 'usd',
+  };
+
+  test('"No charge today." carries the weight', () => {
+    // The first thing anyone checks after committing to a billing change. A
+    // plain string could not express this, and having the CMS pattern-match the
+    // wording would break silently the moment the wording changed.
+    const strong = planDowngradeConfirmationParts(base)
+      .flat().filter((s) => s.strong).map((s) => s.text);
+    assert.deepEqual(strong, ['No charge today.']);
+  });
+
+  test('three paragraphs, so the lines can breathe', () => {
+    assert.equal(planDowngradeConfirmationParts(base).length, 3);
+  });
+
+  test('the money paragraph reads as one sentence across its segments', () => {
+    const [, money] = planDowngradeConfirmationParts(base);
+    assert.equal(
+      money.map((s) => s.text).join(''),
+      'No charge today. Your next payment is $9.50 on Sep 20, 2026.',
+    );
+  });
+
+  test('the emphasis survives when there is no amount to quote', () => {
+    const parts = planDowngradeConfirmationParts({ ...base, nextAmountCents: null });
+    const strong = parts.flat().filter((s) => s.strong).map((s) => s.text);
+    assert.deepEqual(strong, ['No charge today.']);
+    assert.equal(parts[1].map((s) => s.text).join(''), 'No charge today.');
+  });
+
+  test('the STRING is derived from the parts, so the two cannot disagree', () => {
+    // This is what keeps the plain-text API and the structured one honest.
+    const flattened = planDowngradeConfirmationParts(base)
+      .map((p) => p.map((s) => s.text).join(''))
+      .join('\n');
+    assert.equal(planDowngradeConfirmation(base), flattened);
   });
 });
 

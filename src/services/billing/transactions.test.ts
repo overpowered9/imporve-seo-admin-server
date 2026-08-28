@@ -11,6 +11,7 @@ import {
   recordTransaction,
   transactionsFromInvoice,
   subscriptionIdFromInvoice,
+  settlePendingPlanChanges,
   isRenewalInvoice,
   receiptUrlFromSession,
   fetchCheckoutReceiptUrl,
@@ -101,6 +102,70 @@ describe('recordTransaction', () => {
       amountCents: 9900, currency: 'usd', providerEventId: 'evt_1',
     });
     assert.deepEqual(result, { recorded: false, duplicate: false });
+  });
+});
+
+describe('settling a plan change that was waiting on an invoice', () => {
+  // A plan change whose proration could not be collected on the day is written
+  // `pending` with no receipt. Nothing used to change that, so the row stayed
+  // pending for good and its Receipt column stayed blank — which is what QA
+  // reported as "the Stripe link is missing" on the CSV export.
+  const args = {
+    userId: 7,
+    subscriptionId: 'sub_1',
+    receiptUrl: 'https://invoice.stripe.com/i/abc',
+    paidAt: new Date('2026-09-20T00:00:00Z'),
+  };
+  const settleSql = (rows: any[]) => {
+    const sql = createFakeSql();
+    sql.when(/UPDATE billing_transactions/, rows);
+    return sql;
+  };
+
+  test('marks the row succeeded and attaches the receipt', async () => {
+    const sql = settleSql([{ id: 11 }]);
+    assert.equal(await settlePendingPlanChanges(sql, args), 1);
+
+    const q = sql.matching(/UPDATE billing_transactions/)[0];
+    assert.match(q.text, /SET status\s*=\s*'succeeded'/);
+    // COALESCE, so a row that already has a receipt keeps the one closest to
+    // the event rather than being overwritten by a later invoice.
+    assert.match(q.text, /receipt_url\s*=\s*COALESCE/);
+    assert.ok(q.params.includes('https://invoice.stripe.com/i/abc'));
+  });
+
+  test('only PENDING plan upgrades, and only for this subscription', async () => {
+    const sql = settleSql([]);
+    await settlePendingPlanChanges(sql, args);
+    const q = sql.matching(/UPDATE billing_transactions/)[0];
+    assert.match(q.text, /status\s*=\s*'pending'/);
+    assert.match(q.text, /type\s*=\s*'plan_upgrade'/);
+    assert.match(q.text, /provider_object_id/);
+    assert.ok(q.params.includes('sub_1'), 'scoped to the subscription');
+    assert.ok(q.params.includes(7), 'scoped to the user');
+  });
+
+  test('never settles a row created AFTER the invoice', async () => {
+    // A change made after this invoice was raised is not the one it collected.
+    const sql = settleSql([]);
+    await settlePendingPlanChanges(sql, args);
+    assert.match(sql.matching(/UPDATE billing_transactions/)[0].text, /created_at\s*<=/);
+  });
+
+  test('reports how many rows it settled, so one invoice can close two changes', async () => {
+    const sql = settleSql([{ id: 1 }, { id: 2 }]);
+    assert.equal(await settlePendingPlanChanges(sql, args), 2);
+  });
+
+  test('a missing receipt still settles the status', async () => {
+    // Being charged is the fact that matters; the link is a convenience.
+    const sql = settleSql([{ id: 3 }]);
+    assert.equal(await settlePendingPlanChanges(sql, { ...args, receiptUrl: null }), 1);
+  });
+
+  test('nothing to settle is not an error', async () => {
+    const sql = settleSql([]);
+    assert.equal(await settlePendingPlanChanges(sql, args), 0);
   });
 });
 

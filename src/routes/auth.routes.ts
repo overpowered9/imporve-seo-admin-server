@@ -3,7 +3,7 @@ import { z } from 'zod';
 import crypto from 'crypto';
 import { supabaseAdmin } from '../services/supabase.service.js';
 import sql from '../data/db.js';
-import { findUserByEmail, findUserByOAuth, createUser, createOAuthUser, updateUserOAuthData, initializeUserCredits, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, getUserWebsites, getUserWithPlan, startUserTrial, type User } from '../models/user.models.js';
+import { findUserByEmail, findUserByOAuth, createUser, createOAuthUser, updateUserOAuthData, initializeUserCredits, ensureSignupGrant, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, getUserWebsites, getUserWithPlan, startUserTrial, type User } from '../models/user.models.js';
 
 const router = express.Router();
 
@@ -342,6 +342,13 @@ router.post('/oauth-callback', async (req, res) => {
         });
       } catch { /* non-fatal */ }
       await startUserTrial(emailUser.id); // idempotent — ensure the trial exists
+      // A Google signup lands HERE, not in the "brand new user" branch below:
+      // the auth.users trigger has already written the public.users row, so
+      // findUserByEmail succeeds and this reads as "linking an existing
+      // account". That meant initializeUserCredits below was never reached and
+      // the new account got nothing. Idempotent, so genuinely existing accounts
+      // are untouched. See ensureSignupGrant.
+      await ensureSignupGrant(emailUser);
 
       return res.json({
         success: true,

@@ -111,10 +111,12 @@ import {
   releaseOrphanedSchedules,
   isLiveStatus,
 } from '../services/billing/subscription-state.js';
+import { periodEndOf, periodEndOrWarn } from '../services/billing/subscription-period.js';
 import {
   recordTransaction,
   transactionsFromInvoice,
   subscriptionIdFromInvoice,
+  settlePendingPlanChanges,
   isRenewalInvoice,
   fetchCheckoutReceiptUrl,
   readLedger,
@@ -137,8 +139,8 @@ import {
   describeSubscriptionCancelled,
   describeSubscriptionReactivated,
   describeRefund,
-  planUpgradeConfirmation,
-  planDowngradeConfirmation,
+  planUpgradeConfirmationParts,
+  planDowngradeConfirmationParts,
   reactivationConfirmation,
 } from '../services/billing/descriptions.js';
 
@@ -272,7 +274,17 @@ const activateSubscriptionInDb = async (params: {
   planId: number;
   stripeSubscriptionId: string;
   stripeCustomerId: string;
-  nextBillingTimestamp: number;
+  /**
+   * Stripe's period end, unix seconds — or null when it could not be read.
+   *
+   * Nullable deliberately. This used to take `current_period_end || now + 30
+   * days`, and since that field moved onto the subscription ITEM the left side
+   * was always undefined, so every row got a fabricated date. See
+   * services/billing/subscription-period. Null now means "keep what is there",
+   * because a stale date self-corrects on the next webhook and an invented one
+   * never does.
+   */
+  nextBillingTimestamp: number | null;
   /** How this subscription bills. Recorded so the plan grid opens on the right
    *  side of the monthly/yearly toggle without asking Stripe. */
   billingInterval?: 'month' | 'year';
@@ -285,7 +297,8 @@ const activateSubscriptionInDb = async (params: {
       user_id, plan_id, status, stripe_subscription_id, stripe_customer_id, billing_interval, start_date, next_billing_date
     )
     VALUES (
-      ${userId}, ${planId}, 'active', ${stripeSubscriptionId}, ${stripeCustomerId}, ${billingInterval}, NOW(), TO_TIMESTAMP(${nextBillingTimestamp})
+      ${userId}, ${planId}, 'active', ${stripeSubscriptionId}, ${stripeCustomerId}, ${billingInterval}, NOW(),
+      TO_TIMESTAMP(${nextBillingTimestamp}::double precision)
     )
     ON CONFLICT (user_id)
     DO UPDATE SET
@@ -294,7 +307,12 @@ const activateSubscriptionInDb = async (params: {
       stripe_subscription_id = ${stripeSubscriptionId},
       stripe_customer_id = ${stripeCustomerId},
       billing_interval = ${billingInterval},
-      next_billing_date = TO_TIMESTAMP(${nextBillingTimestamp}),
+      -- COALESCE, not an overwrite: an unreadable period must leave the date
+      -- alone rather than blank a good one.
+      next_billing_date = COALESCE(
+        TO_TIMESTAMP(${nextBillingTimestamp}::double precision),
+        subscriptions.next_billing_date
+      ),
       cancel_at_period_end = FALSE,
       pending_plan_id = NULL,
       pending_plan_effective_date = NULL
@@ -830,7 +848,16 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
             package_id: pkg.id,
             approx_pieces: pkg.approx_pieces,
             receipt_url: charged.receiptUrl,
-            // No `url`: nothing to redirect to. The CMS closes the dialog and
+            // The balance AFTER the grant, read back rather than computed by
+            // adding the pack to whatever the CMS last saw. The confirmation
+            // states this number, and a stale client-side total would put a
+            // wrong balance in front of someone who has just paid. Best effort:
+            // a failed read costs one clause of a sentence, never the purchase,
+            // which has already completed by this point.
+            balance_after: await getLiveBalance(user_id)
+              .then((b) => b.total)
+              .catch(() => null),
+            // No `url`: nothing to redirect to. The CMS confirms in place and
             // refreshes the balance.
           },
         });
@@ -1089,8 +1116,10 @@ router.post('/webhook', async (req: Request, res: Response) => {
             planId = userResult.length > 0 ? userResult[0].plan_id : 1;
           }
 
-          // Calculate next billing date (use current_period_end timestamp)
-          const nextBillingTimestamp = (subscription as any).current_period_end || Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+          // Stripe's own period end. On 2025-10-29.clover it lives on the
+          // subscription ITEM, which is why this goes through a helper — see
+          // services/billing/subscription-period.
+          const nextBillingTimestamp = periodEndOrWarn(subscription, 'subscription.created');
 
           await activateSubscriptionInDb({
             userId,
@@ -1120,14 +1149,23 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
         if (subResult.length > 0) {
           const userId = subResult[0].user_id;
-          const nextBillingTimestamp = (subscription as any).current_period_end || Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+          // THE site that did the most damage. This event fires on every plan
+          // change, and the old expression resolved to "now + 30 days" — so an
+          // upgrade pushed the customer's billing date thirty days out from the
+          // moment they clicked, every time. Two upgrades in an hour and the
+          // date had drifted a fortnight from Stripe's anchor.
+          const nextBillingTimestamp = periodEndOrWarn(subscription, 'subscription.updated');
 
           // ✅ Update subscription status from Stripe
           await sql`
-            UPDATE subscriptions 
-            SET 
+            UPDATE subscriptions
+            SET
               status = ${subscription.status},
-              next_billing_date = TO_TIMESTAMP(${nextBillingTimestamp})
+              -- COALESCE: an unreadable period leaves the stored date alone.
+              next_billing_date = COALESCE(
+                TO_TIMESTAMP(${nextBillingTimestamp}::double precision),
+                next_billing_date
+              )
             WHERE stripe_subscription_id = ${subscription.id}
           `;
 
@@ -1237,6 +1275,27 @@ router.post('/webhook', async (req: Request, res: Response) => {
                 invoice, user_id, plan_id, planResult[0]?.name ?? null,
               )) {
                 await recordTransaction(sql, txn);
+              }
+            }
+
+            // ── Settle whatever this invoice was carrying ───────────────────
+            // A plan change whose proration could not be collected on the day
+            // is recorded `pending` with no receipt. This is the invoice that
+            // finally collects it, so this is where that row stops being
+            // pending — otherwise it stays that way for good and Account
+            // Activity shows a charge with a permanently blank Receipt column.
+            //
+            // Guarded on proration lines: an ordinary renewal carries no plan
+            // change and must not mark one settled.
+            if ((invoice.lines?.data ?? []).some(isProrationLine)) {
+              const settled = await settlePendingPlanChanges(sql, {
+                userId: user_id,
+                subscriptionId: paidSubscriptionId,
+                receiptUrl: invoice.hosted_invoice_url || invoice.invoice_pdf || null,
+                paidAt: new Date((invoice.created ?? 0) * 1000),
+              });
+              if (settled > 0) {
+                console.log(`✅ Settled ${settled} pending plan change(s) for user ${user_id}`);
               }
             }
           }
@@ -1460,8 +1519,7 @@ router.post('/verify-session', async (req: Request, res: Response) => {
             planId = userRow.length > 0 ? userRow[0].plan_id : 0;
           }
           if (planId) {
-            const nextBillingTimestamp = (subscription as any).current_period_end
-              || Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+            const nextBillingTimestamp = periodEndOrWarn(subscription, 'verify-session');
             await activateSubscriptionInDb({
               userId,
               planId,
@@ -1678,8 +1736,7 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
         // if the webhook endpoint is misconfigured/down the user would be charged but
         // receive nothing, and even when healthy the frontend reloads credits before the
         // async webhook lands. activateSubscriptionInDb is idempotent with the webhook.
-        const nextBillingTimestamp = (subscription as any).current_period_end
-          || Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+        const nextBillingTimestamp = periodEndOrWarn(subscription, 'subscribe');
 
         try {
           await activateSubscriptionInDb({
@@ -1717,7 +1774,12 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
             amountCharged: formatCents(plan.price_cents, 'usd'),
             lines: [{ description: `${plan.name} — first month`, amount: formatCents(plan.price_cents, 'usd') }],
             nextAmount: formatCents(plan.price_cents, 'usd'),
-            nextBillingDate: new Date(nextBillingTimestamp * 1000).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+            // Null when Stripe gave us no period. The template drops the "Then
+            // $X on <date>" row rather than printing a date we made up — a
+            // receipt is the last place to guess at a billing date.
+            nextBillingDate: nextBillingTimestamp !== null
+              ? new Date(nextBillingTimestamp * 1000).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+              : null,
             cardBrand: defaultPmForReceipt?.brand ?? null,
             cardLast4: defaultPmForReceipt?.last4 ?? null,
             billingUrl: CMS_BILLING_URL,
@@ -2164,13 +2226,27 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
       newPriceId: newPlan.stripe_price_id,
     });
 
+    // ── The period this quote is priced against ──────────────────────────────
+    //
+    // From the SUBSCRIPTION WE JUST RETRIEVED, not from our own column. Stripe
+    // prorated the amounts above against this instant, so every date and day
+    // count in the dialog has to be measured from the same one — that is the
+    // whole defect QA hit: correct cents next to a day count and a renewal date
+    // taken off a stale, separately-derived value, which made the cents look
+    // wrong. The stored column is the fallback, for the case where Stripe's
+    // payload has no period at all.
+    const periodEnd = periodEndOf(stripeSubscription);
+    const periodEndIso = periodEnd !== null
+      ? new Date(periodEnd * 1000).toISOString()
+      : (currentSub.next_billing_date ?? null);
+
     // The other half of the transaction. The money above is prorated by Stripe;
     // the credits are prorated by us, and until now the customer was told about
     // the first and left to guess the second.
     const creditGrant = await previewUpgradeCreditGrant(
       user_id,
       newPlan,
-      currentSub.next_billing_date,
+      periodEndIso,
     );
 
     // ── What the dialog needs to explain the bill ────────────────────────────
@@ -2198,9 +2274,9 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
 
     // Whole days left, for "the N days left in this period". Ceil so a change
     // made with a few hours to run still reads as "1 day" rather than "0".
-    const daysRemaining = currentSub.next_billing_date
+    const daysRemaining = periodEndIso
       ? Math.max(0, Math.ceil(
-        (new Date(currentSub.next_billing_date).getTime() - Date.now()) / 86_400_000,
+        (new Date(periodEndIso).getTime() - Date.now()) / 86_400_000,
       ))
       : null;
 
@@ -2214,7 +2290,9 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
       currency: quote.currency,
       proration_date: quote.prorationDate,
       effective: 'immediate',
-      next_billing_date: currentSub.next_billing_date,
+      // Stripe's anchor, so "Then $X per month, starting …" names the day the
+      // amounts above were actually prorated to.
+      next_billing_date: periodEndIso,
       next_amount_cents: newPlan.price_cents,
       current_plan: currentPlan?.name ?? null,
       new_plan: newPlan.name,
@@ -2829,31 +2907,47 @@ router.post('/change-plan', async (req: Request, res: Response) => {
       );
     }
 
+    // ── One description of this change, rendered two ways ───────────────────
+    // The parameters are built ONCE and both the paragraphs and the plain
+    // string are derived from them. Passing them twice — once for `message`,
+    // once for `message_parts` — is two chances to describe the same plan
+    // change differently, and the customer would see whichever the CMS happened
+    // to render.
+    const confirmationParts = isUpgrade
+      ? planUpgradeConfirmationParts({
+        planName: newPlan.name,
+        // null when collection did not happen, so the copy says "will appear
+        // on your next invoice" instead of asserting a charge that did not
+        // occur. `charge` is null only on the non-upgrade paths.
+        chargedCents: charge && !charge.paid ? null : (proratedCents ?? 0),
+        currency: charge?.currency || 'usd',
+        nextBillingDate: currentSub.next_billing_date,
+        creditsGranted,
+        creditsTotal,
+      })
+      // Was `Plan downgrade scheduled for ${currentSub.next_billing_date}.` —
+      // a Date interpolated straight into a template string, which showed the
+      // customer "Sun Sep 20 2026 00:00:00 GMT+0000 (Coordinated Universal
+      // Time)". Now formatted, and it answers what happens to their credits.
+      : planDowngradeConfirmationParts({
+        fromPlan: currentPlan.name,
+        toPlan: newPlan.name,
+        nextBillingDate: currentSub.next_billing_date,
+        nextAmountCents: newPlan.price_cents,
+        currency: 'usd',
+      });
+
     res.json({
       success: true,
-      message: isUpgrade
-        ? planUpgradeConfirmation({
-          planName: newPlan.name,
-          // null when collection did not happen, so the copy says "will appear
-          // on your next invoice" instead of asserting a charge that did not
-          // occur. `charge` is null only on the non-upgrade paths.
-          chargedCents: charge && !charge.paid ? null : (proratedCents ?? 0),
-          currency: charge?.currency || 'usd',
-          nextBillingDate: currentSub.next_billing_date,
-          creditsGranted,
-          creditsTotal,
-        })
-        // Was `Plan downgrade scheduled for ${currentSub.next_billing_date}.` —
-        // a Date interpolated straight into a template string, which showed the
-        // customer "Sun Sep 20 2026 00:00:00 GMT+0000 (Coordinated Universal
-        // Time)". Now formatted, and it answers what happens to their credits.
-        : planDowngradeConfirmation({
-          fromPlan: currentPlan.name,
-          toPlan: newPlan.name,
-          nextBillingDate: currentSub.next_billing_date,
-          nextAmountCents: newPlan.price_cents,
-          currency: 'usd',
-        }),
+      // The plain string, flattened from the paragraphs below, for any client
+      // that does not render segments.
+      message: confirmationParts
+        .map((paragraph) => paragraph.map((seg) => seg.text).join(''))
+        .join('\n'),
+      // The same message as PARAGRAPHS, with the facts emphasised — the plan
+      // name, the amount charged, the credits added. A CMS that does not know
+      // about message_parts keeps rendering the string exactly as before.
+      message_parts: confirmationParts,
       immediate: isUpgrade,
       effective_date: isUpgrade ? new Date().toISOString() : currentSub.next_billing_date,
       new_plan: newPlan.name

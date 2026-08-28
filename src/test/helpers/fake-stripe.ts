@@ -27,15 +27,31 @@ export interface FakeCustomer {
   deleted?: false;
 }
 
+/**
+ * ── WHERE current_period_end LIVES ──────────────────────────────────────────
+ * On the ITEM, and only on the item. This fake used to put it at the top level,
+ * which is the pre-2025 shape real Stripe stopped sending — so every test
+ * exercised a branch production never took, and five call sites reading
+ * `subscription.current_period_end` silently fell through to "now + 30 days"
+ * for months. Verified against a live subscription on 2025-10-29.clover:
+ *
+ *     sub.current_period_end   = undefined
+ *     item.current_period_end  = 1790409310
+ *
+ * The top-level field is kept OPTIONAL so a fixture can still assert the legacy
+ * fallback path, but makeSubscription no longer emits it. A test double that
+ * models a provider which no longer exists is worse than no double at all.
+ */
 export interface FakeSubscription {
   id: string;
   customer: string;
   status: string;
   cancel_at_period_end: boolean;
   canceled_at: number | null;
-  current_period_end: number;
+  /** Pre-2025 location. Absent on real payloads; set it only to test that path. */
+  current_period_end?: number;
   default_payment_method: string | null;
-  items: { data: Array<{ id: string; price: { id: string } }> };
+  items: { data: Array<{ id: string; price: { id: string }; current_period_end?: number }> };
   metadata: Record<string, string>;
   schedule?: string | null;
   latest_invoice?: any;
@@ -87,18 +103,26 @@ export const makeCustomer = (over: Partial<FakeCustomer> = {}): FakeCustomer => 
   invoice_settings: { default_payment_method: null, ...(over.invoice_settings ?? {}) },
 });
 
-export const makeSubscription = (over: Partial<FakeSubscription> = {}): FakeSubscription => ({
-  id: over.id ?? nextId('sub'),
-  customer: over.customer ?? 'cus_test',
-  status: over.status ?? 'active',
-  cancel_at_period_end: over.cancel_at_period_end ?? false,
-  canceled_at: over.canceled_at ?? null,
-  current_period_end: over.current_period_end ?? Math.floor(Date.now() / 1000) + 15 * 86400,
-  default_payment_method: over.default_payment_method ?? null,
-  items: over.items ?? { data: [{ id: 'si_test', price: { id: 'price_current' } }] },
-  metadata: over.metadata ?? {},
-  schedule: over.schedule ?? null,
-});
+export const makeSubscription = (over: Partial<FakeSubscription> = {}): FakeSubscription => {
+  // `current_period_end` stays in the overrides for every existing caller, but
+  // it lands on the ITEM, which is where Stripe puts it and where the code now
+  // reads it. Explicit `items` win, so a fixture can still build an odd shape.
+  const periodEnd = over.current_period_end ?? Math.floor(Date.now() / 1000) + 15 * 86400;
+  const sub: FakeSubscription = {
+    id: over.id ?? nextId('sub'),
+    customer: over.customer ?? 'cus_test',
+    status: over.status ?? 'active',
+    cancel_at_period_end: over.cancel_at_period_end ?? false,
+    canceled_at: over.canceled_at ?? null,
+    default_payment_method: over.default_payment_method ?? null,
+    items: over.items ?? {
+      data: [{ id: 'si_test', price: { id: 'price_current' }, current_period_end: periodEnd }],
+    },
+    metadata: over.metadata ?? {},
+    schedule: over.schedule ?? null,
+  };
+  return sub;
+};
 
 export const makeInvoice = (over: Partial<FakeInvoice> = {}): FakeInvoice => ({
   id: over.id ?? nextId('in'),

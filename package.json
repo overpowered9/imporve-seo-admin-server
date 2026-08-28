@@ -27,6 +27,7 @@
     "backfill:cancellation-flags": "tsx src/scripts/backfill-stale-cancellations.ts",
     "backfill:receipts": "tsx src/scripts/backfill-credit-purchase-receipts.ts",
     "backfill:credit-expiry": "tsx src/scripts/backfill-credit-expiry.ts",
+    "backfill:billing-dates": "tsx src/scripts/backfill-next-billing-date.ts",
     "seed:expiring": "tsx src/scripts/seed-expiring-credits.ts",
     "migrations:print": "tsx src/scripts/print-migrations.ts",
     "monitor:ledger-gaps": "tsx src/scripts/check-ledger-gaps.ts",
@@ -37,7 +38,8 @@
     "migrate:credit-lots": "tsx src/migrations/012-credit-lots.ts",
     "migrate:yearly-plans": "tsx src/migrations/013-yearly-plans.ts",
     "migrate:website-heartbeat": "tsx src/migrations/014-website-heartbeat.ts",
-    "migrate:website-limits": "tsx src/migrations/015-plan-website-limits.ts"
+    "migrate:website-limits": "tsx src/migrations/015-plan-website-limits.ts",
+    "migrate:signup-credits": "tsx src/migrations/016-signup-credit-grant.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",

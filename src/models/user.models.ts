@@ -257,6 +257,67 @@ export const initializeUserCredits = async (user_id: number, plan_id?: number): 
   // Free tier: No subscription record is created
 };
 
+/**
+ * Grant the signup credits to an account that never received them.
+ *
+ * ── WHY A NEW ACCOUNT COULD HAVE NONE ───────────────────────────────────────
+ * The CMS signs up through supabase.auth.signUp(), so accounts are born inside
+ * Supabase Auth and the public.users row is written by a database trigger
+ * (handle_new_user — now tracked in migrations/016). Email signup then confirms
+ * by link, so the API is not touched at all until the first sign-in, and
+ * initializeUserCredits above — the only correct implementation of the grant —
+ * was never reached by either signup route: /auth/register is not what the CMS
+ * calls, and /auth/oauth finds the trigger-created row and takes its "existing
+ * user" branch.
+ *
+ * So this is called where the API first resolves an account. It is the
+ * PROVISIONING step that had no home, not a repair job, though it repairs the
+ * accounts created while the old trigger was live as a side effect — which is
+ * why no backfill is needed for them.
+ *
+ * ── THE GUARD IS NARROW ON PURPOSE ──────────────────────────────────────────
+ * It fires only for an account with NO credit lots AND no subscription row:
+ * unambiguously a new free account that was never provisioned. A PAYING account
+ * with no lots is a different failure — a refill that did not run, a webhook
+ * that was lost — and quietly handing it the free grant would paper over it and
+ * under-credit the customer. That case is left alone for a human.
+ *
+ * Cheap in the common case: one indexed existence check, then nothing.
+ * initializeUserCredits is itself idempotent (it guards on the same "has any
+ * lots" condition), so a race between two sessions cannot grant twice.
+ *
+ * Never throws. Reading an account must not fail because a grant could not be
+ * written; the failure is logged and the next request tries again.
+ */
+export const ensureSignupGrant = async (
+  user: { id: number; plan_id?: number | null },
+  // The seam the billing services already use (see proration.ts, which takes
+  // its client the same way): production callers pass nothing, and the guard —
+  // the part with the judgement in it — becomes testable without a database.
+  deps: {
+    db?: (strings: TemplateStringsArray, ...values: any[]) => Promise<any[]>;
+    provision?: (userId: number, planId?: number) => Promise<void>;
+  } = {},
+): Promise<boolean> => {
+  const db = deps.db ?? sql;
+  const provision = deps.provision ?? initializeUserCredits;
+  try {
+    const rows = await db`
+      SELECT EXISTS (SELECT 1 FROM credit_lots   WHERE user_id = ${user.id}) AS has_lots,
+             EXISTS (SELECT 1 FROM subscriptions WHERE user_id = ${user.id}) AS has_subscription
+    `;
+    const { has_lots: hasLots, has_subscription: hasSubscription } = (rows[0] ?? {}) as any;
+    if (hasLots || hasSubscription) return false;
+
+    await provision(user.id, user.plan_id ?? undefined);
+    console.log(`💳 Provisioned signup credits for user ${user.id} (none had been granted).`);
+    return true;
+  } catch (err) {
+    console.error(`⚠️ Could not provision signup credits for user ${user.id}:`, err);
+    return false;
+  }
+};
+
 export const getUserWithPlan = async (user_id: number) => {
   const result = await sql`
     SELECT 
