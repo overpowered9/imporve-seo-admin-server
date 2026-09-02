@@ -2396,6 +2396,38 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     // gated, so nobody can be trapped in a subscription.
     if (isUpgrade && await blockedForMissingAddress(user_id, res)) return;
 
+    // ── RE-PICKING THE PLAN A DOWNGRADE IS ALREADY QUEUED FOR ─────────────────
+    // Scale → Optimize is scheduled, and Optimize is chosen a second time. This
+    // was accepted in full: the same price was re-sent to Stripe, changePlan
+    // re-wrote an identical row, a second billing_disclosures row was spent on
+    // the quote, and the caller got a fresh "downgrade scheduled" confirmation
+    // indistinguishable from the first one.
+    //
+    // It reads like the guard below should have caught it, and it does not:
+    // that one is nested inside `new_plan_id === currentSub.plan_id`, and during
+    // a pending downgrade `plan_id` is still the CURRENT plan — so for the
+    // queued plan the comparison is false and the whole block is skipped.
+    //
+    // Answered as "nothing changed", in the same shape as that guard, rather
+    // than as an error: the customer asked for a state the account is already
+    // in, which is not a failure. `cancel_at_period_end` is excluded because a
+    // subscription that is winding down needs the reactivation path below, not
+    // this one.
+    if (
+      currentSub.pending_plan_id === new_plan_id
+      && new_plan_id !== currentSub.plan_id
+      && !currentSub.cancel_at_period_end
+    ) {
+      return res.json({
+        success: true,
+        message: `Your plan is already scheduled to move to ${newPlan.name}. Nothing has changed and you were not charged.`,
+        immediate: false,
+        unchanged: true,
+        new_plan: newPlan.name,
+        effective_date: currentSub.pending_plan_effective_date || currentSub.next_billing_date,
+      });
+    }
+
     // BUG 10 — REACTIVATION. Re-picking the plan you are already on while a
     // cancellation is scheduled is the most natural way to "resubscribe", and
     // it was the one path that silently did the wrong thing: same price means
