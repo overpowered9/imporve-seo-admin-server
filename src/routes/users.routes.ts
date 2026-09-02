@@ -6,6 +6,9 @@ import { validateApiAccess, validateApiAccessWithoutStamp } from '../middleware/
 // data. Same middleware /websites uses.
 import { requireSupabaseUser, type SupabaseAuthedRequest } from '../middleware/supabaseAuth.middleware.js';
 import { publicPricing } from '../services/credit-pricing.js';
+// The signup confirmation + welcome pair, claimed per email so a failure of one
+// cannot re-send the other. Called on first contact — see /by-email below.
+import { ensureSignupEmails } from '../services/trial-emails.service.js';
 import { 
   findUserByEmail,
   findUserByApiKey,
@@ -198,6 +201,21 @@ router.post('/by-email', async (req, res) => {
     // balance and every generation was refused. No-op for everyone else: one
     // existence check and nothing more. See ensureSignupGrant.
     await ensureSignupGrant(user);
+
+    // ── Send the signup emails, if they never went ────────────────────────
+    // Same seam, same reasoning. These were poller-only on a 15-minute
+    // interval, so a new customer sat in front of a dashboard for up to a
+    // quarter of an hour before hearing anything — reported as "the
+    // confirmation arrived, but late". Sending from here puts them out while
+    // the customer is still on the screen; the scheduler remains the backstop
+    // for accounts that never open the CMS.
+    //
+    // Deliberately NOT awaited. Mail is slower than this request should be,
+    // the claims inside make it safe to run concurrently, and a Mailgun outage
+    // must not delay — or fail — somebody's dashboard.
+    ensureSignupEmails(user).catch((err) => {
+      console.error(`[users/by-email] signup emails failed for user ${user.id}:`, err);
+    });
 
     // Void any expired trial (plan) credits before reading, so the dashboard shows the
     // truthful post-expiry balance (plan credits zeroed, purchased preserved).

@@ -1,0 +1,130 @@
+<!--
+  ImproveSEO — Supabase Auth "Confirm signup" template
+  ─────────────────────────────────────────────────────────────────────────────
+  THIS FILE IS NOT LOADED BY ANY CODE. It is pasted into the Supabase dashboard:
+  Authentication → Emails → Templates → Confirm signup. See README.md beside it.
+
+  {{ .ConfirmationURL }} is Supabase's placeholder and must survive editing —
+  it is the whole point of the email. {{ .Email }} is also available.
+
+  Written as nested tables with inline styles because that is what email
+  clients actually render: Gmail strips <style> blocks in some contexts,
+  Outlook ignores flexbox, grid, and border-radius on most elements, and no
+  client can be relied on for CSS gradients. The button is therefore a solid
+  colour, not the CMS's orange gradient.
+-->
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"
+       style="background-color:#F1F2EC;margin:0;padding:0;">
+  <tr>
+    <td align="center" style="padding:32px 12px;">
+
+      <!-- Card -->
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="560"
+             style="max-width:560px;width:100%;background-color:#FFFFFF;border-radius:16px;
+                    border:1px solid #E3E5DC;">
+
+        <!-- Logo -->
+        <tr>
+          <td align="left" style="padding:32px 36px 0 36px;">
+            <!-- Swap this for a logo on a stable, public domain if the CMS host
+                 ever moves. It must be a PNG or JPG: Gmail does not render SVG
+                 in email, which the ticket templates in email.service.ts have
+                 not accounted for. -->
+            <img src="https://user-cms-blue.vercel.app/improvelogo.png"
+                 alt="ImproveSEO" width="132"
+                 style="display:block;width:132px;max-width:132px;height:auto;border:0;outline:none;text-decoration:none;">
+          </td>
+        </tr>
+
+        <!-- Heading -->
+        <tr>
+          <td style="padding:26px 36px 0 36px;">
+            <h1 style="margin:0;font-family:Manrope,'Segoe UI',-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;
+                       font-size:24px;line-height:1.3;font-weight:700;color:#1A1A1A;">
+              Confirm your email address
+            </h1>
+          </td>
+        </tr>
+
+        <!-- Body -->
+        <tr>
+          <td style="padding:14px 36px 0 36px;">
+            <p style="margin:0;font-family:Inter,'Segoe UI',-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;
+                      font-size:15px;line-height:1.65;color:#4A4F47;">
+              Welcome to ImproveSEO. Confirm this address to finish setting up your
+              account and start your free trial.
+            </p>
+          </td>
+        </tr>
+
+        <!-- Call to action -->
+        <tr>
+          <td style="padding:26px 36px 0 36px;">
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+              <tr>
+                <td align="center" bgcolor="#E55432" style="border-radius:10px;">
+                  <a href="{{ .ConfirmationURL }}"
+                     style="display:inline-block;padding:14px 30px;
+                            font-family:Inter,'Segoe UI',-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;
+                            font-size:15px;font-weight:700;line-height:1;color:#FFFFFF;
+                            text-decoration:none;border-radius:10px;">
+                    Confirm email address
+                  </a>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- Plain-link fallback. Some clients strip the button, some corporate
+             gateways rewrite it, and some people simply do not trust one. -->
+        <tr>
+          <td style="padding:26px 36px 0 36px;">
+            <p style="margin:0 0 6px;font-family:Inter,'Segoe UI',-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;
+                      font-size:13px;line-height:1.6;color:#8A8F85;">
+              Or paste this link into your browser:
+            </p>
+            <p style="margin:0;font-family:Inter,'Segoe UI',-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;
+                      font-size:13px;line-height:1.6;word-break:break-all;">
+              <a href="{{ .ConfirmationURL }}" style="color:#1C7C73;text-decoration:underline;">{{ .ConfirmationURL }}</a>
+            </p>
+          </td>
+        </tr>
+
+        <!-- Divider -->
+        <tr>
+          <td style="padding:28px 36px 0 36px;">
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+              <tr><td style="border-top:1px solid #E3E5DC;font-size:0;line-height:0;">&nbsp;</td></tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- Reassurance -->
+        <tr>
+          <td style="padding:18px 36px 34px 36px;">
+            <p style="margin:0;font-family:Inter,'Segoe UI',-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;
+                      font-size:13px;line-height:1.65;color:#8A8F85;">
+              If you did not create an ImproveSEO account, you can ignore this email —
+              nothing will be set up without this confirmation.
+            </p>
+          </td>
+        </tr>
+      </table>
+
+      <!-- Footer -->
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="560"
+             style="max-width:560px;width:100%;">
+        <tr>
+          <td align="center" style="padding:18px 20px 0 20px;">
+            <p style="margin:0;font-family:Inter,'Segoe UI',-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif;
+                      font-size:11px;line-height:1.6;color:#9AA0A6;">
+              © ImproveSEO · This is an automated message about your account.
+            </p>
+          </td>
+        </tr>
+      </table>
+
+    </td>
+  </tr>
+</table>

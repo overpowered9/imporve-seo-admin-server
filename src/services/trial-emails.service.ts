@@ -55,6 +55,111 @@ async function sendSystem(row: DueRow, tpl: { subject: string; html: string; tex
   return sendEmail({ to: row.email, subject: tpl.subject, html: tpl.html, text: tpl.text });
 }
 
+/** The db seam, so the guard can be exercised without a database. */
+type Db = (strings: TemplateStringsArray, ...values: any[]) => Promise<any[]>;
+
+/**
+ * Claim ONE signup email for one account, atomically.
+ *
+ * `WHERE … IS NULL RETURNING` is the whole concurrency story: two schedulers, or
+ * a scheduler racing the on-demand path below, both run this and exactly one
+ * gets a row back. The loser sends nothing.
+ *
+ * Returns the row (so the caller has the name and trial date it needs) or null
+ * when this email has already been claimed.
+ */
+async function claimConfirmation(db: Db, userId: number): Promise<DueRow | null> {
+  const rows = await db`
+    UPDATE users SET confirmation_email_sent_at = NOW()
+    WHERE id = ${userId} AND confirmation_email_sent_at IS NULL
+    RETURNING id, email, name, trial_ends_at
+  `;
+  return (rows[0] as DueRow) ?? null;
+}
+
+async function claimWelcome(db: Db, userId: number): Promise<DueRow | null> {
+  const rows = await db`
+    UPDATE users SET welcome_email_sent_at = NOW()
+    WHERE id = ${userId} AND welcome_email_sent_at IS NULL
+    RETURNING id, email, name, trial_ends_at
+  `;
+  return (rows[0] as DueRow) ?? null;
+}
+
+/**
+ * The two emails a new account gets, each claimed and retried on its own.
+ *
+ * ── WHY THIS IS NOT PART OF THE POLLER ──────────────────────────────────────
+ * It used to be, and only that: the pair went out on the next 15-minute pass,
+ * so every signup waited up to a quarter of an hour to hear anything. Calling
+ * this from the first API request an account makes (see users.routes.ts, beside
+ * ensureSignupGrant) sends it while the customer is still looking at the
+ * screen. The poller stays as the backstop for accounts that never open the CMS.
+ *
+ * ── WHY THE TWO EMAILS ARE CLAIMED SEPARATELY ───────────────────────────────
+ * One claim used to gate both. If the confirmation sent and the welcome failed,
+ * the claim was released and BOTH were retried — so a persistently failing
+ * welcome meant a confirmation delivered again every fifteen minutes, and a
+ * welcome that never arrived at all. That is exactly the reported symptom:
+ * confirmation received, welcome missing. Two claims mean a failure can only
+ * ever retry the email that actually failed.
+ *
+ * Never throws: this runs inside a request that must succeed regardless, and a
+ * mail problem is not a reason to fail someone's dashboard.
+ */
+export async function ensureSignupEmails(
+  user: { id: number },
+  deps: {
+    db?: Db;
+    config?: ReturnType<typeof cfg>;
+    sendConfirmation?: (row: DueRow) => Promise<boolean>;
+    sendWelcome?: (row: DueRow) => Promise<boolean>;
+  } = {},
+): Promise<{ confirmation: boolean; welcome: boolean }> {
+  const db = deps.db ?? (sql as unknown as Db);
+  const c = deps.config ?? cfg();
+  const sent = { confirmation: false, welcome: false };
+  // The same switch the poller honours. An on-demand path that ignored it would
+  // make TRIAL_EMAILS_ENABLED=false mean something different from "off".
+  if (!c.enabled) return sent;
+
+  const sendConfirmation = deps.sendConfirmation
+    ?? ((row: DueRow) => sendSystem(
+      row,
+      emailTemplates.accountConfirmation(firstNameOf(row.name), c.createUrl, fmtDate(row.trial_ends_at)),
+    ));
+  const sendWelcome = deps.sendWelcome
+    ?? ((row: DueRow) => send(row, emailTemplates.trialWelcome(firstNameOf(row.name), c.createUrl), c));
+
+  try {
+    const row = await claimConfirmation(db, user.id);
+    if (row) {
+      sent.confirmation = await sendConfirmation(row);
+      if (!sent.confirmation) {
+        await db`UPDATE users SET confirmation_email_sent_at = NULL WHERE id = ${user.id}`;
+        console.warn(`[trial-emails] confirmation failed for user ${user.id} — will retry`);
+      }
+    }
+  } catch (err) {
+    console.error(`[trial-emails] confirmation error for user ${user.id}:`, err);
+  }
+
+  try {
+    const row = await claimWelcome(db, user.id);
+    if (row) {
+      sent.welcome = await sendWelcome(row);
+      if (!sent.welcome) {
+        await db`UPDATE users SET welcome_email_sent_at = NULL WHERE id = ${user.id}`;
+        console.warn(`[trial-emails] welcome failed for user ${user.id} — will retry`);
+      }
+    }
+  } catch (err) {
+    console.error(`[trial-emails] welcome error for user ${user.id}:`, err);
+  }
+
+  return sent;
+}
+
 /** Run one pass of all three drip emails. Returns per-type counts sent. */
 export async function processTrialEmails(): Promise<{ welcome: number; checkin: number; trialEnding: number }> {
   const c = cfg();
@@ -62,23 +167,18 @@ export async function processTrialEmails(): Promise<{ welcome: number; checkin: 
   if (!c.enabled) return counts;
 
   // ── Account confirmation + Welcome — both sent at account creation ─────────
-  // Per spec, a new signup gets the transactional confirmation (system sender)
-  // AND the human Welcome (from the CEO). One claim gates both.
-  const welcomeRows = await sql<DueRow[]>`
-    WITH due AS (SELECT id FROM users WHERE welcome_email_sent_at IS NULL ORDER BY id LIMIT ${BATCH_LIMIT})
-    UPDATE users u SET welcome_email_sent_at = NOW()
-    FROM due WHERE u.id = due.id
-    RETURNING u.id, u.email, u.name, u.trial_ends_at
+  // The backstop for accounts that have not opened the CMS since signing up;
+  // anyone who has already been sent both by ensureSignupEmails is filtered out
+  // here, and would be a no-op inside it anyway.
+  const dueIds = await sql<{ id: number }[]>`
+    SELECT id FROM users
+     WHERE welcome_email_sent_at IS NULL
+        OR confirmation_email_sent_at IS NULL
+     ORDER BY id LIMIT ${BATCH_LIMIT}
   `;
-  for (const row of welcomeRows) {
-    const first = firstNameOf(row.name);
-    const confOk = await sendSystem(row, emailTemplates.accountConfirmation(first, c.createUrl, fmtDate(row.trial_ends_at)));
-    const welcomeOk = await send(row, emailTemplates.trialWelcome(first, c.createUrl), c);
-    if (confOk && welcomeOk) { counts.welcome++; }
-    else { // un-claim so the pair retries next pass instead of being silently dropped
-      await sql`UPDATE users SET welcome_email_sent_at = NULL WHERE id = ${row.id}`;
-      console.warn(`[trial-emails] signup emails failed for user ${row.id} (conf:${confOk} welcome:${welcomeOk}) — will retry`);
-    }
+  for (const { id } of dueIds) {
+    const r = await ensureSignupEmails({ id }, { config: c });
+    if (r.confirmation || r.welcome) counts.welcome++;
   }
 
   // ── Check-in — free-plan trial users ~3 days in, trial still active ────────

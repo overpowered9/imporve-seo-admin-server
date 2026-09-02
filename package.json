@@ -39,7 +39,8 @@
     "migrate:yearly-plans": "tsx src/migrations/013-yearly-plans.ts",
     "migrate:website-heartbeat": "tsx src/migrations/014-website-heartbeat.ts",
     "migrate:website-limits": "tsx src/migrations/015-plan-website-limits.ts",
-    "migrate:signup-credits": "tsx src/migrations/016-signup-credit-grant.ts"
+    "migrate:signup-credits": "tsx src/migrations/016-signup-credit-grant.ts",
+    "migrate:signup-emails": "tsx src/migrations/017-signup-email-columns.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",
