@@ -109,6 +109,17 @@ router.get('/status', validateApiAccess, async (req, res) => {
 
     const iseoBalance = credits.find(c => c.credit_type === ISEO_CREDIT_TYPE)?.amount || 0;
 
+    // Per-batch expiry, the same data /credits/:user_id already gives the CMS's
+    // breakdown panel (getCreditLotSummary/getLiveBalance). This endpoint used to
+    // stop at plan_remaining/purchased_remaining below, so the plugin's own
+    // "next to expire" row had no field to read and could never render — the
+    // plugin and the CMS described the same balance with different amounts of
+    // detail. Added ALONGSIDE credit_details for the same reason `balance` and
+    // `lots` were added alongside `data` on /credits/:user_id: existing plugin
+    // builds ignore fields they don't recognise, so this cannot break one.
+    const balance = await getLiveBalance(user.id);
+    const lots = await getCreditLotSummary(user.id);
+
     // Per-type plan-vs-purchased breakdown, so clients (the plugin's connection panel)
     // can explain a balance instead of showing a bare number.
     // One pool now, so every legacy label resolves to the SAME row. Kept as a function so the
@@ -154,6 +165,11 @@ router.get('/status', validateApiAccess, async (req, res) => {
         content: detailFor('content'),
         keywords: detailFor('keywords'),
       },
+      // The single next-expiry summary and the full per-batch list — same
+      // shape /credits/:user_id sends the CMS, so the plugin's breakdown can
+      // show real dates instead of the two dateless rows it was limited to.
+      balance,
+      lots,
       plan: {
         name: isPaid ? subscription.plan_name : 'Free',
         slug: isPaid ? subscription.plan_slug : 'free',
