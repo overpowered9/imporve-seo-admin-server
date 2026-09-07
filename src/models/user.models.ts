@@ -412,6 +412,60 @@ export const hasBillingAddress = async (user_id: number): Promise<boolean> => {
     throw error;
   }
 };
+/**
+ * Write the address Stripe collected back onto our user row.
+ *
+ * Stripe is the owner now: it collects at checkout and lets the user edit in
+ * the billing portal, which is what allowed the signup field, the dashboard
+ * reminder and the pre-purchase gate to be removed. This keeps OUR copy in
+ * step, because plenty of things still read it — GET /users/address, the
+ * Settings card, and anything that puts an address on our own paperwork.
+ *
+ * A cache, not a second source of truth. Nothing here is authoritative: if it
+ * is stale, the fix is another webhook, and Stripe's copy is the one that goes
+ * on the invoice.
+ *
+ * Partial addresses are IGNORED rather than written. The three-column test
+ * (line1 + city + country) is the same one hasBillingAddress and
+ * GET /users/address use, and half-writing over a complete address would turn
+ * a good record into an unusable one — the exact failure the old gate existed
+ * to prevent.
+ */
+export const syncAddressFromStripe = async (
+  user_id: number,
+  address: {
+    line1?: string | null; line2?: string | null; city?: string | null;
+    state?: string | null; postal_code?: string | null; country?: string | null;
+  } | null | undefined,
+): Promise<boolean> => {
+  if (!address?.line1 || !address?.city || !address?.country) return false;
+
+  try {
+    await sql`
+      UPDATE users
+      SET    address_line1       = ${address.line1},
+             address_line2       = ${address.line2 ?? null},
+             address_city        = ${address.city},
+             address_state       = ${address.state ?? null},
+             address_postal_code = ${address.postal_code ?? null},
+             address_country     = ${address.country},
+             address_updated_at  = NOW()
+      WHERE  id = ${user_id}
+    `;
+    return true;
+  } catch (error: any) {
+    // Migration 003 has not run. Same reasoning as hasBillingAddress: an
+    // un-migrated database is our problem, and it must not turn a completed
+    // payment into a failed webhook that Stripe then retries forever.
+    if (error?.code === '42703') {
+      console.warn('users address columns missing — migration 003 has not run; skipping the Stripe address sync.');
+      return false;
+    }
+    console.error(`Could not sync the Stripe address for user ${user_id}:`, error);
+    return false;
+  }
+};
+
 
 /**
  * Compose the display string from the parts. ONE definition, so `name` can
