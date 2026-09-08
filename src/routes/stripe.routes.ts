@@ -136,6 +136,7 @@ import {
   describePlanDowngradeScheduled,
   describeCreditPurchase,
   describePaymentFailed,
+  describeSubscriptionStarted,
   describeSubscriptionCancelled,
   describeSubscriptionReactivated,
   describeRefund,
@@ -328,6 +329,45 @@ const activateSubscriptionInDb = async (params: {
     await refillPlanCredits(userId, planResult[0], 'Subscription activated');
   }
 
+  // ── Record the ledger row HERE, not only from invoice.payment_succeeded ──
+  //
+  // This is the same reasoning that made the plan_upgrade write synchronous
+  // (see the comment at its call site in /change-plan): a customer converting
+  // from Free Trial to a paid plan was charged and their subscription is
+  // active in Stripe regardless of whether our webhook ever runs, so Account
+  // Activity must not depend on it alone. It previously did — there was no
+  // recordTransaction call anywhere on the path a NEW subscription takes
+  // (this function, called from /subscribe-to-plan, /verify-session, and the
+  // customer.subscription.created webhook), only on invoice.payment_succeeded,
+  // which additionally no-ops silently if it arrives before the subscription
+  // row above has been upserted (a real possible ordering, since Stripe does
+  // not guarantee event order).
+  //
+  // Keyed `subscription_create:<subscription id>`, NOT `invoice:<invoice id>` —
+  // deliberately a different key than transactionsFromInvoice would use for a
+  // renewal or plan-change invoice, so the two can never collide, and matched
+  // to what transactionsFromInvoice now uses for THIS specific case (see
+  // transactions.ts) so the eventual invoice webhook settles this same row
+  // in place — filling in the real amount/receipt via recordTransaction's
+  // COALESCE upsert — rather than creating a second, redundant-looking row
+  // for the same one-time event. amountCents is unknown at this synchronous
+  // point (no invoice has necessarily been read yet); the settle fills it in.
+  try {
+    await recordTransaction(sql, {
+      userId,
+      type: 'subscription_create',
+      description: describeSubscriptionStarted(planResult[0]?.name ?? null),
+      status: 'succeeded',
+      providerEventId: `subscription_create:${stripeSubscriptionId}`,
+      providerObjectId: stripeSubscriptionId,
+      planId,
+    });
+  } catch (ledgerError) {
+    // recordTransaction never throws; this guards anything around it. A
+    // ledger write must not fail a subscription that has already activated.
+    console.error('⚠️ Could not record the new subscription in the ledger:', ledgerError);
+  }
+
   // BILL-005 — a NEW subscription is the clearest possible statement that the
   // customer is not leaving. The UPSERT above already clears
   // cancel_at_period_end in our row; this clears the provider-side schedule
@@ -432,7 +472,38 @@ const grantCreditPack = async (params: {
 
   // Purchased, not plan: these persist across billing cycles and are never
   // wiped by a monthly refill.
-  await addPurchasedCredits(params.userId, ISEO_CREDIT_TYPE, params.credits, 'Credit purchase via Stripe');
+  //
+  // Guarded on its own: this is a real DB transaction (sql.begin in
+  // addPurchasedCredits) and it CAN throw — a constraint violation on this
+  // account's credit rows, a deadlock, anything. Left unguarded, that
+  // exception used to propagate all the way out through chargeCreditPackOnCard
+  // AFTER the card had already been charged, where it was read as "the charge
+  // failed" and triggered a second, duplicate Checkout Session for money
+  // already collected — see the comment at that call site.
+  //
+  // Releasing the claim here (rather than leaving it stuck at
+  // processed:false forever, unretriable because ON CONFLICT DO NOTHING) is
+  // safe specifically BECAUSE addPurchasedCredits is atomic: it throwing
+  // means nothing was granted, so a later retry with the same claimId can
+  // attempt the whole grant cleanly. This must NOT be done below this point —
+  // once credits are granted, releasing the claim would let a retry grant
+  // them again.
+  try {
+    await addPurchasedCredits(params.userId, ISEO_CREDIT_TYPE, params.credits, 'Credit purchase via Stripe');
+  } catch (grantError) {
+    console.error(
+      `❌ Could not grant ${params.credits} purchased credits to user ${params.userId} `
+      + `(claim ${params.claimId}) — releasing the claim so this can be retried. `
+      + `The customer was already charged; do not charge them again.`,
+      grantError,
+    );
+    try {
+      await sql`DELETE FROM stripe_webhook_events WHERE event_id = ${params.claimId} AND processed = false`;
+    } catch (releaseError) {
+      console.error(`❌ Could not even release the claim ${params.claimId} — needs manual cleanup.`, releaseError);
+    }
+    return false;
+  }
 
   await recordTransaction(sql, {
     userId: params.userId,
@@ -564,17 +635,43 @@ const chargeCreditPackOnCard = async (params: {
 
     const receiptUrl = paid.hosted_invoice_url || paid.invoice_pdf || null;
 
-    await grantCreditPack({
-      userId: params.userId,
-      credits: params.pkg.credits,
-      claimId: `topup_invoice_${paid.id}`,
-      amountCents: paid.amount_paid ?? params.amountCents,
-      currency: paid.currency || 'usd',
-      providerObjectId: paid.id ?? null,
-      receiptUrl,
-      // Only subscribers reach this path; the free rate is Checkout-only.
-      atFreeRate: false,
-    });
+    // ── THE MONEY HAS ALREADY MOVED — NOTHING BELOW THIS LINE MAY REPORT
+    //    `paid: false` ─────────────────────────────────────────────────────
+    //
+    // grantCreditPack was called from inside the SAME try block this catch
+    // guards, which meant a failure granting credits (addPurchasedCredits is
+    // a real DB transaction — it can throw) was indistinguishable from a
+    // failed CHARGE. The caller (POST /buy-credits) reads `paid: false` as
+    // "the card route didn't work" and falls back to opening a brand-new
+    // Checkout Session for the same purchase — so a customer who was already
+    // charged here would be asked to pay AGAIN, while the credits and ledger
+    // row from the charge that actually succeeded are silently lost, with
+    // nothing that ever retries them.
+    //
+    // A failure here is now caught on its own and logged loudly for manual
+    // reconciliation, but it can no longer turn an already-paid invoice into
+    // a reported failure — that would risk a double charge, which is strictly
+    // worse than a delayed credit grant.
+    try {
+      await grantCreditPack({
+        userId: params.userId,
+        credits: params.pkg.credits,
+        claimId: `topup_invoice_${paid.id}`,
+        amountCents: paid.amount_paid ?? params.amountCents,
+        currency: paid.currency || 'usd',
+        providerObjectId: paid.id ?? null,
+        receiptUrl,
+        // Only subscribers reach this path; the free rate is Checkout-only.
+        atFreeRate: false,
+      });
+    } catch (grantError) {
+      console.error(
+        `❌ Charged invoice ${paid.id} for user ${params.userId} but could not grant`
+        + ` the credits/ledger row — needs manual reconciliation. Customer must NOT`
+        + ` be charged again.`,
+        grantError,
+      );
+    }
 
     console.log(
       `✅ Charged ${params.amountCents} for ${params.pkg.credits} credits to user ${params.userId}`

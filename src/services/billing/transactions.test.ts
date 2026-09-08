@@ -309,6 +309,38 @@ describe('transactionsFromInvoice', () => {
     assert.equal(rows[0].type, 'subscription_create');
   });
 
+  test('a first subscription invoice keys on the SUBSCRIPTION, not the invoice — it settles the row activateSubscriptionInDb already wrote', () => {
+    const rows = transactionsFromInvoice({
+      id: 'in_first', created: 1, currency: 'usd', status: 'paid',
+      billing_reason: 'subscription_create', amount_paid: 4900,
+      parent: { subscription_details: { subscription: 'sub_new' } },
+      lines: { data: [{ id: 'il', description: 'Grow × 1', amount: 4900 }] },
+    }, 7, 2);
+    // Same key activateSubscriptionInDb uses (`subscription_create:<sub id>`) —
+    // recordTransaction's upsert merges this settled amount/receipt into that
+    // row instead of inserting a second one for the same event.
+    assert.equal(rows[0].providerEventId, 'subscription_create:sub_new');
+  });
+
+  test('a first subscription invoice with no readable subscription id falls back to the invoice id, rather than a null key', () => {
+    const rows = transactionsFromInvoice({
+      id: 'in_first', created: 1, currency: 'usd', status: 'paid',
+      billing_reason: 'subscription_create', amount_paid: 4900,
+      lines: { data: [{ id: 'il', description: 'Grow × 1', amount: 4900 }] },
+    }, 7, 2);
+    assert.equal(rows[0].providerEventId, 'subscription_create:in_first');
+  });
+
+  test('a renewal still keys on the invoice — nothing was written earlier for it to settle', () => {
+    const rows = transactionsFromInvoice({
+      id: 'in_renew_2', created: 1, currency: 'usd', status: 'paid',
+      billing_reason: 'subscription_cycle', amount_paid: 9900,
+      parent: { subscription_details: { subscription: 'sub_new' } },
+      lines: { data: [{ id: 'il', description: 'Optimize × 1', amount: 9900 }] },
+    }, 7, 3);
+    assert.equal(rows[0].providerEventId, 'invoice:in_renew_2');
+  });
+
   test('an unpaid invoice is recorded as pending, not succeeded', () => {
     const rows = transactionsFromInvoice({
       id: 'in_open', created: 1, currency: 'usd', status: 'open',
