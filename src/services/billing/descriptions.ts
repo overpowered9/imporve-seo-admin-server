@@ -68,7 +68,7 @@ const PLAN_DISPLAY_NAMES: Readonly<Record<string, string>> = Object.freeze({
 const canonicalPlanKey = (value: string | null | undefined): string =>
   String(value ?? '').trim().replace(/\s+plan$/i, '').toLowerCase();
 
-const planLabel = (name: string | null | undefined): string => {
+export const planLabel = (name: string | null | undefined): string => {
   const trimmed = String(name ?? '').trim();
   if (!trimmed) return '';
   // An unknown plan keeps its own name rather than becoming "Unknown" — a new
@@ -216,7 +216,11 @@ export const describePaymentFailed = (): string =>
 export const describeCreditsExpired = (credits: number): string =>
   `Credits expired — ${Math.abs(credits).toLocaleString()} credits`;
 
-/** Exposed for the CMS-facing tests and for anything that needs the same normalisation. */
+/**
+ * Kept as an alias so the existing CMS-facing tests keep their import. New
+ * callers should use the exported `planLabel` above — it is the same function,
+ * and the double underscore wrongly suggests it is private.
+ */
 export const __planLabel = planLabel;
 
 /**

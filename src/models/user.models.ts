@@ -11,6 +11,7 @@ import {
 // pulls only descriptions.js and a type.
 import { recordTransaction } from '../services/billing/transactions.js';
 import { describeTrialStarted, describeTrialEnded } from '../services/billing/descriptions.js';
+import { TRIAL_DAYS, effectiveTrialEnd, isTrialExpired } from './trial.js';
 export interface User {
   id: number;
   email: string;
@@ -93,8 +94,12 @@ export type CreditType = 'iseo';
 export const ISEO_CREDIT_TYPE: CreditType = 'iseo';
 const CREDIT_TYPES: CreditType[] = [ISEO_CREDIT_TYPE];
 
-/** Length of the free trial started at signup. */
-export const TRIAL_DAYS = 7;
+/**
+ * The trial-window rules now live in ./trial.js so they can be unit-tested
+ * without opening a database connection. Re-exported here because this is the
+ * address every caller already knows them by.
+ */
+export { TRIAL_DAYS, effectiveTrialEnd, isTrialExpired };
 
 /**
  * Credits a plan grants per billing cycle.
@@ -931,32 +936,6 @@ export const suspendPlanCredits = async (user_id: number, reason = 'Subscription
       `;
     }
   });
-};
-
-/**
- * Effective trial end for a user: the explicit `trial_ends_at`, or — when that was never
- * set — `created_at + TRIAL_DAYS` as a fallback. Returns null only when neither is known.
- * The fallback closes the hole where a NULL `trial_ends_at` would otherwise bypass every
- * trial check (a null timestamp is not "no trial", it's a trial whose end we must infer).
- */
-export const effectiveTrialEnd = (
-  user: { trial_ends_at?: Date | null; created_at?: Date | null }
-): Date | null => {
-  if (user.trial_ends_at) return new Date(user.trial_ends_at);
-  if (user.created_at) {
-    const d = new Date(user.created_at);
-    d.setDate(d.getDate() + TRIAL_DAYS);
-    return d;
-  }
-  return null;
-};
-
-/** True when the user's free-trial window has elapsed (uses effectiveTrialEnd). */
-export const isTrialExpired = (
-  user: { trial_ends_at?: Date | null; created_at?: Date | null }
-): boolean => {
-  const end = effectiveTrialEnd(user);
-  return !!end && end.getTime() < Date.now();
 };
 
 /** Is this a free ($0) plan? A missing/unknown plan is treated as free (fail-safe). */

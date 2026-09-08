@@ -1,4 +1,9 @@
 import sql from '../data/db.js';
+import { describeTicketUserPlan, type TicketUserPlan, type TicketUserPlanRow } from './ticket-plan.js';
+
+// Re-exported so the routes and the CMS-facing types keep one address for these.
+export { describeTicketUserPlan };
+export type { TicketUserPlan };
 
 // Types
 export interface SupportTicket {
@@ -43,10 +48,48 @@ export interface TicketAttachment {
   created_at: Date;
 }
 
-export interface TicketWithUser extends SupportTicket {
+export interface TicketWithUser extends SupportTicket, TicketUserPlan {
   user_email: string;
   user_name: string;
 }
+
+/**
+ * Fold the derived plan onto a joined row, dropping the two columns that exist
+ * only to feed the derivation so they do not leak into the API response.
+ */
+const withUserPlan = (row: Record<string, unknown>): TicketWithUser => {
+  const { plan_price_cents, user_created_at, ...rest } = row;
+  return { ...rest, ...describeTicketUserPlan(row as TicketUserPlanRow) } as unknown as TicketWithUser;
+};
+
+/**
+ * Attach the requester (and their plan) to a ticket just written.
+ *
+ * The write paths RETURNING * a bare ticket, so they look the user up rather
+ * than joining. Going through the same derivation as the read paths is what
+ * keeps a ticket's plan identical whether the panel got it from the create
+ * response, the queue or the detail view.
+ *
+ * A user that cannot be found still yields a whole ticket, as before — blank
+ * name and email, and no trial claimed, since nothing is known to claim it from.
+ */
+const attachUserToTicket = async (ticket: SupportTicket): Promise<TicketWithUser> => {
+  const userResult = await sql`
+    SELECT u.email as user_email, u.name as user_name,
+           u.created_at as user_created_at, u.trial_ends_at,
+           sp.slug as plan_slug, sp.name as plan_name, sp.price_cents as plan_price_cents
+    FROM users u
+    LEFT JOIN subscription_plans sp ON sp.id = u.plan_id
+    WHERE u.id = ${ticket.user_id}
+  `;
+
+  return withUserPlan({
+    ...ticket,
+    user_email: '',
+    user_name: '',
+    ...(userResult[0] ?? {}),
+  } as Record<string, unknown>);
+};
 
 export interface TicketStats {
   total: number;
@@ -88,23 +131,7 @@ export const createTicket = async (data: {
   
   // Fetch user info
   const ticket = result[0] as SupportTicket;
-  const userResult = await sql`
-    SELECT email as user_email, name as user_name FROM users WHERE id = ${ticket.user_id}
-  `;
-  
-  if (!userResult[0]) {
-    return {
-      ...ticket,
-      user_email: '',
-      user_name: ''
-    } as TicketWithUser;
-  }
-  
-  return {
-    ...ticket,
-    user_email: userResult[0].user_email as string,
-    user_name: userResult[0].user_name as string
-  } as TicketWithUser;
+  return attachUserToTicket(ticket);
 };
 
 /**
@@ -148,12 +175,15 @@ export const getTicketById = async (ticket_id: number, includeInternalNotes: boo
   attachments: TicketAttachment[];
 } | null> => {
   const ticketResult = await sql`
-    SELECT t.*, u.email as user_email, u.name as user_name
+    SELECT t.*, u.email as user_email, u.name as user_name,
+           u.created_at as user_created_at, u.trial_ends_at,
+           sp.slug as plan_slug, sp.name as plan_name, sp.price_cents as plan_price_cents
     FROM support_tickets t
     JOIN users u ON t.user_id = u.id
+    LEFT JOIN subscription_plans sp ON sp.id = u.plan_id
     WHERE t.id = ${ticket_id}
   `;
-  
+
   if (!ticketResult[0]) return null;
   
   const messages = includeInternalNotes 
@@ -175,7 +205,7 @@ export const getTicketById = async (ticket_id: number, includeInternalNotes: boo
   `;
   
   return {
-    ticket: ticketResult[0] as TicketWithUser,
+    ticket: withUserPlan(ticketResult[0] as Record<string, unknown>),
     messages: messages as unknown as TicketMessage[],
     attachments: attachments as unknown as TicketAttachment[]
   };
@@ -295,9 +325,12 @@ export const getAllTickets = async (options: {
   }
   
   const ticketsResult = await sql`
-    SELECT t.*, u.email as user_email, u.name as user_name
+    SELECT t.*, u.email as user_email, u.name as user_name,
+           u.created_at as user_created_at, u.trial_ends_at,
+           sp.slug as plan_slug, sp.name as plan_name, sp.price_cents as plan_price_cents
     FROM support_tickets t
     JOIN users u ON t.user_id = u.id
+    LEFT JOIN subscription_plans sp ON sp.id = u.plan_id
     WHERE ${conditions}
     ORDER BY 
       CASE t.priority 
@@ -318,7 +351,7 @@ export const getAllTickets = async (options: {
   `;
   
   return {
-    tickets: ticketsResult as unknown as TicketWithUser[],
+    tickets: (ticketsResult as unknown as Record<string, unknown>[]).map(withUserPlan),
     total: countResult[0]?.total || 0
   };
 };
@@ -358,23 +391,7 @@ export const updateTicketStatus = async (
   if (!result[0]) return null;
   
   const ticket = result[0] as SupportTicket;
-  const userResult = await sql`
-    SELECT email as user_email, name as user_name FROM users WHERE id = ${ticket.user_id}
-  `;
-  
-  if (!userResult[0]) {
-    return {
-      ...ticket,
-      user_email: '',
-      user_name: ''
-    } as TicketWithUser;
-  }
-  
-  return {
-    ...ticket,
-    user_email: userResult[0].user_email as string,
-    user_name: userResult[0].user_name as string
-  } as TicketWithUser;
+  return attachUserToTicket(ticket);
 };
 
 /**
@@ -416,9 +433,12 @@ export const getTicketStats = async (): Promise<TicketStats> => {
  */
 export const getRecentTickets = async (limit: number = 10): Promise<TicketWithUser[]> => {
   const result = await sql`
-    SELECT t.*, u.email as user_email, u.name as user_name
+    SELECT t.*, u.email as user_email, u.name as user_name,
+           u.created_at as user_created_at, u.trial_ends_at,
+           sp.slug as plan_slug, sp.name as plan_name, sp.price_cents as plan_price_cents
     FROM support_tickets t
     JOIN users u ON t.user_id = u.id
+    LEFT JOIN subscription_plans sp ON sp.id = u.plan_id
     WHERE t.status NOT IN ('resolved', 'closed')
     ORDER BY 
       CASE t.priority 
@@ -430,7 +450,7 @@ export const getRecentTickets = async (limit: number = 10): Promise<TicketWithUs
       t.updated_at DESC
     LIMIT ${limit}
   `;
-  return result as unknown as TicketWithUser[];
+  return (result as unknown as Record<string, unknown>[]).map(withUserPlan);
 };
 
 // ==================== TAG OPERATIONS ====================
