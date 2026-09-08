@@ -378,7 +378,17 @@ export function transactionsFromInvoice(
     amountCents: invoice.amount_paid ?? invoice.amount_due ?? 0,
     currency,
     status: (invoice.status === 'paid' ? 'succeeded' : 'pending') as TransactionStatus,
-    providerEventId: `invoice:${invoice.id}`,
+    // A first-subscription invoice settles the SAME row activateSubscriptionInDb
+    // already wrote synchronously (see its call site) — keyed on the
+    // subscription, not this invoice, so this upsert fills in the real
+    // amount/receipt in place instead of inserting a second, redundant row
+    // for what is, to the customer, one event ("you subscribed to Grow").
+    // Every other invoice type keeps the per-invoice key: a renewal or a
+    // settled plan-change invoice IS its own event, with nothing written
+    // earlier for it to merge into.
+    providerEventId: type === 'subscription_create'
+      ? `subscription_create:${subscriptionIdFromInvoice(invoice) ?? invoice.id}`
+      : `invoice:${invoice.id}`,
     providerObjectId: invoice.id,
     receiptUrl,
     planId,
