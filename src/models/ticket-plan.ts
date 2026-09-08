@@ -25,8 +25,12 @@ export interface TicketUserPlan {
   trial_expired: boolean;
   /**
    * The EFFECTIVE trial end (see effectiveTrialEnd): the explicit
-   * `users.trial_ends_at`, or signup + TRIAL_DAYS when that was never set. Null
-   * only when neither is known, which is the one case where no trial is claimed.
+   * `users.trial_ends_at`, or signup + TRIAL_DAYS when that was never set.
+   *
+   * Null for a PAYING account. Every user has a signup date, so the fallback
+   * yields a date for everyone — including customers who are years past any
+   * trial — and a panel rendering it beside a Scale customer would print a
+   * trial that does not exist. Trial fields only carry meaning on the $0 plan.
    */
   trial_ends_at: Date | null;
 }
@@ -88,6 +92,6 @@ export const describeTicketUserPlan = (row: TicketUserPlanRow): TicketUserPlan =
     plan_display_name: onTrial ? 'Free Trial' : planLabel(slug ?? name) || 'Free',
     on_trial: onTrial,
     trial_expired: isFree && expired,
-    trial_ends_at: trialEnd,
+    trial_ends_at: isFree ? trialEnd : null,
   };
 };

@@ -163,6 +163,22 @@ describe('describeTicketUserPlan — a trial is not the free plan', () => {
     assert.equal(plan.trial_expired, false);
   });
 
+  test('a paying account carries NO trial date to render', () => {
+    // Every user has a signup date, so the effective-end fallback produces a
+    // date for everyone. Returned unguarded, a panel would print "trial ends
+    // <date>" beside a customer who has been paying for a year.
+    const plan = describeTicketUserPlan({
+      plan_slug: 'pro',
+      plan_name: 'Pro Plan',
+      plan_price_cents: 4900,
+      trial_ends_at: null,
+      user_created_at: daysFromNow(-450),
+    });
+    assert.equal(plan.trial_ends_at, null);
+    assert.equal(plan.on_trial, false);
+    assert.equal(plan.trial_expired, false);
+  });
+
   test('no plan row at all is free, and claims no trial it cannot date', () => {
     const plan = describeTicketUserPlan({});
     assert.equal(plan.plan_display_name, 'Free');
