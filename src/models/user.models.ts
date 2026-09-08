@@ -212,10 +212,30 @@ export const initializeUserCredits = async (user_id: number, plan_id?: number): 
   // account got a cached figure it could not spend a single credit of. Not just
   // a display bug — burnFromLots finds no lots, so every generation is refused.
   //
-  // Guarded on "has this user any lots yet", which preserves the idempotence the
-  // ON CONFLICT DO NOTHING below provided: signup is retried, and a retry must
-  // not hand out the allotment twice.
+  // Guarded on "has this user any lots yet", so a retried signup does not hand
+  // out the allotment twice.
+  //
+  // ── WHY THE ADVISORY LOCK, NOT JUST THE CHECK ───────────────────────────
+  // Under the default READ COMMITTED isolation, "check then insert" is not
+  // idempotent under concurrency: two calls for the same user can both run
+  // the SELECT below before either commits its INSERT, both see no lots, and
+  // both grant — which is exactly how a Free Trial account ended up with 300
+  // credits instead of 100 (three concurrent grants of the same lot). This
+  // was NOT a rare edge case: ensureSignupGrant calls this on every
+  // /users/by-email request for an unprovisioned account, and a fresh
+  // signup's first page load routinely fires several of those at once.
+  //
+  // pg_advisory_xact_lock serializes concurrent calls for the SAME user_id —
+  // transaction-scoped, so it releases itself on commit or rollback with no
+  // separate unlock step. The second caller blocks here, then (after the
+  // first commits) re-runs the "existing" check below and correctly finds
+  // the row already there, skipping its own insert. This is the only call
+  // site that needs it: every path that can grant credits (direct signup,
+  // and ensureSignupGrant from every /users/by-email hit) funnels through
+  // this one transaction.
   await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(${user_id})`;
+
     const existing = (await tx`
       SELECT 1 FROM credit_lots WHERE user_id = ${user_id} LIMIT 1
     `) as unknown as unknown[];
@@ -283,8 +303,13 @@ export const initializeUserCredits = async (user_id: number, plan_id?: number): 
  * under-credit the customer. That case is left alone for a human.
  *
  * Cheap in the common case: one indexed existence check, then nothing.
- * initializeUserCredits is itself idempotent (it guards on the same "has any
- * lots" condition), so a race between two sessions cannot grant twice.
+ * This function's OWN check-then-provision here is not race-safe under
+ * concurrent calls — and does not need to be. initializeUserCredits holds a
+ * per-user advisory lock around its actual grant, which is the real,
+ * sufficient guard: two overlapping calls both reach `provision`, but only
+ * one of them ends up inserting a lot (see its comment for why this exact
+ * gap — a plain "check, then insert" — used to let a Free Trial account be
+ * granted 100 credits two or three times over).
  *
  * Never throws. Reading an account must not fail because a grant could not be
  * written; the failure is logged and the next request tries again.
