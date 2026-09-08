@@ -1419,6 +1419,16 @@ export async function syncBalanceCache(tx: any, user_id: number): Promise<void> 
 /** One row of the balance breakdown: a batch of credits sharing an expiry date. */
 export interface CreditLotBucket {
   source: 'plan' | 'purchased';
+  /**
+   * True when this 'plan' batch was granted by the FREE plan specifically —
+   * a Free Trial's allotment, not a paid subscription's. Always false for a
+   * 'purchased' batch. Additive: `source` keeps its existing two values and
+   * meaning (a consumer that only reads `source` sees exactly what it always
+   * has), so nothing that already reads this shape can be broken by it — the
+   * same reasoning `balance`/`lots` were themselves added under. See the
+   * plugin's connection panel, the one consumer that reads this field today.
+   */
+  is_free: boolean;
   /** The day they lapse, as YYYY-MM-DD. A day, not an instant — see below. */
   expires_on: string;
   remaining: number;
@@ -1438,19 +1448,41 @@ export interface CreditLotBucket {
  *
  * Ordered soonest-first, which is both the order the panel displays and the
  * order the credits will actually be spent (FEFO).
+ *
+ * ── WHY THE JOIN, AND WHY is_free IS NOT source ─────────────────────────────
+ * credit_lots.source only ever holds 'plan' or 'purchased' (a DB CHECK
+ * constraint) — a Free Trial's grant and a paid plan's grant are BOTH
+ * written as 'plan' (initializeUserCredits), so nothing in this table alone
+ * says which one a given lot is. subscription_plans (via plan_id) is what
+ * actually knows that.
+ *
+ * is_free is a NEW field, not a new value of `source`, on purpose: this
+ * function also backs the CMS's own breakdown panel (GET /credits/:user_id),
+ * whose utils/creditBreakdown.js reads `source === 'plan'` the same way the
+ * plugin's connection panel does. Widening what `source` itself can be would
+ * make every free-trial lot silently fall into that code's "else = purchased"
+ * branch — a regression there, not a fix. Adding a field neither existing
+ * reader looks at is safe by construction.
+ *
+ * A purchased lot's plan_id is always NULL, so the LEFT JOIN finds no plan
+ * for it and is_free reads false — no extra filtering needed to keep
+ * purchased lots out of this.
  */
 export const getCreditLotSummary = async (user_id: number): Promise<CreditLotBucket[]> => {
   const rows = await sql`
-    SELECT source,
-           to_char((expires_at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS expires_on,
-           COALESCE(SUM(remaining), 0)::int AS remaining
-    FROM   credit_lots
-    WHERE  user_id = ${user_id} AND remaining > 0 AND expires_at > NOW()
-    GROUP  BY source, (expires_at AT TIME ZONE 'UTC')::date
-    ORDER  BY (expires_at AT TIME ZONE 'UTC')::date ASC, source ASC
+    SELECT cl.source,
+           COALESCE(sp.slug = 'free', false) AS is_free,
+           to_char((cl.expires_at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS expires_on,
+           COALESCE(SUM(cl.remaining), 0)::int AS remaining
+    FROM   credit_lots cl
+    LEFT JOIN subscription_plans sp ON sp.id = cl.plan_id
+    WHERE  cl.user_id = ${user_id} AND cl.remaining > 0 AND cl.expires_at > NOW()
+    GROUP  BY cl.source, sp.slug, (cl.expires_at AT TIME ZONE 'UTC')::date
+    ORDER  BY (cl.expires_at AT TIME ZONE 'UTC')::date ASC, cl.source ASC
   `;
   return (rows as unknown as CreditLotBucket[]).map((r) => ({
     source: r.source,
+    is_free: !!r.is_free,
     expires_on: r.expires_on,
     remaining: Number(r.remaining) || 0,
   }));

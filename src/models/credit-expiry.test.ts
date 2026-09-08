@@ -114,10 +114,23 @@ describe('the balance breakdown groups by day, not by instant', () => {
   test('getCreditLotSummary buckets on the UTC date', () => {
     const body = functionBody(models, 'getCreditLotSummary');
     assert.match(body, /AT TIME ZONE 'UTC'\)::date/);
-    assert.match(body, /GROUP {2}BY source, \(expires_at AT TIME ZONE 'UTC'\)::date/);
+    // Grouped on the plan too (via the subscription_plans join, for is_free) —
+    // a free-plan lot and a paid-plan lot expiring the same day must stay
+    // separate buckets, not merge into one row.
+    assert.match(body, /GROUP {2}BY cl\.source, sp\.slug, \(cl\.expires_at AT TIME ZONE 'UTC'\)::date/);
     // Soonest first — the order the panel shows AND the order they are spent.
-    assert.match(body, /ORDER {2}BY \(expires_at AT TIME ZONE 'UTC'\)::date ASC/);
-    assert.match(body, /remaining > 0 AND expires_at > NOW\(\)/);
+    assert.match(body, /ORDER {2}BY \(cl\.expires_at AT TIME ZONE 'UTC'\)::date ASC/);
+    assert.match(body, /cl\.remaining > 0 AND cl\.expires_at > NOW\(\)/);
+  });
+
+  test('getCreditLotSummary tells a free-plan lot apart from a paid one via is_free, not source', () => {
+    // source stays 'plan'|'purchased' only — the CMS's own breakdown panel
+    // (utils/creditBreakdown.js) reads source === 'plan' the same way the
+    // plugin does, so widening what source itself can be would silently
+    // mis-bucket every free-trial account there. is_free is additive instead.
+    const body = functionBody(models, 'getCreditLotSummary');
+    assert.match(body, /LEFT JOIN subscription_plans sp ON sp\.id = cl\.plan_id/);
+    assert.match(body, /COALESCE\(sp\.slug = 'free', false\) AS is_free/);
   });
 
   test('getLiveBalance buckets the same way', () => {
