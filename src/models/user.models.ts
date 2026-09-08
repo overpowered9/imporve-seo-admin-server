@@ -2025,14 +2025,28 @@ export const addUserWebsite = async (user_id: number, url: string, name: string)
   // Extract domain from URL
   const domain = new URL(url).hostname;
   
-  // Check user's website limit
+  // Check user's website limit.
+  //
+  // NULL means UNLIMITED — that is how the top tier is stored. This used to
+  // read `userPlan?.website_limit || 1`, which collapsed both null (unlimited)
+  // and a missing plan down to 1: a Scale customer was capped at a single
+  // website, while an unreadable account with no sites sailed past the gate
+  // entirely. The live path in websites.routes.ts has always tested against
+  // null explicitly; this now matches it, and the message matches too so the
+  // CMS recognises the refusal either way.
   const userPlan = await getUserWithPlan(user_id);
-  const currentWebsites = await getUserWebsites(user_id);
-  
-  if (currentWebsites.length >= (userPlan?.website_limit || 1)) {
-    throw new Error('Website limit reached for your plan');
+  if (!userPlan) {
+    // Fail closed: no plan read means no allowance to check against.
+    throw new Error('User not found');
   }
-  
+
+  if (userPlan.website_limit !== null && userPlan.website_limit !== undefined) {
+    const currentWebsites = await getUserWebsites(user_id);
+    if (currentWebsites.length >= userPlan.website_limit) {
+      throw new Error(`Website limit reached. Your plan allows ${userPlan.website_limit} websites.`);
+    }
+  }
+
   const result = await sql`
     INSERT INTO websites (user_id, domain, site_code, active)
     VALUES (${user_id}, ${domain}, ${generateSiteCode()}, true)

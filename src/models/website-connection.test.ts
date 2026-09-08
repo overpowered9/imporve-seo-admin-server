@@ -90,6 +90,73 @@ describe('clearWebsiteConnection', () => {
   });
 });
 
+describe('addUserWebsite — the website-limit gate', () => {
+  const body = sqlOf(functionBody(models, 'addUserWebsite'));
+
+  test('an unreadable account is refused, not waved through', () => {
+    // `userPlan?.website_limit || 1` used to fall back to a limit of 1 when
+    // the plan lookup itself failed — an account with a broken plan reference
+    // could add sites without limit. Failing closed on a missing plan is the
+    // opposite bug from the one below, and just as real.
+    assert.match(body, /if \(!userPlan\)/);
+    assert.match(body, /throw new Error\('User not found'\)/);
+  });
+
+  test('NULL (unlimited) is checked explicitly, not treated as falsy', () => {
+    // The bug this fixes: `website_limit || 1` reads null (unlimited, the top
+    // tier's own encoding) as 0-ish and falls back to 1 — a Scale customer
+    // capped at a single website by the same expression meant to protect
+    // Free's limit.
+    assert.doesNotMatch(body, /website_limit \|\| 1/);
+    assert.match(body, /website_limit !== null && userPlan\.website_limit !== undefined/);
+  });
+
+  test('the limit check does not run at all for an unlimited plan', () => {
+    // getUserWebsites is only worth calling — and the count only worth
+    // comparing — when there IS a limit to compare it against.
+    const guarded = body.slice(body.indexOf('website_limit !== null'));
+    assert.match(guarded, /getUserWebsites\(user_id\)/);
+    assert.match(guarded, /currentWebsites\.length >= userPlan\.website_limit/);
+  });
+
+  test('the refusal message states the actual number, matching websites.routes.ts', () => {
+    assert.match(body, /Website limit reached\. Your plan allows \$\{userPlan\.website_limit\} websites\./);
+  });
+});
+
+describe('POST /users/websites — no longer trusts a bare user_id', () => {
+  // Isolate this one route's handler by its unique registration line, up to
+  // the next router.* call — the same slicing idiom the disconnect-endpoint
+  // tests below use on this same `routes` source text.
+  const start = routes.indexOf("router.post('/websites', requireSupabaseUser");
+  const handlerBody = routes.slice(start, routes.indexOf('\nrouter.', start));
+
+  test('the route is registered', () => {
+    assert.ok(start >= 0, "router.post('/websites', ...) not found — has it moved or been renamed?");
+  });
+
+  test('requires a verified session', () => {
+    // This route took `user_id` straight from the request body with no auth
+    // middleware at all — any caller who knew a numeric id could attach a
+    // website to that account. /websites (websites.routes.ts) has always
+    // required a session; this route was simply missed.
+    assert.match(handlerBody, /requireSupabaseUser, async \(req: SupabaseAuthedRequest/);
+  });
+
+  test('the id used to write the website comes from the token, not the body', () => {
+    assert.match(handlerBody, /const user_id = req\.appUser!\.id/);
+    assert.match(handlerBody, /addUserWebsite\(user_id, url, name\)/);
+  });
+
+  test('a body user_id that disagrees with the token is refused, not silently overridden', () => {
+    // user_id stays optional in the body (existing callers keep working), but
+    // when present it is CHECKED against the token, not trusted over it.
+    assert.match(handlerBody, /user_id: z\.number\(\)\.optional\(\)/);
+    assert.match(handlerBody, /bodyUserId !== undefined && bodyUserId !== user_id/);
+    assert.match(handlerBody, /res\.status\(403\)/);
+  });
+});
+
 describe('the disconnect endpoint', () => {
   test('authenticates WITHOUT stamping a connection', () => {
     // validateApiAccess stamps the site as connected on the way in, and that
