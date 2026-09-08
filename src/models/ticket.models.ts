@@ -1,9 +1,9 @@
 import sql from '../data/db.js';
-import { describeTicketUserPlan, type TicketUserPlan, type TicketUserPlanRow } from './ticket-plan.js';
+import { describeUserPlan, type UserPlanSummary, type UserPlanRow } from './user-plan.js';
 
 // Re-exported so the routes and the CMS-facing types keep one address for these.
-export { describeTicketUserPlan };
-export type { TicketUserPlan };
+export { describeUserPlan };
+export type { UserPlanSummary };
 
 // Types
 export interface SupportTicket {
@@ -48,7 +48,7 @@ export interface TicketAttachment {
   created_at: Date;
 }
 
-export interface TicketWithUser extends SupportTicket, TicketUserPlan {
+export interface TicketWithUser extends SupportTicket, UserPlanSummary {
   user_email: string;
   user_name: string;
 }
@@ -59,7 +59,7 @@ export interface TicketWithUser extends SupportTicket, TicketUserPlan {
  */
 const withUserPlan = (row: Record<string, unknown>): TicketWithUser => {
   const { plan_price_cents, user_created_at, ...rest } = row;
-  return { ...rest, ...describeTicketUserPlan(row as TicketUserPlanRow) } as unknown as TicketWithUser;
+  return { ...rest, ...describeUserPlan(row as UserPlanRow) } as unknown as TicketWithUser;
 };
 
 /**

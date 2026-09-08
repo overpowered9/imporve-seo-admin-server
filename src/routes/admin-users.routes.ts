@@ -5,8 +5,30 @@ import sql from '../data/db.js';
 // one writer. Both imports exist so this route cannot reinvent either.
 import { syncBalanceCache } from '../models/user.models.js';
 import { PURCHASED_CREDIT_LIFETIME_MONTHS } from '../config/credits.config.js';
+import { describeUserPlan, type UserPlanRow } from '../models/user-plan.js';
 
 const router = express.Router();
+
+/**
+ * Add the plan an admin should actually READ to a user row.
+ *
+ * These queries return `sp.name` — the raw column, which still holds the
+ * ORIGINAL names ("Starter Plan", "Pro Plan") while the product, the billing
+ * ledger and the customer call those Optimize and Scale, and the 950-cent plan
+ * whose slug is 'basic' is called Grow. A panel printing the column names a plan
+ * that no longer exists by that name.
+ *
+ * It also could not tell a free trial from a lapsed free account: both sit on
+ * the $0 plan and only the trial end separates them.
+ *
+ * Same derivation the support queue uses, so one account reads the same however
+ * an agent reached it. Additive — `plan_name` is still the raw column, and
+ * nothing that already worked changes shape.
+ */
+const withPlan = <T extends Record<string, unknown>>(row: T) => {
+  const { plan_price_cents, user_created_at, ...rest } = row;
+  return { ...rest, ...describeUserPlan(row as UserPlanRow) };
+};
 
 // GET /admin/users - List all users with pagination, search, filter, sort
 router.get('/', async (req, res) => {
@@ -34,7 +56,8 @@ router.get('/', async (req, res) => {
       if (safeSort === 'created_at' && safeOrder === 'desc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE (u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search})
@@ -45,7 +68,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'created_at' && safeOrder === 'asc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE (u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search})
@@ -56,7 +80,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'email' && safeOrder === 'asc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE (u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search})
@@ -67,7 +92,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'email' && safeOrder === 'desc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE (u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search})
@@ -78,7 +104,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'name' && safeOrder === 'asc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE (u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search})
@@ -89,7 +116,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'name' && safeOrder === 'desc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE (u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search})
@@ -100,7 +128,8 @@ router.get('/', async (req, res) => {
       } else {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE (u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search})
@@ -121,7 +150,8 @@ router.get('/', async (req, res) => {
       if (safeSort === 'created_at' && safeOrder === 'desc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search}
@@ -131,7 +161,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'created_at' && safeOrder === 'asc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search}
@@ -141,7 +172,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'email' && safeOrder === 'asc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search}
@@ -151,7 +183,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'email' && safeOrder === 'desc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search}
@@ -161,7 +194,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'name' && safeOrder === 'asc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search}
@@ -171,7 +205,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'name' && safeOrder === 'desc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search}
@@ -181,7 +216,8 @@ router.get('/', async (req, res) => {
       } else {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.email ILIKE ${searchPattern} OR u.name ILIKE ${searchPattern} OR CAST(u.id AS TEXT) = ${search}
@@ -200,7 +236,8 @@ router.get('/', async (req, res) => {
       if (safeSort === 'created_at' && safeOrder === 'desc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.plan_id = ${planId}
@@ -210,7 +247,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'created_at' && safeOrder === 'asc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.plan_id = ${planId}
@@ -220,7 +258,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'email' && safeOrder === 'asc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.plan_id = ${planId}
@@ -230,7 +269,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'email' && safeOrder === 'desc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.plan_id = ${planId}
@@ -240,7 +280,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'name' && safeOrder === 'asc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.plan_id = ${planId}
@@ -250,7 +291,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'name' && safeOrder === 'desc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.plan_id = ${planId}
@@ -260,7 +302,8 @@ router.get('/', async (req, res) => {
       } else {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           WHERE u.plan_id = ${planId}
@@ -277,7 +320,8 @@ router.get('/', async (req, res) => {
       if (safeSort === 'created_at' && safeOrder === 'desc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           ORDER BY u.created_at DESC
@@ -286,7 +330,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'created_at' && safeOrder === 'asc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           ORDER BY u.created_at ASC
@@ -295,7 +340,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'email' && safeOrder === 'asc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           ORDER BY u.email ASC
@@ -304,7 +350,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'email' && safeOrder === 'desc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           ORDER BY u.email DESC
@@ -313,7 +360,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'name' && safeOrder === 'asc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           ORDER BY u.name ASC
@@ -322,7 +370,8 @@ router.get('/', async (req, res) => {
       } else if (safeSort === 'name' && safeOrder === 'desc') {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           ORDER BY u.name DESC
@@ -331,7 +380,8 @@ router.get('/', async (req, res) => {
       } else {
         users = await sql`
           SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-                 sp.name as plan_name, sp.slug as plan_slug
+                 sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
           FROM users u
           LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
           ORDER BY u.id DESC
@@ -347,7 +397,7 @@ router.get('/', async (req, res) => {
     res.json({
       success: true,
       data: {
-        users,
+        users: (users as unknown as Record<string, unknown>[]).map(withPlan),
         total,
         pagination: { limit, offset, total }
       }
@@ -402,7 +452,8 @@ router.get('/:userId', async (req, res) => {
 
     const userResult = await sql`
       SELECT u.id, u.email, u.name, u.api_key, u.plan_id, u.created_at, u.updated_at,
-             sp.name as plan_name, sp.slug as plan_slug
+             sp.name as plan_name, sp.slug as plan_slug,
+                 sp.price_cents as plan_price_cents, u.trial_ends_at, u.created_at as user_created_at
       FROM users u
       LEFT JOIN subscription_plans sp ON u.plan_id = sp.id
       WHERE u.id = ${userId}
@@ -438,7 +489,7 @@ router.get('/:userId', async (req, res) => {
     res.json({
       success: true,
       data: {
-        user: userResult[0],
+        user: withPlan(userResult[0] as unknown as Record<string, unknown>),
         credits,
         websites,
         subscription: subscription[0] || null,

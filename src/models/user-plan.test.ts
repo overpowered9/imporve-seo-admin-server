@@ -23,7 +23,7 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { describeTicketUserPlan } from './ticket-plan.js';
+import { describeUserPlan } from './user-plan.js';
 
 /** Days from now, as the timestamp the users table would hold. */
 const daysFromNow = (n: number): Date => {
@@ -32,9 +32,9 @@ const daysFromNow = (n: number): Date => {
   return d;
 };
 
-describe('describeTicketUserPlan — the name the customer knows', () => {
+describe('describeUserPlan — the name the customer knows', () => {
   test("slug 'basic' is Grow, never Basic — it is the 950-cent paid plan", () => {
-    const plan = describeTicketUserPlan({
+    const plan = describeUserPlan({
       plan_slug: 'basic',
       plan_name: 'Basic Plan',
       plan_price_cents: 950,
@@ -45,13 +45,13 @@ describe('describeTicketUserPlan — the name the customer knows', () => {
   });
 
   test("slug 'starter' is Optimize and 'pro' is Scale", () => {
-    const optimize = describeTicketUserPlan({
+    const optimize = describeUserPlan({
       plan_slug: 'starter',
       plan_name: 'Starter Plan',
       plan_price_cents: 2500,
       user_created_at: daysFromNow(-400),
     });
-    const scale = describeTicketUserPlan({
+    const scale = describeUserPlan({
       plan_slug: 'pro',
       plan_name: 'Pro Plan',
       plan_price_cents: 4900,
@@ -62,7 +62,7 @@ describe('describeTicketUserPlan — the name the customer knows', () => {
   });
 
   test('the outdated raw name still resolves when no slug came back', () => {
-    const plan = describeTicketUserPlan({
+    const plan = describeUserPlan({
       plan_name: 'Pro Plan',
       plan_price_cents: 4900,
       user_created_at: daysFromNow(-400),
@@ -71,7 +71,7 @@ describe('describeTicketUserPlan — the name the customer knows', () => {
   });
 
   test('the raw name is kept alongside, so the panel can still show it', () => {
-    const plan = describeTicketUserPlan({
+    const plan = describeUserPlan({
       plan_slug: 'starter',
       plan_name: 'Starter Plan',
       plan_price_cents: 2500,
@@ -82,7 +82,7 @@ describe('describeTicketUserPlan — the name the customer knows', () => {
   });
 
   test('a plan added since this mapping was written reads as itself, not "Unknown"', () => {
-    const plan = describeTicketUserPlan({
+    const plan = describeUserPlan({
       plan_slug: 'agency',
       plan_name: 'Agency Plan',
       plan_price_cents: 19900,
@@ -92,9 +92,9 @@ describe('describeTicketUserPlan — the name the customer knows', () => {
   });
 });
 
-describe('describeTicketUserPlan — a trial is not the free plan', () => {
+describe('describeUserPlan — a trial is not the free plan', () => {
   test('a free account inside its trial window reads Free Trial', () => {
-    const plan = describeTicketUserPlan({
+    const plan = describeUserPlan({
       plan_slug: 'free',
       plan_name: 'Free',
       plan_price_cents: 0,
@@ -107,7 +107,7 @@ describe('describeTicketUserPlan — a trial is not the free plan', () => {
   });
 
   test('the same account once the trial has lapsed reads Free', () => {
-    const plan = describeTicketUserPlan({
+    const plan = describeUserPlan({
       plan_slug: 'free',
       plan_name: 'Free',
       plan_price_cents: 0,
@@ -120,7 +120,7 @@ describe('describeTicketUserPlan — a trial is not the free plan', () => {
   });
 
   test('a null trial_ends_at falls back to signup + TRIAL_DAYS rather than "no trial"', () => {
-    const fresh = describeTicketUserPlan({
+    const fresh = describeUserPlan({
       plan_slug: 'free',
       plan_price_cents: 0,
       trial_ends_at: null,
@@ -129,7 +129,7 @@ describe('describeTicketUserPlan — a trial is not the free plan', () => {
     assert.equal(fresh.on_trial, true);
     assert.equal(fresh.plan_display_name, 'Free Trial');
 
-    const old = describeTicketUserPlan({
+    const old = describeUserPlan({
       plan_slug: 'free',
       plan_price_cents: 0,
       trial_ends_at: null,
@@ -141,7 +141,7 @@ describe('describeTicketUserPlan — a trial is not the free plan', () => {
 
   test('the effective trial end is returned, so the panel can date it', () => {
     const explicit = daysFromNow(3);
-    const plan = describeTicketUserPlan({
+    const plan = describeUserPlan({
       plan_slug: 'free',
       plan_price_cents: 0,
       trial_ends_at: explicit,
@@ -151,7 +151,7 @@ describe('describeTicketUserPlan — a trial is not the free plan', () => {
   });
 
   test('a PAYING account is never on trial, whatever its trial columns say', () => {
-    const plan = describeTicketUserPlan({
+    const plan = describeUserPlan({
       plan_slug: 'pro',
       plan_name: 'Pro Plan',
       plan_price_cents: 4900,
@@ -167,7 +167,7 @@ describe('describeTicketUserPlan — a trial is not the free plan', () => {
     // Every user has a signup date, so the effective-end fallback produces a
     // date for everyone. Returned unguarded, a panel would print "trial ends
     // <date>" beside a customer who has been paying for a year.
-    const plan = describeTicketUserPlan({
+    const plan = describeUserPlan({
       plan_slug: 'pro',
       plan_name: 'Pro Plan',
       plan_price_cents: 4900,
@@ -180,7 +180,7 @@ describe('describeTicketUserPlan — a trial is not the free plan', () => {
   });
 
   test('no plan row at all is free, and claims no trial it cannot date', () => {
-    const plan = describeTicketUserPlan({});
+    const plan = describeUserPlan({});
     assert.equal(plan.plan_display_name, 'Free');
     assert.equal(plan.on_trial, false);
     assert.equal(plan.trial_expired, false);
@@ -188,7 +188,7 @@ describe('describeTicketUserPlan — a trial is not the free plan', () => {
   });
 
   test('an unknown plan_id (no join match) is treated as free, never as paying', () => {
-    const plan = describeTicketUserPlan({
+    const plan = describeUserPlan({
       plan_price_cents: null,
       trial_ends_at: daysFromNow(-1),
       user_created_at: daysFromNow(-8),

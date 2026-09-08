@@ -1,10 +1,12 @@
 /**
- * The plan a support agent is shown beside a ticket.
+ * The plan an ADMIN is shown for a user — in the support queue, on a ticket, and
+ * in the user list. One derivation for all of them, so the same account cannot
+ * be described two ways depending on which screen an agent happens to open.
  *
  * ── WHY THIS IS ITS OWN MODULE ──────────────────────────────────────────────
  * Pure functions over plain data, deliberately free of any database import, so
- * the two rules below can be unit-tested directly. ticket.models.ts re-exports
- * them, which is the address the routes use.
+ * the two rules below can be unit-tested directly — neither ticket.models.ts nor
+ * admin-users.routes.ts can be imported without opening a connection.
  */
 import { planLabel } from '../services/billing/descriptions.js';
 import { effectiveTrialEnd } from './trial.js';
@@ -15,7 +17,7 @@ import { effectiveTrialEnd } from './trial.js';
  * `plan_name` is the RAW `subscription_plans.name` and is kept only so the panel
  * can fall back or debug; `plan_display_name` is the one to print.
  */
-export interface TicketUserPlan {
+export interface UserPlanSummary {
   plan_slug: string | null;
   /** Raw `subscription_plans.name` — outdated by design. Prefer plan_display_name. */
   plan_name: string | null;
@@ -36,7 +38,7 @@ export interface TicketUserPlan {
 }
 
 /** The shape the ticket queries select for the plan derivation. */
-export interface TicketUserPlanRow {
+export interface UserPlanRow {
   plan_slug?: string | null;
   plan_name?: string | null;
   plan_price_cents?: number | string | null;
@@ -66,7 +68,7 @@ export interface TicketUserPlanRow {
  * isFreePlanId(): a missing or unknown plan is treated as free, so a user with a
  * broken plan_id is never shown to an agent as paying.
  */
-export const describeTicketUserPlan = (row: TicketUserPlanRow): TicketUserPlan => {
+export const describeUserPlan = (row: UserPlanRow): UserPlanSummary => {
   const slug = row.plan_slug ?? null;
   const name = row.plan_name ?? null;
   const isFree = row.plan_price_cents == null || Number(row.plan_price_cents) === 0;
