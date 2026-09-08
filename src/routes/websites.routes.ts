@@ -71,6 +71,12 @@ router.post('/', async (req: SupabaseAuthedRequest, res) => {
       if (currentWebsites.length >= userWithPlan.website_limit) {
         return res.status(400).json({
           success: false,
+          // The CMS shows its own dialog for this rather than the sentence
+          // below, and it needs to recognise the refusal to do so. The code is
+          // the stable contract — the same one the plugin connect flow returns
+          // — so the client is not left matching English prose. The sentence
+          // stays for callers that only read `error`.
+          code: 'WEBSITE_LIMIT_REACHED',
           error: `Website limit reached. Your plan allows ${userWithPlan.website_limit} websites.`
         });
       }

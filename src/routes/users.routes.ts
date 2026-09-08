@@ -354,16 +354,31 @@ router.get('/websites/:user_id', async (req, res) => {
 });
 
 // Add user website
-router.post('/websites', async (req, res) => {
+//
+// Guarded, and identity comes from the TOKEN. This used to take `user_id`
+// straight from the body with no middleware at all, which made it a second,
+// unauthenticated way into the websites table: anyone who knew a numeric user
+// id could attach a site to that account. /websites has always worked this way
+// (websites.routes.ts) — this route was simply missed.
+//
+// `user_id` stays in the body for compatibility with existing callers, but it
+// is now checked against the token rather than trusted, matching
+// websites.routes.ts:53-56.
+router.post('/websites', requireSupabaseUser, async (req: SupabaseAuthedRequest, res) => {
   try {
-    const { user_id, url, name } = z.object({
-      user_id: z.number(),
+    const { user_id: bodyUserId, url, name } = z.object({
+      user_id: z.number().optional(),
       url: z.string().url(),
       name: z.string()
     }).parse(req.body);
-    
+
+    const user_id = req.appUser!.id;
+    if (bodyUserId !== undefined && bodyUserId !== user_id) {
+      return res.status(403).json({ success: false, error: 'Not authorized for this account.' });
+    }
+
     const website = await addUserWebsite(user_id, url, name);
-    
+
     res.json({
       success: true,
       data: website
