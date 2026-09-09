@@ -1081,6 +1081,11 @@ export interface InactivityPayload {
   ctaUrl: string;
 }
 
+export interface TrialEndedPayload {
+  firstName: string;
+  ctaUrl: string;
+}
+
 export const billingEmailTemplates = {
   /**
    * Plan change / upgrade receipt. (BILL-006)
@@ -1234,6 +1239,34 @@ export const billingEmailTemplates = {
     ].join('\n');
 
     return { subject: '[PLACEHOLDER] Your ImproveSEO credits are waiting', html, text };
+  },
+
+  /**
+   * ⚠️ PLACEHOLDER COPY. Final wording is pending ("email copy will follow").
+   *
+   * Sent once, when a Free Trial account's trial has ended and it has moved
+   * to the Free plan (see trialEndedJob in billing/notification-jobs.ts).
+   * FOR THE COPY OWNER: replace only the strings in this function — every
+   * variable available is on TrialEndedPayload above.
+   */
+  trialEndedPlaceholder: (p: TrialEndedPayload) => {
+    const html = billingShell(
+      '[PLACEHOLDER] Your free trial has ended',
+      `<p style="font-size:15px;color:#333;">Hi ${p.firstName},</p>
+       <p style="font-size:15px;color:#333;">[PLACEHOLDER COPY — awaiting final wording.]</p>`,
+      '[PLACEHOLDER CTA]',
+      p.ctaUrl,
+    );
+
+    const text = [
+      `Hi ${p.firstName},`,
+      '',
+      '[PLACEHOLDER COPY — awaiting final wording.]',
+      '',
+      `[PLACEHOLDER CTA]: ${p.ctaUrl}`,
+    ].join('\n');
+
+    return { subject: '[PLACEHOLDER] Your free trial has ended', html, text };
   },
 };
 

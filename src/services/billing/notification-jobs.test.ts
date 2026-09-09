@@ -13,6 +13,7 @@ import {
   claimNotification,
   creditExpiryJob,
   inactivityJob,
+  trialEndedJob,
   loadNotificationConfig,
   runAllNotificationJobs,
   piecesFrom,
@@ -411,16 +412,17 @@ describe('shared runner', () => {
     assert.equal(result.queued, 0);
   });
 
-  test('runAllNotificationJobs covers every configured lead time plus inactivity', async () => {
+  test('runAllNotificationJobs covers every configured lead time, inactivity, and trial_ended', async () => {
     const { sql } = sqlWithConstraints([]);
     const results = await runAllNotificationJobs(sql, { dryRun: true });
-    // 14, 3, 0 + inactivity. The credit-expiry passes still APPEAR while the
-    // email is gated — a job that vanished from the output would look like a
-    // bug, and this dry run is how the runbook checks what the scheduler does.
-    assert.equal(results.length, 4);
+    // 14, 3, 0 + inactivity + trial_ended. The credit-expiry AND trial_ended
+    // passes still APPEAR while gated — a job that vanished from the output
+    // would look like a bug, and this dry run is how the runbook checks what
+    // the scheduler does.
+    assert.equal(results.length, 5);
     assert.deepEqual(
       results.map((r) => r.name.replace(/ — DISABLED .*/, '')),
-      ['credit_expiry(14d)', 'credit_expiry(3d)', 'credit_expiry(0d)', 'inactivity'],
+      ['credit_expiry(14d)', 'credit_expiry(3d)', 'credit_expiry(0d)', 'inactivity', 'trial_ended'],
     );
   });
 
@@ -451,5 +453,101 @@ describe('shared runner', () => {
       if (previous === undefined) delete process.env.ISEO_CREDIT_EXPIRY_EMAILS_ENABLED;
       else process.env.ISEO_CREDIT_EXPIRY_EMAILS_ENABLED = previous;
     }
+  });
+
+  test('the placeholder trial-ended email is OFF unless explicitly enabled', async () => {
+    // Same reasoning as credit_expiry above: the queued template still reads
+    // "[PLACEHOLDER] Your free trial has ended" — this must not reach a real
+    // inbox until TRIAL_ENDED_EMAIL_ENABLED is flipped on.
+    const previous = process.env.TRIAL_ENDED_EMAIL_ENABLED;
+    delete process.env.TRIAL_ENDED_EMAIL_ENABLED;
+    try {
+      const { sql, queued } = sqlWithConstraints([candidate()]);
+      const results = await runAllNotificationJobs(sql, { dryRun: true });
+      const trialEnded = results.find((r) => /^trial_ended/.test(r.name));
+
+      assert.ok(trialEnded, 'the pass is still reported');
+      assert.match(trialEnded.name, /DISABLED/, 'and visibly marked as off');
+      assert.equal(trialEnded.queued, 0);
+      assert.equal(trialEnded.wouldEmail.length, 0);
+      assert.equal(queued.size, 0, 'nothing reached the outbox');
+    } finally {
+      if (previous === undefined) delete process.env.TRIAL_ENDED_EMAIL_ENABLED;
+      else process.env.TRIAL_ENDED_EMAIL_ENABLED = previous;
+    }
+  });
+});
+
+describe('trial_ended — a Free Trial account moved to the Free plan', () => {
+  test('shape: this is a real job definition', () => {
+    const job = trialEndedJob(cfg());
+    assert.equal(job.name, 'trial_ended');
+    assert.equal(job.template, 'lifecycle.trial_ended');
+    assert.equal(job.category, 'lifecycle');
+    assert.equal(typeof job.fetchPage, 'function');
+    assert.equal(typeof job.dedupeKey, 'function');
+    assert.equal(typeof job.payload, 'function');
+  });
+
+  test('a lapsed-trial account is queued exactly once', async () => {
+    const { sql, queued } = sqlWithConstraints([candidate({ trial_end: '2026-09-01T00:00:00Z' })]);
+    const result = await runNotificationJob(sql, trialEndedJob(cfg()), cfg());
+    assert.equal(result.queued, 1);
+    assert.equal(queued.size, 1);
+  });
+
+  test('a second run does not re-queue the same account — a trial does not end twice', async () => {
+    const { sql } = sqlWithConstraints([candidate({ trial_end: '2026-09-01T00:00:00Z' })]);
+    await runNotificationJob(sql, trialEndedJob(cfg()), cfg());
+    const second = await runNotificationJob(sql, trialEndedJob(cfg()), cfg());
+    assert.equal(second.queued, 0);
+    assert.equal(second.skippedDuplicate, 1);
+  });
+
+  test('dedupeKey is the trial-end timestamp — one occurrence per account, ever', () => {
+    const job = trialEndedJob(cfg());
+    assert.equal(
+      job.dedupeKey({ ...candidate(), trial_end: '2026-09-01T00:00:00Z' } as any),
+      'ended:2026-09-01T00:00:00.000Z',
+    );
+  });
+
+  test('SUPPRESSION and eligibility rules are present in the candidate query', async () => {
+    // The fake SQL matches candidate queries by their text, not by evaluating
+    // the SQL — so filtering (still-active trial, a paid plan, an already
+    // notified account) is verified by asserting the clause exists, the same
+    // way the inactivity suite does above.
+    const { sql } = sqlWithConstraints([]);
+    await runNotificationJob(sql, trialEndedJob(cfg()), cfg());
+    const q = sql.matching(/SELECT u\.id AS user_id/)
+      .find((m) => /trial_end/.test(m.text));
+    assert.ok(q, 'trialEndedJob candidate query not found');
+
+    assert.match(q!.text, /marketing_opt_out_at IS NULL/, 'unsubscribed');
+    assert.match(q!.text, /email_hard_bounced_at IS NULL/, 'hard-bounced');
+    assert.match(q!.text, /is_internal = FALSE/, 'internal/test accounts');
+    // Free plan only — mirrors isFreePlanId's own price_cents = 0 definition.
+    assert.match(q!.text, /sp\.price_cents = 0 OR u\.plan_id IS NULL/);
+    // The trial must actually have ended.
+    assert.match(q!.text, /<= NOW\(\)/);
+    // Never twice, ever — no cooldown window, just "has this ever fired".
+    assert.match(q!.text, /NOT EXISTS \(\s*SELECT 1 FROM user_notifications/);
+    assert.match(q!.text, /n\.kind = 'trial_ended'/);
+    // NEVER paid, not just "not currently paid" — an account that upgraded
+    // then later cancelled back to free would otherwise wrongly qualify;
+    // cancellation sets subscriptions.status='cancelled', it never deletes
+    // the row (see stripe.routes.ts customer.subscription.deleted). The
+    // guard below excludes by EXISTENCE of any row, so a status-based filter
+    // that only caught ACTIVE subscriptions could not have satisfied this.
+    assert.match(q!.text, /NOT EXISTS \(SELECT 1 FROM subscriptions s WHERE s\.user_id = u\.id\)/);
+    assert.doesNotMatch(q!.text, /subscriptions[^)]*status/, 'must not be scoped by status');
+  });
+
+  test('the payload carries just enough for the placeholder template', () => {
+    const payload = trialEndedJob(cfg()).payload(candidate(), cfg());
+    for (const key of ['firstName', 'ctaUrl']) {
+      assert.ok(key in payload, `payload is missing ${key}`);
+    }
+    assert.equal(payload.ctaUrl, cfg().dashboardUrl);
   });
 });

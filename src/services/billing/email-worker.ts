@@ -45,6 +45,7 @@ export const RENDERERS: Record<string, (payload: any) => RenderedEmail> = {
   'billing.cancellation': (p) => billingEmailTemplates.billingCancelled(p),
   'lifecycle.credit_expiry': (p) => billingEmailTemplates.creditsExpiringPlaceholder(p),
   'lifecycle.inactivity': (p) => billingEmailTemplates.inactivityPlaceholder(p),
+  'lifecycle.trial_ended': (p) => billingEmailTemplates.trialEndedPlaceholder(p),
 };
 
 /**
