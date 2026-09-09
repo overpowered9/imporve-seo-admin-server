@@ -37,7 +37,7 @@
  */
 import type { SqlLike } from './payment-methods.js';
 import { enqueueEmail, type EmailCategory } from './email-outbox.js';
-import { expireLapsedLots } from '../../models/user.models.js';
+import { expireLapsedLots, TRIAL_DAYS } from '../../models/user.models.js';
 
 export interface NotificationConfig {
   /** Lead times in days before expiry. Signed off as 14, 3, 0 (day-of). */
@@ -450,6 +450,83 @@ export const inactivityJob = (cfg: NotificationConfig): JobDefinition => ({
   }),
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Trial ended → moved to Free plan
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Candidate query: Free Plan accounts whose trial has just ended.
+ *
+ * WHY A JOB, NOT A HOOK ON THE REQUEST PATH THAT PERFORMS THIS TRANSITION —
+ * reconcileTrialCredits() (user.models.ts) is what actually voids a lapsed
+ * trial's credits, but it only runs when the affected account happens to make
+ * an authenticated request. An account that lets its trial lapse and never
+ * reopens the dashboard or plugin — arguably exactly who this email is for —
+ * would never trigger it. This job finds the same accounts independently, the
+ * same way credit_expiry/inactivity already do for their own time-based
+ * conditions, so delivery does not depend on the customer's own activity.
+ *
+ * "Free plan" mirrors isFreePlanId's own definition (price_cents = 0 or no
+ * plan at all) rather than a hardcoded plan id, so it tracks that function if
+ * the catalogue ever changes. The trial-end fallback mirrors
+ * effectiveTrialEnd's own COALESCE(trial_ends_at, created_at + TRIAL_DAYS).
+ *
+ * UNLIKE inactivity, no cooldown window: this fires once, ever, per account —
+ * a trial does not end twice — so a plain NOT EXISTS against user_notifications
+ * is the whole guard, and the candidate pool naturally shrinks as accounts are
+ * claimed rather than needing a rolling exclusion window.
+ *
+ * ── WHY `NOT EXISTS (... subscriptions ...)`, NOT JUST "currently free" ────
+ * Found in QA before this shipped: "currently on the free plan" is NOT the
+ * same claim as "this trial ended and moved them to free". An account that
+ * upgraded to a paid plan BEFORE its original trial_ends_at ever passed is
+ * excluded at that moment (it isn't on the free plan yet), so it is never
+ * claimed then — but if it later CANCELS, customer.subscription.deleted sets
+ * subscriptions.status = 'cancelled' and downgrades plan_id back to free
+ * (stripe.routes.ts) — the row is kept, never deleted. From that point on it
+ * satisfies "free plan" AND "trial_ends_at in the past" AND "never claimed",
+ * and would wrongly receive a "your trial ended" email for a cancellation
+ * that has nothing to do with its trial. Excluding anyone with ANY
+ * subscriptions row — cancelled or not — means only accounts that were NEVER
+ * paid, even briefly, are eligible; that is the actual claim this email makes.
+ */
+export const trialEndedJob = (cfg: NotificationConfig): JobDefinition => ({
+  name: 'trial_ended',
+  template: 'lifecycle.trial_ended',
+  category: 'lifecycle',
+  fetchPage: (sql, afterId, limit) => sql`
+    SELECT u.id AS user_id, u.email, u.name,
+           COALESCE(u.trial_ends_at, u.created_at + (${TRIAL_DAYS} || ' days')::interval) AS trial_end
+    FROM   users u
+    LEFT   JOIN subscription_plans sp ON sp.id = u.plan_id
+    WHERE  u.email IS NOT NULL
+      AND  u.id > ${afterId}
+      AND  u.marketing_opt_out_at IS NULL
+      AND  u.email_hard_bounced_at IS NULL
+      AND  u.is_internal = FALSE
+      AND  (sp.price_cents = 0 OR u.plan_id IS NULL)
+      AND  COALESCE(u.trial_ends_at, u.created_at + (${TRIAL_DAYS} || ' days')::interval) <= NOW()
+      -- Never paid, ever — not "not currently paid". See the note above.
+      AND  NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.user_id = u.id)
+      AND  NOT EXISTS (
+             SELECT 1 FROM user_notifications n
+             WHERE  n.user_id = u.id AND n.kind = 'trial_ended'
+           )
+    ORDER  BY u.id
+    LIMIT  ${limit}
+  ` as Promise<Candidate[]>,
+
+  // The trial-end timestamp identifies the occurrence. `kind` is already
+  // 'trial_ended' in the composite (user_id, kind, dedupe_key) key, so the
+  // key itself does not need to repeat that.
+  dedupeKey: (c) => `ended:${new Date(c.trial_end).toISOString()}`,
+
+  payload: (c, config) => ({
+    firstName: firstNameOf(c.name, c.email),
+    ctaUrl: config.dashboardUrl,
+  }),
+});
+
 /** Run every notification job once. Exported for the CLI and the scheduler. */
 export async function runAllNotificationJobs(
   sql: SqlLike,
@@ -499,6 +576,32 @@ export async function runAllNotificationJobs(
 
   // BILL-008 — reuses the same runner; see the module note.
   results.push(await runNotificationJob(sql, inactivityJob(cfg), cfg, options));
+
+  // ── Trial ended → moved to Free plan ──────────────────────────────────────
+  //
+  // Gated the same way credit_expiry is, and for the identical reason: the
+  // template this queues is still [PLACEHOLDER] copy. LIFECYCLE_EMAILS_ENABLED
+  // alone was already shown (see the credit_expiry comment above) not to be a
+  // safe substitute for a per-job gate — it is set in production for
+  // inactivity, and a broader "lifecycle emails are on" flag says nothing
+  // about whether THIS job's specific copy is ready. Flip
+  // TRIAL_ENDED_EMAIL_ENABLED=true once the real copy replaces
+  // trialEndedPlaceholder in email.service.ts.
+  const trialEndedEmailsEnabled =
+    String(process.env.TRIAL_ENDED_EMAIL_ENABLED || 'false').toLowerCase() === 'true';
+
+  if (!trialEndedEmailsEnabled) {
+    results.push({
+      name: 'trial_ended — DISABLED (TRIAL_ENDED_EMAIL_ENABLED)',
+      scanned: 0,
+      queued: 0,
+      skippedDuplicate: 0,
+      errors: 0,
+      wouldEmail: [],
+    });
+  } else {
+    results.push(await runNotificationJob(sql, trialEndedJob(cfg), cfg, options));
+  }
 
   // ── The sweep that actually takes the credits away ────────────────────────
   // Runs AFTER the warnings, so a lot that reaches zero lead time is warned
