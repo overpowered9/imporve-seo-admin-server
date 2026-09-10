@@ -33,6 +33,7 @@ const migrations = [
   ['014 — websites.heartbeat_at (plugin checks in on its own)', '../migrations/014-website-heartbeat.js'],
   ['015 — website_limit for Grow (2) and Optimize (3)', '../migrations/015-plan-website-limits.js'],
   ['017 — signup-email claim columns (versioned, de-defaulted, back-marked)', '../migrations/017-signup-email-columns.js'],
+  ['018 — websites.domain index (cross-account supersede lookup)', '../migrations/018-websites-domain-index.js'],
 ] as const;
 // NOTE: 009–013 are absent from this list and were before 014 was added. Left
 // alone deliberately rather than fixed in passing — whoever added them either

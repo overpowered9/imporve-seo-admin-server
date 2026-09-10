@@ -1781,38 +1781,67 @@ export const getUserWebsites = async (user_id: number): Promise<Website[]> => {
  *    (undefined_column) is expected and silent whenever migration 008 has not
  *    run yet — the same deploy-before-migrate tolerance the address endpoints
  *    use — so shipping this code ahead of the migration is safe.
+ *
+ *  • SUPERSEDES OTHER ACCOUNTS' ROWS FOR THE SAME DOMAIN. Only one physical
+ *    WordPress install can hold live credentials for a domain at a time, but
+ *    nothing about adding a website ties the domain string to a single owner
+ *    (findWebsiteByDomain's own callers say so explicitly: "any number of
+ *    accounts may add/link the same domain"). Without this, reconnecting a
+ *    site under a different account left the OLD account's row reading
+ *    Active forever — the same domain showed Active under two accounts at
+ *    once. So every time this row is actually (re)stamped, any OTHER
+ *    account's still-active row for the same domain is cleared in the same
+ *    transaction. Exact-string domain match, `active = true` only — the same
+ *    semantics findWebsiteByDomain's existing callers already rely on.
  */
 export const touchWebsiteConnection = async (
   website_id: number,
   opts: { heartbeat?: boolean } = {},
 ): Promise<void> => {
   try {
-    if (opts.heartbeat) {
-      // A heartbeat additionally records the CAPABILITY (migration 014), and
-      // that bit must land on the very first one. Hence `heartbeat_at IS NULL`
-      // in the WHERE: without it, a heartbeat arriving within five minutes of a
-      // generation would be thrown away by the throttle above and the site
-      // would look like an older build until the next hour — or indefinitely,
-      // on a busy site that never has a quiet five minutes.
+    await sql.begin(async (sql) => {
+      const stamped = (opts.heartbeat
+        ? await sql`
+            UPDATE websites
+            SET last_connected_at = NOW(), heartbeat_at = NOW()
+            WHERE id = ${website_id}
+              AND (
+                heartbeat_at IS NULL
+                OR last_connected_at IS NULL
+                OR last_connected_at < NOW() - INTERVAL '5 minutes'
+              )
+            RETURNING domain, user_id
+          `
+        : await sql`
+            UPDATE websites
+            SET last_connected_at = NOW()
+            WHERE id = ${website_id}
+              AND (last_connected_at IS NULL OR last_connected_at < NOW() - INTERVAL '5 minutes')
+            RETURNING domain, user_id
+          `) as unknown as { domain: string; user_id: number }[];
+
+      // Throttled away — nothing changed, so nothing to supersede either. Same
+      // cost as before this change in the common case (a site pinging inside
+      // its own 5-minute window).
+      const row = stamped[0];
+      if (!row) return;
+
+      // This row just went (or stayed) live, so any OTHER account's
+      // still-active row for the SAME domain is now stale. Clear it rather
+      // than leaving it to a heartbeat's 24h silence window (see the CMS's
+      // CONNECTION_STALE_HOURS) — or forever, on a pre-heartbeat build. A
+      // soft-deleted sibling is left alone: it is never shown as Active
+      // anywhere, so touching it would only add risk. Clears every matching
+      // sibling, not just one.
       await sql`
         UPDATE websites
-        SET last_connected_at = NOW(), heartbeat_at = NOW()
-        WHERE id = ${website_id}
-          AND (
-            heartbeat_at IS NULL
-            OR last_connected_at IS NULL
-            OR last_connected_at < NOW() - INTERVAL '5 minutes'
-          )
+        SET last_connected_at = NULL, heartbeat_at = NULL
+        WHERE domain = ${row.domain}
+          AND user_id != ${row.user_id}
+          AND active = true
+          AND (last_connected_at IS NOT NULL OR heartbeat_at IS NOT NULL)
       `;
-      return;
-    }
-
-    await sql`
-      UPDATE websites
-      SET last_connected_at = NOW()
-      WHERE id = ${website_id}
-        AND (last_connected_at IS NULL OR last_connected_at < NOW() - INTERVAL '5 minutes')
-    `;
+    });
   } catch (error: any) {
     // 42703 = undefined_column: migration 008 (or 014) has not run yet.
     if (error?.code === '42703') return;

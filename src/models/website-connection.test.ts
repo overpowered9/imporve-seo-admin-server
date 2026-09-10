@@ -69,11 +69,68 @@ describe('touchWebsiteConnection', () => {
   test('the ordinary path still does NOT touch heartbeat_at', () => {
     // A plugin request is not proof the plugin heartbeats. Only an unprompted
     // check-in is, or the window would be applied to sites that cannot meet it.
-    const ordinary = body.slice(body.lastIndexOf('SET last_connected_at = NOW()'));
+    //
+    // Sliced up to this branch's OWN `RETURNING`, not to the end of the
+    // function: the supersede write further down legitimately clears
+    // heartbeat_at (for the OTHER account's superseded row), and that must
+    // not make this check pass or fail for the wrong reason.
+    const start = body.lastIndexOf('SET last_connected_at = NOW()');
+    const ordinary = body.slice(start, body.indexOf('RETURNING domain, user_id', start));
     assert.doesNotMatch(ordinary, /heartbeat_at/);
   });
 
   test('still swallows undefined_column so it can ship before the migration', () => {
+    assert.match(body, /42703/);
+  });
+});
+
+describe('touchWebsiteConnection — cross-account supersede', () => {
+  // Same domain reading Active under two accounts at once was the reported
+  // bug: nothing ever told the OLD account's row it had been superseded when
+  // the SAME domain reconnected under a NEW account. This is the fix — see
+  // the function's own doc comment for the full reasoning.
+  const body = sqlOf(functionBody(models, 'touchWebsiteConnection'));
+
+  test('both stamp branches report back which domain/account they just touched', () => {
+    // Without RETURNING there is no cheap way to know whether THIS call
+    // actually wrote (vs. was throttled away) or which domain to supersede
+    // on — both are needed below.
+    const heartbeatBranch = body.slice(0, body.indexOf(': await sql'));
+    const ordinaryBranch = body.slice(body.indexOf(': await sql'));
+    assert.match(heartbeatBranch, /RETURNING domain, user_id/);
+    assert.match(ordinaryBranch, /RETURNING domain, user_id/);
+  });
+
+  test('a throttled-away call supersedes nothing', () => {
+    // If RETURNING came back empty, this row was not actually (re)stamped,
+    // so there is nothing to say about any other account's row either.
+    assert.match(body, /if \(!row\) return/);
+  });
+
+  test('the supersede write only ever touches OTHER accounts, never this one', () => {
+    assert.match(body, /user_id != \$\{row\.user_id\}/);
+  });
+
+  test('the supersede write is scoped to the SAME domain', () => {
+    assert.match(body, /domain = \$\{row\.domain\}/);
+  });
+
+  test('a soft-deleted sibling row is left alone', () => {
+    const supersede = body.slice(body.indexOf('SET last_connected_at = NULL'));
+    assert.match(supersede, /AND active = true/);
+  });
+
+  test('the supersede write clears both connection columns', () => {
+    assert.match(body, /SET last_connected_at = NULL, heartbeat_at = NULL/);
+  });
+
+  test('the stamp and the supersede happen in one transaction', () => {
+    assert.match(body, /await sql\.begin\(async \(sql\) =>/);
+  });
+
+  test('still swallows undefined_column so it can ship before the migration', () => {
+    // The new cross-account query is inside the same try/catch as the
+    // original stamp — a 42703 here must stay non-fatal too.
     assert.match(body, /42703/);
   });
 });
