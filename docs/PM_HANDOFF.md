@@ -3,10 +3,30 @@
 Everything that could be done in code is done and pushed. What remains needs credentials or an
 irreversible decision, so it needs a person.
 
-
+**Read section 0 first. It is time-sensitive.**
 
 ---
 
+## 0. URGENT — rotate these credentials
+
+Production secrets were pasted into a chat transcript. Treat all of them as compromised and rotate
+them **before** go-live. In rough priority order:
+
+| Secret | Where | Why it matters |
+|---|---|---|
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase → Settings → API | Bypasses row-level security — full read/write on the whole database |
+| `DATABASE_URL` password | Supabase → Settings → Database | Direct Postgres access |
+| `ANTHROPIC_API_KEY` | console.anthropic.com | Billable; abuse costs money immediately |
+| `OPENAI_API_KEY` | platform.openai.com | Same |
+| `SUPABASE_ANON_KEY` | Supabase → Settings → API | Public-ish, but rotate with the service key |
+| `MONGODB_URI` password | MongoDB Atlas → Database Access | Prompt data |
+| `MAILGUN_API_KEY` | Mailgun → API keys | Can send mail as your domain |
+| `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | Stripe dashboard | Test-mode keys, but rotate anyway |
+
+Update each in the Render dashboard as you rotate it. Never commit them — `.env` is gitignored and
+must stay that way.
+
+**Separate finding:** your Stripe keys are **test-mode** (`sk_test_` / `pk_test_`) while
 `NODE_ENV=production`. If you expect live payments, that is a bug in its own right.
 
 ---
