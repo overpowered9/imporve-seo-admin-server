@@ -14,6 +14,20 @@ import { chat } from '../services/openai.js';
 import { enforceMetaLength, META_BOUNDS } from '../services/meta-length.js';
 import { requireAdmin } from '../middleware/adminAuth.middleware.js';
 import { rateLimitPerUser } from '../middleware/rateLimit.middleware.js';
+import {
+  keywordDailyLimitFor,
+  offersManualListsHint,
+  nextUtcMidnight,
+  KEYWORD_DAILY_LIMIT_CODE,
+  KEYWORD_DAILY_LIMIT_MESSAGE,
+  type KeywordAllowancePlan,
+} from '../config/keyword-limits.config.js';
+import {
+  getKeywordPlanContext,
+  reserveKeywordGeneration,
+  releaseKeywordGeneration,
+  type KeywordReservation,
+} from '../models/keyword-usage.js';
 
 const router = Router();
 
@@ -1116,10 +1130,67 @@ router.post('/generateimage', validateApiAccess, validateCredits('iseo', priceOf
 });
 
 /**
+ * Take one of today's Keyword Generator runs for this user, or answer 429 when the plan's daily
+ * allowance (config/keyword-limits.config.ts) is spent.
+ *
+ * Returns the reservation to hand back if the run then fails, null when the allowance could not
+ * be checked, or false when the 429 has been sent and the caller must stop.
+ *
+ * FAILS OPEN: if the check cannot be made at all — most likely migration 019 not yet applied —
+ * the run proceeds uncapped and the error is logged under [keyword-allowance]. The run is still
+ * credit-charged, so nothing is given away, and a usage counter must never be the thing that
+ * takes keyword generation down.
+ */
+async function claimKeywordAllowance(userId: number, res: Response): Promise<KeywordReservation | null | false> {
+  let plan: KeywordAllowancePlan;
+  let limit: number;
+  let reservation: KeywordReservation | null;
+  try {
+    plan = await getKeywordPlanContext(userId);
+    limit = keywordDailyLimitFor(plan);
+    reservation = await reserveKeywordGeneration(userId, limit);
+  } catch (err) {
+    console.error('[keyword-allowance] could not check the daily allowance — allowing this run:', err);
+    return null;
+  }
+  if (reservation) return reservation;
+
+  const resetsAt = nextUtcMidnight();
+  const retryAfterSeconds = Math.max(1, Math.ceil((resetsAt.getTime() - Date.now()) / 1000));
+  res.set('Retry-After', String(retryAfterSeconds));
+  res.status(429).json({
+    success: false,
+    error: KEYWORD_DAILY_LIMIT_MESSAGE,
+    code: KEYWORD_DAILY_LIMIT_CODE,
+    limit,
+    used: limit,
+    plan_slug: plan.slug,
+    manual_lists_hint: offersManualListsHint(plan),
+    resets_at: resetsAt.toISOString(),
+    retry_after_seconds: retryAfterSeconds,
+  });
+  return false;
+}
+
+/** Hand back an unused allowance slot. Never throws: the response has already been decided. */
+async function releaseKeywordAllowance(userId: number, reservation: KeywordReservation): Promise<void> {
+  try {
+    await releaseKeywordGeneration(userId, reservation.usageDate);
+  } catch (err) {
+    console.error('[keyword-allowance] could not hand back an unused run:', err);
+  }
+}
+
+/**
  * Generate Keyword List
  * POST /api/v1/generate/generatekeyword
+ *
+ * Capped per UTC day by plan (claimKeywordAllowance) as well as credit-charged. A run that does
+ * not deliver keywords gives its slot back, so only successful runs count toward the allowance.
  */
 router.post('/generatekeyword', validateApiAccess, validateCredits('iseo', priceOf('keywords')), async (req: AuthenticatedRequest, res: Response) => {
+  let reservation: KeywordReservation | null = null;
+  let delivered = false;
   try {
     const {
       seed_keyword,
@@ -1136,6 +1207,10 @@ router.post('/generatekeyword', validateApiAccess, validateCredits('iseo', price
 
     const seed = String(seed_keyword).trim();
     const keywordCount = Math.min(Math.max(parseInt(count, 10) || 30, 1), 50);
+
+    const claim = await claimKeywordAllowance(req.user.id, res);
+    if (claim === false) return;
+    reservation = claim;
 
     console.log(`🔍 Starting keyword generation for: "${seed}" (count=${keywordCount})`);
 
@@ -1221,6 +1296,8 @@ Output rules: one keyword per line, lowercase, no numbering, no bullets, no quot
     console.log(`✅ ${keywords.length} keywords generated and saved (ID: ${generationId})`);
     console.log(`💳 1 keyword credit deducted for user ${userId}`);
 
+    // From here the run counts toward today's allowance.
+    delivered = true;
     res.json({
       success: true,
       data: {
@@ -1237,6 +1314,12 @@ Output rules: one keyword per line, lowercase, no numbering, no bullets, no quot
       success: false,
       error: error instanceof Error ? error.message : 'Failed to generate keywords'
     });
+  } finally {
+    // Every path that did not deliver keywords — empty model output, a model or database
+    // failure — gives the day's slot back, so only successful runs use up the allowance.
+    if (reservation && !delivered) {
+      await releaseKeywordAllowance(req.user.id, reservation);
+    }
   }
 });
 

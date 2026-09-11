@@ -137,6 +137,18 @@ npm run migrate:iseo-credits   # 011 — collapse to the single ISEO pool  ⚠�
 Order matters: 011 seeds balances from the env grants, and 010 must already have added the column
 that regeneration pricing reads. Both are idempotent — safe to re-run if one is interrupted.
 
+### Keyword Generator daily allowance (migration 019)
+
+```bash
+npm run migrate:keyword-daily-usage   # 019 — keyword_daily_usage table
+```
+
+Independent of 010/011 and idempotent. It can run before or after the deploy that ships the
+allowance: until the table exists the server logs `[keyword-allowance]` and lets keyword runs
+through with no daily cap (still credit-charged). Or paste the output of `npm run migrations:print`
+into the Supabase SQL editor. The limits default to 10/20/50/50 runs a day (Free/Grow/Optimize/Scale).
+To change them, set `KEYWORD_DAILY_LIMIT_FREE|BASIC|STARTER|PRO`; they're optional.
+
 ## 7. Spot-check two real accounts
 
 - **A free-tier account** — balance should equal `ISEO_GRANT_FREE` (100), purchased 0.

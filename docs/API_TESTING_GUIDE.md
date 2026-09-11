@@ -105,6 +105,32 @@ plugin keeps working. Remove it once plugin and CMS both read `credits_total`.
 > correctly priced, but only `/content-v2/article` and `/content-v2/image` have the atomic
 > reserve-then-settle guarantee. Worth migrating; not done in this release.
 
+#### Keyword Generator daily allowance — `POST /api/v1/generate/generatekeyword`
+
+On top of the credit charge, each account gets a number of successful runs per UTC day, by plan:
+Free Trial / Free (`free`) **10**, Grow (`basic`) **20**, Optimize (`starter`) and Scale (`pro`)
+**50**. The credit check runs first, so a trial-expired or out-of-credits account still gets its 402.
+Runs that fail or return no keywords do not count. Once the allowance is spent:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: <seconds until 00:00 UTC>
+
+{ "success": false,
+  "code": "KEYWORD_DAILY_LIMIT_REACHED",
+  "error": "Your daily Keyword Generator tool allowance is exhausted. You will be able to use the Keyword Generator tool again tomorrow.",
+  "limit": 10, "used": 10, "plan_slug": "free",
+  "manual_lists_hint": false,
+  "resets_at": "2026-09-12T00:00:00.000Z", "retry_after_seconds": 3600 }
+```
+
+`manual_lists_hint` is true for Optimize and Scale; the plugin then adds a link to its manual keyword
+list screen. Match on `code`, not on the message. The generator is not charged for a 429.
+
+To test: run `generatekeyword` 10 times with a free-plan key; the 11th must return the 429 above,
+and a run that returns 500 must not use up a slot. If migration 019 has not been applied, the server
+logs `[keyword-allowance]` and lets the run through with no daily cap.
+
 ### 2.5 Admin routes (admin auth) — previously wide open
 
 All of these returned **200 to anyone** before this release.
