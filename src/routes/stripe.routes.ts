@@ -1002,7 +1002,7 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
         credit_type: ISEO_CREDIT_TYPE,
         quantity: pkg.credits.toString(),
         package_id: pkg.id,
-        // Which tier was charged, so the ledger row can say "(Free plan rate)"
+        // Which tier was charged, so the ledger row can say "(Basic plan rate)"
         // and support can explain why two identical-looking purchases cost
         // different amounts.
         at_free_rate: (!isSubscriber).toString(),
@@ -1631,7 +1631,34 @@ router.post('/verify-session', async (req: Request, res: Response) => {
 
     if (purchaseType === 'credit_topup') {
       const applied = await applyCreditTopupOnce(session);
-      return res.json({ success: true, type: 'credit_topup', applied });
+      // ── Say WHAT was bought, not only that it was applied ─────────────────
+      // The CMS confirms a Checkout purchase with the same "Credits added"
+      // dialog as a saved-card one, which states the pack, the charge and the
+      // new balance. This used to return only { type, applied }, so every
+      // Checkout purchase fell through to the dialog's last-resort line —
+      // "Your credit purchase was successful." — which QA reported.
+      //
+      // Same shape as the saved-card branch of /buy-credits. Returned whether
+      // or not THIS call applied the grant: the webhook usually wins the claim
+      // before the browser is back, and the purchase happened either way.
+      const topupUserId = parseInt(session.metadata?.user_id || '0');
+      return res.json({
+        success: true,
+        type: 'credit_topup',
+        applied,
+        data: {
+          paid: true,
+          quantity: parseInt(session.metadata?.quantity || '0') || null,
+          package_id: session.metadata?.package_id ?? null,
+          amount: typeof session.amount_total === 'number' ? session.amount_total : null,
+          currency: session.currency || 'usd',
+          // Read back after the grant; a failed read drops one clause of the
+          // confirmation, never the response.
+          balance_after: topupUserId
+            ? await getLiveBalance(topupUserId).then((b) => b.total).catch(() => null)
+            : null,
+        },
+      });
     }
 
     // Redirect-based subscription checkout (create-checkout-session / upgrade-plan).
