@@ -12,6 +12,7 @@ import {
 import { recordTransaction } from '../services/billing/transactions.js';
 import { describeTrialStarted, describeTrialEnded } from '../services/billing/descriptions.js';
 import { TRIAL_DAYS, effectiveTrialEnd, isTrialExpired } from './trial.js';
+import { isLiveStatus } from '../services/billing/subscription-state.js';
 export interface User {
   id: number;
   email: string;
@@ -412,6 +413,60 @@ export const hasBillingAddress = async (user_id: number): Promise<boolean> => {
     throw error;
   }
 };
+/**
+ * Write the address Stripe collected back onto our user row.
+ *
+ * Stripe is the owner now: it collects at checkout and lets the user edit in
+ * the billing portal, which is what allowed the signup field, the dashboard
+ * reminder and the pre-purchase gate to be removed. This keeps OUR copy in
+ * step, because plenty of things still read it — GET /users/address, the
+ * Settings card, and anything that puts an address on our own paperwork.
+ *
+ * A cache, not a second source of truth. Nothing here is authoritative: if it
+ * is stale, the fix is another webhook, and Stripe's copy is the one that goes
+ * on the invoice.
+ *
+ * Partial addresses are IGNORED rather than written. The three-column test
+ * (line1 + city + country) is the same one hasBillingAddress and
+ * GET /users/address use, and half-writing over a complete address would turn
+ * a good record into an unusable one — the exact failure the old gate existed
+ * to prevent.
+ */
+export const syncAddressFromStripe = async (
+  user_id: number,
+  address: {
+    line1?: string | null; line2?: string | null; city?: string | null;
+    state?: string | null; postal_code?: string | null; country?: string | null;
+  } | null | undefined,
+): Promise<boolean> => {
+  if (!address?.line1 || !address?.city || !address?.country) return false;
+
+  try {
+    await sql`
+      UPDATE users
+      SET    address_line1       = ${address.line1},
+             address_line2       = ${address.line2 ?? null},
+             address_city        = ${address.city},
+             address_state       = ${address.state ?? null},
+             address_postal_code = ${address.postal_code ?? null},
+             address_country     = ${address.country},
+             address_updated_at  = NOW()
+      WHERE  id = ${user_id}
+    `;
+    return true;
+  } catch (error: any) {
+    // Migration 003 has not run. Same reasoning as hasBillingAddress: an
+    // un-migrated database is our problem, and it must not turn a completed
+    // payment into a failed webhook that Stripe then retries forever.
+    if (error?.code === '42703') {
+      console.warn('users address columns missing — migration 003 has not run; skipping the Stripe address sync.');
+      return false;
+    }
+    console.error(`Could not sync the Stripe address for user ${user_id}:`, error);
+    return false;
+  }
+};
+
 
 /**
  * Compose the display string from the parts. ONE definition, so `name` can
@@ -898,8 +953,22 @@ export const previewUpgradeCreditGrant = async (
  * Suspend access by zeroing the PLAN (included) credits only — e.g. on a failed renewal
  * or a bad subscription status. Purchased credits are preserved (the user paid for them).
  */
-export const suspendPlanCredits = async (user_id: number, reason = 'Subscription suspended'): Promise<void> => {
-  await sql.begin(async sql => {
+export const suspendPlanCredits = async (
+  user_id: number,
+  reason = 'Subscription suspended',
+  options: {
+    /**
+     * Checked INSIDE the transaction, before anything is voided; returning
+     * false voids nothing. For a caller whose decision can go stale between
+     * reading the account and writing to it — see reconcileTrialCredits.
+     */
+    onlyIf?: (tx: any) => Promise<boolean>;
+  } = {},
+): Promise<boolean> => {
+  // Resolves to whether the suspension ran (false only when `onlyIf` refused).
+  return sql.begin(async sql => {
+    if (options.onlyIf && !(await options.onlyIf(sql))) return false;
+
     // ── Void the LOTS, not the cache ──────────────────────────────────────
     // This zeroed credit_balances.included_remaining and nothing else. Once the
     // balance became derived, that stopped suspending anything at all: the next
@@ -935,6 +1004,8 @@ export const suspendPlanCredits = async (user_id: number, reason = 'Subscription
         VALUES (${user_id}, ${ISEO_CREDIT_TYPE}, ${-voided}, ${reason})
       `;
     }
+
+    return true;
   });
 };
 
@@ -943,6 +1014,45 @@ export const isFreePlanId = async (plan_id?: number | null): Promise<boolean> =>
   if (!plan_id) return true;
   const rows = await sql`SELECT price_cents FROM subscription_plans WHERE id = ${plan_id} LIMIT 1`;
   return !rows[0] || Number(rows[0].price_cents) === 0;
+};
+
+/**
+ * Is this account STILL on the free tier with no paid subscription running?
+ * Read inside the suspension's transaction, with the user row locked.
+ *
+ * ── WHY reconcileTrialCredits CANNOT TRUST ITS OWN ARGUMENT ─────────────────
+ * It is handed a user row loaded at the START of a request. Coming back from
+ * Stripe, the CMS fires /users/by-email, /users/credits and friends while
+ * /verify-session (or the subscription webhook) is activating the new plan.
+ * A request that loaded the account a moment earlier still holds the free
+ * plan_id, sees the freshly granted Grow lot as "trial credits left", voids
+ * it, and writes "Free trial ended — moved to Basic plan" — onto a customer
+ * who has just paid for Grow. QA saw exactly that row.
+ *
+ * ── WHY THE LOCK MAKES IT SAFE ──────────────────────────────────────────────
+ * activateSubscriptionInDb writes the subscriptions row, then UPDATE users,
+ * then refills plan credits. Holding the users row FOR UPDATE here means:
+ *   • activation already updated users → this reads the paid plan and refuses;
+ *   • it had not → its UPDATE waits for this commit, so the refill lands AFTER
+ *     the trial credits are voided, never before.
+ * The live-subscription check covers the window between its two writes.
+ *
+ * Same "free" rule as isFreePlanId: no plan, an unknown plan, or a $0 plan.
+ */
+const stillOnFreeTierLocked = async (tx: any, user_id: number): Promise<boolean> => {
+  const rows = await tx`
+    SELECT sp.price_cents
+    FROM users u
+    LEFT JOIN subscription_plans sp ON sp.id = u.plan_id
+    WHERE u.id = ${user_id}
+    FOR UPDATE OF u
+  `;
+  if (rows.length === 0) return false;
+  const price = rows[0].price_cents;
+  if (price !== null && price !== undefined && Number(price) !== 0) return false;
+
+  const subs = await tx`SELECT status FROM subscriptions WHERE user_id = ${user_id}`;
+  return !subs.some((s: { status: string | null }) => isLiveStatus(s.status));
 };
 
 /**
@@ -967,7 +1077,16 @@ export const reconcileTrialCredits = async (
     LIMIT 1
   `;
   if (pending.length > 0) {
-    await suspendPlanCredits(user.id, 'Trial expired');
+    // Re-checked under a lock rather than trusted from `user`, which was loaded
+    // when the request began — see stillOnFreeTierLocked for the race this
+    // closes: a just-paid Grow grant voided, and "Free trial ended" written onto
+    // an account that had subscribed.
+    const suspended = await suspendPlanCredits(user.id, 'Trial expired', {
+      onlyIf: (tx) => stillOnFreeTierLocked(tx, user.id),
+    });
+    // It subscribed after this request read it: paying, not an expired trial.
+    // Nothing voided, and no activity row.
+    if (!suspended) return false;
 
     // Written HERE, inside the one-time suspension, not beside the `return true`
     // below. This function runs on every authenticated plugin request and keeps

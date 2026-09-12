@@ -16,6 +16,7 @@ import {
   suspendPlanCredits,
   getFreePlanId,
   hasBillingAddress,
+  syncAddressFromStripe,
   previewUpgradeCreditGrant,
   getLiveBalance,
   ISEO_CREDIT_TYPE
@@ -71,32 +72,26 @@ const priceForPlan = (
 };
 
 /**
- * Guard for the money-moving endpoints: no billing address, no purchase.
+ * ── THE BILLING-ADDRESS GATE IS GONE, DELIBERATELY ─────────────────────────
  *
- * Client decision — a billing address is mandatory, because without one we
- * cannot calculate tax or issue a valid invoice for the sale.
+ * There used to be a blockedForMissingAddress() guard here, refusing every
+ * money-moving request from an account with no address on file, plus a signup
+ * field, a dashboard reminder and a dialog in the CMS to get one.
  *
- * Returns true when it has ALREADY answered the request, so callers read as:
- *   if (await blockedForMissingAddress(user_id, res)) return;
+ * All of it existed to satisfy Stripe. Stripe collects the address itself at
+ * checkout now (billing_address_collection: 'required' on every session
+ * below), writes it onto the Customer, and lets the user edit it later in the
+ * billing portal — so the address arrives at the moment it is actually needed,
+ * from the system that needs it, and four places asking for it in advance were
+ * four places to get it wrong.
  *
- * The `code` is what the CMS keys off to show "add your address" rather than a
- * generic failure, so it must stay stable.
+ * What replaced it: the collection flags on the sessions, syncAddressFromStripe
+ * keeping our copy in step from the checkout.session.completed and
+ * customer.updated webhooks, and POST /billing-portal for later edits.
  *
- * NOT applied to cancel/pause/resume, or to adding a card: none of them take
- * money, and gating them would trap a user with no address inside a
- * subscription they want out of.
+ * hasBillingAddress() is still exported and still read by GET /users/address,
+ * which reports whether we hold one. It no longer BLOCKS anything.
  */
-const BILLING_ADDRESS_REQUIRED = 'BILLING_ADDRESS_REQUIRED';
-
-async function blockedForMissingAddress(user_id: number, res: Response): Promise<boolean> {
-  if (await hasBillingAddress(user_id)) return false;
-  res.status(400).json({
-    success: false,
-    error: 'Add your billing address before making a purchase. We need it to calculate tax and issue a valid invoice.',
-    code: BILLING_ADDRESS_REQUIRED,
-  });
-  return true;
-}
 import { sendEmail, emailTemplates } from '../services/email.service.js';
 import {
   ensureDefaultPaymentMethod as ensureDefaultPaymentMethodFor,
@@ -765,7 +760,6 @@ const upgradeSchema = z.object({
 router.post('/create-checkout-session', async (req: Request, res: Response) => {
   try {
     const { user_id, price_id, success_url, cancel_url } = createCheckoutSessionSchema.parse(req.body);
-    if (await blockedForMissingAddress(user_id, res)) return;
 
     // Get user email
     const userResult = await sql`SELECT email FROM users WHERE id = ${user_id}`;
@@ -781,6 +775,11 @@ router.post('/create-checkout-session', async (req: Request, res: Response) => {
     // Create Stripe checkout session
     const session = await stripe.checkout.sessions.create({
       customer_email: userEmail,
+      // Stripe collects the billing address at checkout, so nothing has to be
+      // demanded at signup or gated before a purchase. It is REQUIRED rather
+      // than auto: the reason we ask at all is tax and a valid invoice, and
+      // 'auto' asks only where the card brand happens to require it.
+      billing_address_collection: 'required',
       payment_method_types: ['card'],
       line_items: [
         {
@@ -880,7 +879,6 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
     const {
       user_id, package_id, quantity, success_url, cancel_url, payment_method_id,
     } = buyCreditSchema.parse(req.body);
-    if (await blockedForMissingAddress(user_id, res)) return;
 
     // Get user email
     const userResult = await sql`SELECT email FROM users WHERE id = ${user_id}`;
@@ -968,6 +966,11 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
     // Create Stripe checkout session for one-time payment
     const session = await stripe.checkout.sessions.create({
       customer_email: userEmail,
+      // Stripe collects the billing address at checkout, so nothing has to be
+      // demanded at signup or gated before a purchase. It is REQUIRED rather
+      // than auto: the reason we ask at all is tax and a valid invoice, and
+      // 'auto' asks only where the card brand happens to require it.
+      billing_address_collection: 'required',
       payment_method_types: ['card'],
       line_items: [
         {
@@ -999,7 +1002,7 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
         credit_type: ISEO_CREDIT_TYPE,
         quantity: pkg.credits.toString(),
         package_id: pkg.id,
-        // Which tier was charged, so the ledger row can say "(Free plan rate)"
+        // Which tier was charged, so the ledger row can say "(Basic plan rate)"
         // and support can explain why two identical-looking purchases cost
         // different amounts.
         at_free_rate: (!isSubscriber).toString(),
@@ -1036,7 +1039,6 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
 router.post('/upgrade-plan', async (req: Request, res: Response) => {
   try {
     const { user_id, new_plan_id, success_url, cancel_url } = upgradeSchema.parse(req.body);
-    if (await blockedForMissingAddress(user_id, res)) return;
 
     // Get user and current subscription
     const userResult = await sql`SELECT email FROM users WHERE id = ${user_id}`;
@@ -1065,6 +1067,11 @@ router.post('/upgrade-plan', async (req: Request, res: Response) => {
     // For now, we'll create a checkout session with plan details
     const session = await stripe.checkout.sessions.create({
       customer_email: userEmail,
+      // Stripe collects the billing address at checkout, so nothing has to be
+      // demanded at signup or gated before a purchase. It is REQUIRED rather
+      // than auto: the reason we ask at all is tax and a valid invoice, and
+      // 'auto' asks only where the card brand happens to require it.
+      billing_address_collection: 'required',
       payment_method_types: ['card'],
       line_items: [
         {
@@ -1163,6 +1170,16 @@ router.post('/webhook', async (req: Request, res: Response) => {
         const userId = parseInt(session.metadata?.user_id || '0');
         const purchaseType = session.metadata?.purchase_type;
 
+        // The address Stripe just collected, onto our row. This is what
+        // replaced asking at signup and gating the purchase — the user gives
+        // it once, at the moment it is actually needed, and we learn it here.
+        // client_reference_id covers the sessions that carry the user there
+        // instead of in metadata.
+        const addressUserId = userId || parseInt(session.client_reference_id || '0');
+        if (addressUserId) {
+          await syncAddressFromStripe(addressUserId, session.customer_details?.address);
+        }
+
         if (purchaseType === 'credit_topup') {
           // Idempotent (session-keyed) so a later /verify-session call can't double-credit.
           await applyCreditTopupOnce(session);
@@ -1178,6 +1195,21 @@ router.post('/webhook', async (req: Request, res: Response) => {
           `;
 
           console.log(`✅ Updated user ${userId} plan to ${planId} (will be activated on subscription.created)`);
+        }
+        break;
+      }
+
+      // The billing portal is where a user changes their address after the
+      // fact (POST /billing-portal), and this is how we hear about it. Without
+      // this case the portal would edit Stripe's copy and leave ours stale —
+      // which is precisely the drift that made keeping our own form the wrong
+      // answer to 'how does the user update their address?'.
+      case 'customer.updated': {
+        const customer = event.data.object as Stripe.Customer;
+        const uid = parseInt(customer.metadata?.user_id || '0');
+        if (uid) {
+          const synced = await syncAddressFromStripe(uid, customer.address);
+          if (synced) console.log('Address synced from Stripe for user ' + uid + '.');
         }
         break;
       }
@@ -1599,7 +1631,34 @@ router.post('/verify-session', async (req: Request, res: Response) => {
 
     if (purchaseType === 'credit_topup') {
       const applied = await applyCreditTopupOnce(session);
-      return res.json({ success: true, type: 'credit_topup', applied });
+      // ── Say WHAT was bought, not only that it was applied ─────────────────
+      // The CMS confirms a Checkout purchase with the same "Credits added"
+      // dialog as a saved-card one, which states the pack, the charge and the
+      // new balance. This used to return only { type, applied }, so every
+      // Checkout purchase fell through to the dialog's last-resort line —
+      // "Your credit purchase was successful." — which QA reported.
+      //
+      // Same shape as the saved-card branch of /buy-credits. Returned whether
+      // or not THIS call applied the grant: the webhook usually wins the claim
+      // before the browser is back, and the purchase happened either way.
+      const topupUserId = parseInt(session.metadata?.user_id || '0');
+      return res.json({
+        success: true,
+        type: 'credit_topup',
+        applied,
+        data: {
+          paid: true,
+          quantity: parseInt(session.metadata?.quantity || '0') || null,
+          package_id: session.metadata?.package_id ?? null,
+          amount: typeof session.amount_total === 'number' ? session.amount_total : null,
+          currency: session.currency || 'usd',
+          // Read back after the grant; a failed read drops one clause of the
+          // confirmation, never the response.
+          balance_after: topupUserId
+            ? await getLiveBalance(topupUserId).then((b) => b.total).catch(() => null)
+            : null,
+        },
+      });
     }
 
     // Redirect-based subscription checkout (create-checkout-session / upgrade-plan).
@@ -1718,7 +1777,6 @@ router.post('/subscribe-to-plan', async (req: Request, res: Response) => {
     }).parse(req.body);
 
     // First subscription is always a purchase.
-    if (await blockedForMissingAddress(user_id, res)) return;
 
     // Get user and plan
     const [userResult, planResult] = await Promise.all([
@@ -2016,7 +2074,6 @@ router.post('/create-subscription-checkout', async (req: Request, res: Response)
     // A subscription is a purchase, so the same address rule applies here as on
     // every other money-moving endpoint. Checked BEFORE any Stripe object is
     // created, so a blocked user leaves nothing behind.
-    if (await blockedForMissingAddress(user_id, res)) return;
 
     const [userResult, planResult] = await Promise.all([
       sql`SELECT id, email, stripe_customer_id FROM users WHERE id = ${user_id}`,
@@ -2081,6 +2138,13 @@ router.post('/create-subscription-checkout', async (req: Request, res: Response)
 
     const session = await stripe.checkout.sessions.create({
       customer: customerId,
+      // Stripe collects the billing address here — that is what replaced the
+      // signup field, the dashboard reminder and the pre-purchase gate.
+      billing_address_collection: 'required',
+      // …and writes it back onto the Customer, so the address the user gave
+      // at checkout is the one on the account afterwards. Without this the
+      // Customer keeps whatever it had, and the next invoice is issued against a stale one.
+      customer_update: { address: 'auto' },
       mode: 'subscription',
       line_items: [{ price: priceId, quantity: 1 }],
       // The card is kept on the customer, so renewals and every later upgrade
@@ -2491,7 +2555,6 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     // REDUCING their spend, which is the wrong way round. Reactivation below is
     // likewise not a new charge. Cancelling has its own endpoint and is never
     // gated, so nobody can be trapped in a subscription.
-    if (isUpgrade && await blockedForMissingAddress(user_id, res)) return;
 
     // ── RE-PICKING THE PLAN A DOWNGRADE IS ALREADY QUEUED FOR ─────────────────
     // Scale → Optimize is scheduled, and Optimize is chosen a second time. This
@@ -3390,6 +3453,68 @@ router.get('/payment-methods/:user_id', async (req: Request, res: Response) => {
 });
 
 /**
+ * Send the user to Stripe's billing portal.
+ * POST /api/v1/stripe/billing-portal
+ *
+ * ── THE ANSWER TO "HOW DOES A USER UPDATE THEIR ADDRESS?" ───────────────────
+ * Stripe now collects the billing address at checkout, which is what let the
+ * signup field, the dashboard reminder and the pre-purchase gate go away. That
+ * left one question: what happens when the address later changes.
+ *
+ * The portal is the answer, rather than keeping our own form and writing
+ * through to Stripe. A form of ours would be a second place the address lives,
+ * and the two would drift the moment a user edited it in a Stripe-hosted
+ * receipt or an invoice — leaving the one WE hold on invoices being wrong in
+ * exactly the situation it matters. The portal edits the Customer directly, so
+ * there is one copy and Stripe owns it.
+ *
+ * It also carries what a payment surface has to and we would otherwise build:
+ * card management, invoice history, and SCA where the region demands it.
+ *
+ * A customer is created on demand, so this works for an account that has never
+ * paid — otherwise "update my address" would be unavailable to exactly the
+ * people who have not been to checkout yet.
+ */
+router.post('/billing-portal', async (req: Request, res: Response) => {
+  try {
+    const { user_id, return_url } = z.object({
+      user_id: z.number(),
+      return_url: z.string().url(),
+    }).parse(req.body);
+
+    const rows = await sql`SELECT email, stripe_customer_id FROM users WHERE id = ${user_id}`;
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const user = rows[0];
+    let customerId = user.stripe_customer_id as string | null;
+
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email as string,
+        metadata: { user_id: user_id.toString() },
+      });
+      customerId = customer.id;
+      await sql`UPDATE users SET stripe_customer_id = ${customerId} WHERE id = ${user_id}`;
+    }
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url,
+    });
+
+    return res.json({ success: true, url: session.url });
+  } catch (error) {
+    console.error('Billing portal session error:', error);
+    return res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to open the billing portal',
+    });
+  }
+});
+
+/**
  * Create setup session for adding payment method
  * POST /api/v1/stripe/create-setup-session
  */
@@ -3430,6 +3555,13 @@ router.post('/create-setup-session', async (req: Request, res: Response) => {
     // Create setup session
     const session = await stripe.checkout.sessions.create({
       customer: customerId,
+      // Stripe collects the billing address here — that is what replaced the
+      // signup field, the dashboard reminder and the pre-purchase gate.
+      billing_address_collection: 'required',
+      // …and writes it back onto the Customer, so the address the user gave
+      // at checkout is the one on the account afterwards. Without this the
+      // Customer keeps whatever it had, and a card added here would leave the account with none.
+      customer_update: { address: 'auto' },
       payment_method_types: ['card'],
       mode: 'setup',
       success_url: success_url,

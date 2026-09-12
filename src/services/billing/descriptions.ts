@@ -140,8 +140,10 @@ const formatMoneyCents = (cents: number, currency = 'usd'): string => {
 export const describeTrialStarted = (days: number): string =>
   `Free trial started — ${days} day${days === 1 ? '' : 's'}`;
 
+// The free tier is sold as the Basic plan now (the CMS renamed it), so new
+// activity rows name it the same way. Rows already written keep their text.
 export const describeTrialEnded = (): string =>
-  'Free trial ended — moved to Free plan';
+  'Free trial ended — moved to Basic plan';
 
 export const describeSubscriptionStarted = (plan: string | null | undefined): string =>
   withPlan('Subscription started', plan);
@@ -195,7 +197,7 @@ export const describePlanDowngraded = (
  * needs to see why the amounts differ.
  */
 export const describeCreditPurchase = (credits: number, atFreeRate = false): string =>
-  `Credit pack purchase — ${credits.toLocaleString()} credits${atFreeRate ? ' (Free plan rate)' : ''}`;
+  `Credit pack purchase — ${credits.toLocaleString()} credits${atFreeRate ? ' (Basic plan rate)' : ''}`;
 
 export const describeRefund = (): string => 'Refund — issued by support';
 
