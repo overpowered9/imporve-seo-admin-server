@@ -30,7 +30,8 @@ import {
   getLiveBalance,
   getCreditLotSummary,
   clearWebsiteConnection,
-  ensureSignupGrant
+  ensureSignupGrant,
+  hasPasswordCredential
 } from '../models/user.models.js';
 
 const router = express.Router();
@@ -265,7 +266,10 @@ router.post('/by-email', async (req, res) => {
         scheduled_publishing: userWithPlan?.scheduled_publishing,
         course_access: userWithPlan?.course_access,
         oauth_provider: user.oauth_provider || null,
-        has_password: !!user.password_hash,
+        // Was `!!user.password_hash`, which is NULL for every web email signup
+        // (supabase.auth.signUp + trigger), so those accounts were told they
+        // had no password. Supabase Auth is checked too — see the helper.
+        has_password: await hasPasswordCredential(user),
         credits,
         websites_count: websites.length,
         created_at: user.created_at,

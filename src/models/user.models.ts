@@ -349,6 +349,47 @@ export const ensureSignupGrant = async (
   }
 };
 
+/**
+ * Does this account have a password? Drives `has_password` on /users/by-email,
+ * which decides whether Settings asks for the current password or offers to
+ * set a first one.
+ *
+ * ── WHY password_hash ALONE WAS WRONG ───────────────────────────────────────
+ * It was `!!user.password_hash`. Only /auth/signup (plugin) and
+ * /auth/set-password write that column. A WEB email signup goes through
+ * supabase.auth.signUp(); the users row comes from the handle_new_user trigger
+ * and password_hash stays NULL. Every such account was told "You don't have a
+ * password yet" and was not asked for its current password before changing it.
+ *
+ * The password those accounts sign in with lives in Supabase Auth, so that is
+ * checked too: a non-empty auth.users.encrypted_password. It is empty for a
+ * Google-only account, which is still correctly reported as having none.
+ *
+ * Returns null when the lookup fails. Unknown must never read as false: the CMS
+ * treats anything but false as "has a password" and keeps the check.
+ */
+export const hasPasswordCredential = async (
+  user: { id: number; email: string; password_hash?: string | null },
+  deps: {
+    db?: (strings: TemplateStringsArray, ...values: any[]) => Promise<any[]>;
+  } = {},
+): Promise<boolean | null> => {
+  if (user.password_hash) return true;
+  const db = deps.db ?? sql;
+  try {
+    // bool_or across rows: auth.users is not unique on email for SSO accounts.
+    const rows = await db`
+      SELECT COALESCE(bool_or(encrypted_password IS NOT NULL AND encrypted_password <> ''), false) AS has_password
+      FROM auth.users
+      WHERE lower(email) = lower(${user.email})
+    `;
+    return !!(rows[0] as any)?.has_password;
+  } catch (err) {
+    console.error(`⚠️ Could not read the auth password state for user ${user.id}:`, err);
+    return null;
+  }
+};
+
 export const getUserWithPlan = async (user_id: number) => {
   const result = await sql`
     SELECT 
