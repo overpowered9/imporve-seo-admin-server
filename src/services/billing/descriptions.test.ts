@@ -26,7 +26,7 @@ import {
 describe('the requested catalogue, line for line', () => {
   test('every line matches what was specified', () => {
     assert.equal(describeTrialStarted(7), 'Free trial started — 7 days');
-    assert.equal(describeTrialEnded(), 'Free trial ended — moved to Free plan');
+    assert.equal(describeTrialEnded(), 'Free trial ended — moved to Basic plan');
     assert.equal(describeSubscriptionStarted('Grow'), 'Subscription started — Grow plan');
     assert.equal(describeSubscriptionRenewed('Grow'), 'Subscription renewed — Grow plan');
     assert.equal(describeSubscriptionCancelled('Grow'), 'Subscription canceled — Grow plan');
@@ -43,7 +43,7 @@ describe('the requested catalogue, line for line', () => {
     assert.equal(describeCreditPurchase(60), 'Credit pack purchase — 60 credits');
     assert.equal(
       describeCreditPurchase(60, true),
-      'Credit pack purchase — 60 credits (Free plan rate)',
+      'Credit pack purchase — 60 credits (Basic plan rate)',
     );
     assert.equal(describeRefund(), 'Refund — issued by support');
     assert.equal(
