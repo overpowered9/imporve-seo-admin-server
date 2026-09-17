@@ -532,6 +532,20 @@ describe('nameChangeGroups', () => {
     assert.equal(groups[0].from_plan, undefined, 'the current change is named by the route, not here');
   });
 
+  test('a price retired by migration 021 still names its plan', async () => {
+    // Existing subscribers keep billing on the old shared-product prices.
+    const sql = createFakeSql();
+    sql.when(/FROM subscription_plans/, [
+      { name: 'Grow', stripe_price_id: 'price_grow_new', stripe_price_id_yearly: null, legacy_stripe_price_ids: ['price_grow_old'] },
+      { name: 'Starter Plan', stripe_price_id: 'price_optimize', stripe_price_id_yearly: null },
+    ]);
+    const groups = await nameChangeGroups(sql, [
+      { at: PERIOD_START, is_current: false, amount_cents: 0, charge_cents: 0, credit_cents: 0, from_price_id: 'price_grow_old', to_price_id: 'price_optimize' },
+    ]);
+    assert.equal(groups[0].from_plan, 'Grow');
+    assert.equal(groups[0].to_plan, 'Starter Plan');
+  });
+
   test('a lookup failure still returns the groups unnamed', async () => {
     const sql = createFakeSql().failOn(/FROM subscription_plans/);
     const groups = await nameChangeGroups(sql, [

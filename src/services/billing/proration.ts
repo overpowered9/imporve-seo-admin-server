@@ -593,7 +593,8 @@ export async function chargeProrationNow(
  * Stripe's line says "ImproveSEO Subscription" — the product, not the plan — so
  * "your change from Grow to Optimize" cannot come from the description. It
  * comes from the PRICE on each line, looked up against subscription_plans
- * (monthly or yearly price). That is an exact lookup.
+ * (monthly, yearly, or a price the plan was sold at before migration 021).
+ * That is an exact lookup.
  *
  * It replaced a join on billing_disclosures.proration_date, which stopped being
  * able to work once proration became day-aligned: two changes on the same day
@@ -610,21 +611,20 @@ export async function nameChangeGroups(
   const earlier = groups.filter((g) => !g.is_current && (g.from_price_id || g.to_price_id));
   if (earlier.length === 0) return groups;
 
-  const priceIds = [...new Set(earlier.flatMap((g) => [g.from_price_id, g.to_price_id]))]
-    .filter((id): id is string => !!id);
-
   try {
-    const rows = await sql`
-      SELECT name, stripe_price_id, stripe_price_id_yearly
-      FROM   subscription_plans
-      WHERE  stripe_price_id = ANY(${priceIds})
-         OR  stripe_price_id_yearly = ANY(${priceIds})
-    `;
+    // Every plan row, matched here rather than in SQL: a subscriber who joined
+    // before migration 021 is still billed on a price now listed only in
+    // `legacy_stripe_price_ids`, and reading the column off `*` keeps this
+    // working on a database where that migration has not run yet. The table
+    // holds a handful of rows.
+    const rows = await sql`SELECT * FROM subscription_plans`;
 
     const nameFor = (priceId?: string | null): string | null => {
       if (!priceId) return null;
       const row = (rows as any[]).find(
-        (r) => r.stripe_price_id === priceId || r.stripe_price_id_yearly === priceId,
+        (r) => r.stripe_price_id === priceId
+          || r.stripe_price_id_yearly === priceId
+          || (Array.isArray(r.legacy_stripe_price_ids) && r.legacy_stripe_price_ids.includes(priceId)),
       );
       return row?.name ?? null;
     };

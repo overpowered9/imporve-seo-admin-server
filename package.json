@@ -44,7 +44,8 @@
     "migrate:signup-emails": "tsx src/migrations/017-signup-email-columns.ts",
     "migrate:websites-domain-index": "tsx src/migrations/018-websites-domain-index.ts",
     "migrate:keyword-daily-usage": "tsx src/migrations/019-keyword-daily-usage.ts",
-    "migrate:website-limits-v2": "tsx src/migrations/020-plan-website-limits-v2.ts"
+    "migrate:website-limits-v2": "tsx src/migrations/020-plan-website-limits-v2.ts",
+    "migrate:plan-stripe-products": "tsx src/migrations/021-plan-stripe-products.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",
