@@ -34,7 +34,7 @@ app.set('trust proxy', 1);
 const corsOptions = {
   origin: true, // Allow all origins
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization', 'x-api-key', 'x-site-code'],
+  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization', 'x-api-key', 'x-site-code', 'x-site-domain'],
   credentials: true
 };
 

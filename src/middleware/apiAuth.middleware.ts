@@ -6,6 +6,44 @@ export interface AuthenticatedRequest extends Request {
   website?: any;
 }
 
+/** Strips scheme, "www.", path, query, trailing dot and port so "https://www.example.com/" and "example.com:443" compare equal. */
+function normalizeDomain(input: string): string {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .replace(/[/?#].*$/, '')
+    .replace(/:\d+$/, '')
+    .replace(/\.$/, '');
+}
+
+/**
+ * How hard the site_code ↔ domain check bites. Set ISEO_DOMAIN_ENFORCEMENT in the environment.
+ *
+ *   'log'     (default) — compare and record mismatches, but let every request through.
+ *   'enforce'           — reject a mismatch with 403.
+ *   'off'               — skip the check entirely.
+ *
+ * Defaults to 'log' ON PURPOSE. This check sits in the middleware that gates EVERY
+ * authenticated route, so a false positive doesn't degrade one feature — it takes the whole
+ * product down for that site at once (generation, credits, status, heartbeat). And
+ * `websites.domain` is a self-reported string that has never been load-bearing until now:
+ * it is set once at signup and there is no endpoint to edit it (websites.routes.ts has only
+ * POST and DELETE), so a customer whose stored domain is stale — site migrated, staging
+ * clone, moved to a subdomain, typed sloppily — cannot fix it themselves; they would have to
+ * delete and re-add the website to get a new site_code.
+ *
+ * So: deploy on 'log', grep for ISEO_DOMAIN_MISMATCH to see how many REAL requests would have
+ * been rejected and whether they are genuine misconfigurations or our own normalization
+ * failing, then flip to 'enforce' via the env var — no code deploy needed.
+ *
+ * NOTE this is a misconfiguration guard, NOT a security control: x-site-domain is asserted by
+ * the plugin, and anyone who controls the WordPress install can send whatever they like.
+ * It stops the wrong site code being pasted into the wrong site. It stops nothing malicious.
+ */
+const DOMAIN_ENFORCEMENT = (process.env.ISEO_DOMAIN_ENFORCEMENT || 'log').toLowerCase();
+
 /**
  * Authenticate a plugin request by API Key + Site Code.
  *
@@ -49,10 +87,48 @@ const authenticate = ({ stampConnection }: { stampConnection: boolean }) =>
       });
     }
 
-    // Optional: Verify origin matches website domain
-    if (origin && !origin.includes(website.domain)) {
-      console.warn(`Origin mismatch: ${origin} vs ${website.domain}`);
-      // You might want to enforce this check or just log it
+    // Verify the site code was actually issued for the domain making this request.
+    //
+    // Without this, any site code active on this account authenticates from ANY of the
+    // account's domains — e.g. site-a.com's plugin install could paste in site-b.com's
+    // site code and both would resolve here identically, since findWebsiteByCode only
+    // checks account ownership, never the caller's domain.
+    //
+    // x-site-domain is the plugin declaring its own home_url() host explicitly, sent on its
+    // SERVER-side calls. Origin/Referer is the fallback, and carries the browser-side calls
+    // (keyword generation posts straight from wp-admin to this API) — those deliberately do
+    // not send the custom header, because it would join the CORS preflight and a plugin
+    // update landing before this deploy would break them outright.
+    //
+    // Exact match after normalization: the old `origin.includes(website.domain)` was a
+    // substring test, so "evil-example.com" satisfied a check against "example.com".
+    //
+    // No domain signal at all stays permissive — that is every request from a not-yet-updated
+    // plugin, and refusing them would lock out sites that are correctly connected today.
+    // website.domain being empty is treated the same way: a legacy row with no domain
+    // recorded must not reject the one site it actually belongs to.
+    const claimedDomain = (req.headers['x-site-domain'] as string) || origin;
+
+    if (DOMAIN_ENFORCEMENT !== 'off' && claimedDomain && website.domain) {
+      const claimed = normalizeDomain(claimedDomain);
+      const registered = normalizeDomain(website.domain);
+
+      if (claimed !== registered) {
+        // One greppable line per mismatch — this is the signal that says whether flipping
+        // ISEO_DOMAIN_ENFORCEMENT to 'enforce' would break real customers.
+        console.warn(
+          `ISEO_DOMAIN_MISMATCH mode=${DOMAIN_ENFORCEMENT} user=${user.id} website=${website.id} ` +
+          `site_code=${site_code} registered=${registered} claimed=${claimed} ` +
+          `source=${req.headers['x-site-domain'] ? 'x-site-domain' : 'origin'} path=${req.originalUrl}`
+        );
+
+        if (DOMAIN_ENFORCEMENT === 'enforce') {
+          return res.status(403).json({
+            success: false,
+            error: "This Site Code does not belong to this website's domain."
+          });
+        }
+      }
     }
 
     // ── Connection heartbeat ────────────────────────────────────────────────
