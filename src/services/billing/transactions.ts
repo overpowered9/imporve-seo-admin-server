@@ -217,6 +217,64 @@ export async function fetchCheckoutReceiptUrl(
 }
 
 /**
+ * What the FIRST invoice of a new subscription charged, and its receipt.
+ *
+ * ── WHY THE "SUBSCRIBED" ROW NEEDS THIS ─────────────────────────────────────
+ * activateSubscriptionInDb writes the `subscription_create` row with no amount
+ * and no receipt, and left invoice.payment_succeeded to fill both in. That
+ * webhook can only do so once it finds our subscriptions row — and Stripe does
+ * not order events, so on a Checkout signup the invoice routinely arrives
+ * FIRST, finds nothing, is marked processed, and is never retried. QA's Grow
+ * signup showed exactly that: the row, with a blank amount and no receipt link.
+ *
+ * Reading the invoice at activation puts both on the row in the same write,
+ * whichever event comes first. The webhook still upserts the same key, so it
+ * can only confirm them.
+ *
+ * Only a PAID `subscription_create` invoice counts: any other latest invoice
+ * (a later renewal, when this runs from a replayed event) is not this row's.
+ */
+export function firstInvoiceCharge(invoice: any): {
+  amountCents: number; currency: string; receiptUrl: string | null;
+} | null {
+  if (!invoice || typeof invoice === 'string') return null;
+  if (invoice.billing_reason !== 'subscription_create' || invoice.status !== 'paid') return null;
+  const amount = invoice.amount_paid ?? invoice.amount_due;
+  if (typeof amount !== 'number' || !Number.isFinite(amount)) return null;
+  return {
+    amountCents: amount,
+    currency: invoice.currency || 'usd',
+    receiptUrl: invoice.hosted_invoice_url || invoice.invoice_pdf || null,
+  };
+}
+
+type SubscriptionRetriever = {
+  subscriptions: { retrieve: (id: string, params?: any) => Promise<any> };
+};
+
+/**
+ * Re-read a subscription with its latest invoice expanded, and pick out the
+ * first charge. NEVER THROWS — this runs after the customer has paid; a Stripe
+ * hiccup costs the row its amount (which the webhook can still supply), never
+ * the activation.
+ */
+export async function fetchFirstInvoiceCharge(
+  stripe: SubscriptionRetriever,
+  subscriptionId: string | null | undefined,
+): Promise<ReturnType<typeof firstInvoiceCharge>> {
+  if (!subscriptionId) return null;
+  try {
+    const subscription = await stripe.subscriptions.retrieve(subscriptionId, {
+      expand: ['latest_invoice'],
+    });
+    return firstInvoiceCharge(subscription?.latest_invoice);
+  } catch (error) {
+    console.error(`[billing] could not read the first invoice of ${subscriptionId}:`, error);
+    return null;
+  }
+}
+
+/**
  * Turn a Stripe invoice into ledger rows.
  *
  * An upgrade invoice carries BOTH a credit for unused time and a charge for the

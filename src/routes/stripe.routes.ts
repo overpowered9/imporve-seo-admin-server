@@ -114,6 +114,7 @@ import {
   settlePendingPlanChanges,
   isRenewalInvoice,
   fetchCheckoutReceiptUrl,
+  fetchFirstInvoiceCharge,
   readLedger,
 } from '../services/billing/transactions.js';
 import {
@@ -346,9 +347,15 @@ const activateSubscriptionInDb = async (params: {
   // transactions.ts) so the eventual invoice webhook settles this same row
   // in place — filling in the real amount/receipt via recordTransaction's
   // COALESCE upsert — rather than creating a second, redundant-looking row
-  // for the same one-time event. amountCents is unknown at this synchronous
-  // point (no invoice has necessarily been read yet); the settle fills it in.
+  // for the same one-time event.
+  //
+  // OLD: "amountCents is unknown at this synchronous point (no invoice has
+  // necessarily been read yet); the settle fills it in." It often never did —
+  // the invoice webhook can arrive before the subscriptions row it looks up
+  // exists, and is not retried — so QA saw a Grow signup with no amount and no
+  // receipt. The first invoice is now read here; see fetchFirstInvoiceCharge.
   try {
+    const firstCharge = await fetchFirstInvoiceCharge(stripe, stripeSubscriptionId);
     await recordTransaction(sql, {
       userId,
       type: 'subscription_create',
@@ -357,6 +364,9 @@ const activateSubscriptionInDb = async (params: {
       providerEventId: `subscription_create:${stripeSubscriptionId}`,
       providerObjectId: stripeSubscriptionId,
       planId,
+      amountCents: firstCharge?.amountCents ?? null,
+      currency: firstCharge?.currency ?? null,
+      receiptUrl: firstCharge?.receiptUrl ?? null,
     });
   } catch (ledgerError) {
     // recordTransaction never throws; this guards anything around it. A

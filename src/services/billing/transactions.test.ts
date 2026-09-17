@@ -15,6 +15,8 @@ import {
   isRenewalInvoice,
   receiptUrlFromSession,
   fetchCheckoutReceiptUrl,
+  firstInvoiceCharge,
+  fetchFirstInvoiceCharge,
   readLedger,
 } from './transactions.js';
 
@@ -548,5 +550,50 @@ describe('receipt links for credit purchases', () => {
     };
     assert.equal(await fetchCheckoutReceiptUrl(stripe, null), null);
     assert.equal(called, false, 'must not call Stripe with an empty id');
+  });
+});
+
+describe('the first charge of a new subscription', () => {
+  const paidFirst = {
+    id: 'in_first', billing_reason: 'subscription_create', status: 'paid',
+    amount_paid: 950, currency: 'usd', hosted_invoice_url: 'https://invoice/1',
+  };
+
+  test('a paid first invoice gives the amount, currency and hosted invoice link', () => {
+    assert.deepEqual(firstInvoiceCharge(paidFirst), {
+      amountCents: 950, currency: 'usd', receiptUrl: 'https://invoice/1',
+    });
+  });
+
+  test('falls back to the PDF when there is no hosted page', () => {
+    const { hosted_invoice_url, ...rest } = paidFirst;
+    assert.equal(firstInvoiceCharge({ ...rest, invoice_pdf: 'https://pdf/1' })?.receiptUrl, 'https://pdf/1');
+  });
+
+  test("only a PAID subscription_create invoice is this row's", () => {
+    assert.equal(firstInvoiceCharge({ ...paidFirst, billing_reason: 'subscription_cycle' }), null);
+    assert.equal(firstInvoiceCharge({ ...paidFirst, status: 'open' }), null);
+    assert.equal(firstInvoiceCharge('in_first'), null, 'an unexpanded id is not an invoice');
+    assert.equal(firstInvoiceCharge(null), null);
+  });
+
+  test('reads the subscription with its latest invoice expanded', async () => {
+    let seen: any = null;
+    const stripe = {
+      subscriptions: {
+        retrieve: async (id: string, params: any) => {
+          seen = { id, params };
+          return { id, latest_invoice: paidFirst };
+        },
+      },
+    };
+    assert.equal((await fetchFirstInvoiceCharge(stripe, 'sub_1'))?.amountCents, 950);
+    assert.deepEqual(seen, { id: 'sub_1', params: { expand: ['latest_invoice'] } });
+  });
+
+  test('never throws — a Stripe failure costs the amount, not the activation', async () => {
+    const stripe = { subscriptions: { retrieve: async () => { throw new Error('down'); } } };
+    assert.equal(await fetchFirstInvoiceCharge(stripe, 'sub_1'), null);
+    assert.equal(await fetchFirstInvoiceCharge(stripe, null), null);
   });
 });
