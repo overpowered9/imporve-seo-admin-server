@@ -13,7 +13,7 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { periodEndOf, periodEndOrWarn } from './subscription-period.js';
+import { periodEndOf, periodEndOrWarn, periodStartOf } from './subscription-period.js';
 
 /** The live shape: period on the item, nothing at the top level. */
 const CLOVER_SUBSCRIPTION = {
@@ -79,6 +79,23 @@ describe('periodEndOf', () => {
         `expected ${String(bad)} to be rejected`,
       );
     }
+  });
+});
+
+describe('periodStartOf', () => {
+  test('reads the start from the items, earliest first', () => {
+    assert.equal(periodStartOf({
+      items: { data: [{ current_period_start: 1787900000 }, { current_period_start: 1787817600 }] },
+    }), 1787817600);
+  });
+
+  test('falls back to the pre-2025 top-level field', () => {
+    assert.equal(periodStartOf({ current_period_start: 1787817600, items: { data: [{}] } }), 1787817600);
+  });
+
+  test('null when Stripe said nothing', () => {
+    assert.equal(periodStartOf({ items: { data: [{}] } }), null);
+    assert.equal(periodStartOf(null), null);
   });
 });
 

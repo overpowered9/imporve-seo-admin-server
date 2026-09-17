@@ -12,7 +12,10 @@ import assert from 'node:assert/strict';
 import { createFakeSql } from '../../test/helpers/fake-sql.js';
 import { createFakeStripe } from '../../test/helpers/fake-stripe.js';
 import {
+  chargeProrationNow,
+  dayAlignedProrationDate,
   groupProrationLines,
+  nameChangeGroups,
   isProrationLine,
   sumProrationLines,
   describeProrationLines,
@@ -103,6 +106,7 @@ describe('describeProrationLines', () => {
       // Null, not absent: this fixture predates Stripe sending a period, and
       // the grouper has to cope with exactly that shape.
       period_start: null,
+      price_id: null,
     });
   });
 });
@@ -368,5 +372,214 @@ describe('groupProrationLines', () => {
 
   test('no lines, no groups', () => {
     assert.deepEqual(groupProrationLines([], AUG_24), []);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Whole-day proration
+//
+// QA upgraded Optimize → Scale about half an hour into a 30-day period and was
+// quoted $49.42 / −$24.97 for "the 30 days left". Stripe prorates to the second;
+// aligning the proration instant to the start of the billing day makes the same
+// arithmetic whole-day: $49.50 / −$25.00.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DAY = 86_400;
+const PERIOD_START = 1787817600; // 27 Aug 2026 08:00:00 UTC, say
+
+describe('dayAlignedProrationDate', () => {
+  test('half an hour into the period prices from the period start', () => {
+    assert.equal(dayAlignedProrationDate(PERIOD_START, PERIOD_START + 1800), PERIOD_START);
+  });
+
+  test('counts whole days from the period start, not from UTC midnight', () => {
+    const tenDaysAndFiveHours = PERIOD_START + 10 * DAY + 5 * 3600;
+    assert.equal(dayAlignedProrationDate(PERIOD_START, tenDaysAndFiveHours), PERIOD_START + 10 * DAY);
+  });
+
+  test('exactly on a day boundary stays on it', () => {
+    assert.equal(dayAlignedProrationDate(PERIOD_START, PERIOD_START + 3 * DAY), PERIOD_START + 3 * DAY);
+  });
+
+  test('THE POINT: day 0 of a 30-day period is exactly the full price and half of it', () => {
+    // What Stripe does with the instant: price × (end − instant) / (end − start).
+    const end = PERIOD_START + 30 * DAY;
+    const at = dayAlignedProrationDate(PERIOD_START, PERIOD_START + 1800);
+    const share = (cents: number) => Math.round(cents * (end - at) / (end - PERIOD_START));
+    assert.equal(share(4950), 4950);
+    assert.equal(-share(2500), -2500);
+  });
+
+  test('an unknown or future period start falls back to now rather than inventing a date', () => {
+    const now = PERIOD_START + 1234;
+    assert.equal(dayAlignedProrationDate(null, now), now);
+    assert.equal(dayAlignedProrationDate(undefined, now), now);
+    assert.equal(dayAlignedProrationDate(now + 10, now), now);
+  });
+});
+
+describe('previewUpgrade — day alignment', () => {
+  test('prices from the start of the billing day when the period start is known', async () => {
+    const stripe = createFakeStripe();
+    stripe.preview.lines = CLOVER_LINES;
+    const periodStart = Math.floor(Date.now() / 1000) - 3 * DAY - 1800;
+
+    const result = await previewUpgrade(stripe.api, {
+      customerId: 'cus_1', subscriptionId: 'sub_1', subscriptionItemId: 'si_1', newPriceId: 'price_x',
+      periodStart,
+    });
+
+    assert.equal(result.prorationDate, periodStart + 3 * DAY);
+    const call = stripe.callsTo('invoices.createPreview')[0];
+    assert.equal(call.args[0].subscription_details.proration_date, periodStart + 3 * DAY);
+  });
+
+  test('an explicit proration date (the replayed quote) still wins', async () => {
+    const stripe = createFakeStripe();
+    stripe.preview.lines = CLOVER_LINES;
+    const result = await previewUpgrade(stripe.api, {
+      customerId: 'cus_1', subscriptionId: 'sub_1', subscriptionItemId: 'si_1', newPriceId: 'price_x',
+      prorationDate: 1770000000, periodStart: 1760000000,
+    });
+    assert.equal(result.prorationDate, 1770000000);
+  });
+});
+
+describe('describeProrationLines — price', () => {
+  test('reads the price from the clover pricing block, id or expanded', () => {
+    const [a, b] = describeProrationLines([
+      { amount: -100, parent: { subscription_item_details: { proration: true } }, pricing: { price_details: { price: 'price_grow' } } },
+      { amount: 200, parent: { subscription_item_details: { proration: true } }, pricing: { price_details: { price: { id: 'price_optimize' } } } },
+    ]);
+    assert.equal(a.price_id, 'price_grow');
+    assert.equal(b.price_id, 'price_optimize');
+  });
+});
+
+// Two upgrades on the SAME day now share one proration instant. Grow → Optimize
+// whose charge failed (so it is still pending), then Optimize → Scale.
+const SAME_DAY = [
+  { description: 'Unused time on ImproveSEO Subscription', amount_cents: -2500, period_start: PERIOD_START, price_id: 'price_optimize' },
+  { description: 'Remaining time on ImproveSEO Subscription', amount_cents: 4950, period_start: PERIOD_START, price_id: 'price_scale' },
+  { description: 'Unused time on ImproveSEO Subscription', amount_cents: -1000, period_start: PERIOD_START, price_id: 'price_grow' },
+  { description: 'Remaining time on ImproveSEO Subscription', amount_cents: 2500, period_start: PERIOD_START, price_id: 'price_optimize' },
+];
+const SAME_DAY_PRICES = { newPriceId: 'price_scale', currentPriceId: 'price_optimize' };
+
+describe('groupProrationLines — same-day changes', () => {
+  test('separates this change from an earlier one sharing its instant', () => {
+    const groups = groupProrationLines(SAME_DAY, PERIOD_START, SAME_DAY_PRICES);
+    assert.equal(groups.length, 2);
+    assert.equal(groups[0].is_current, true);
+    assert.equal(groups[0].charge_cents, 4950);
+    assert.equal(groups[0].credit_cents, -2500);
+    assert.equal(groups[0].amount_cents, 2450);
+    assert.equal(groups[1].is_current, false);
+    assert.equal(groups[1].amount_cents, 1500);
+  });
+
+  test('THE INVARIANT still holds: the groups add up to the total', () => {
+    const groups = groupProrationLines(SAME_DAY, PERIOD_START, SAME_DAY_PRICES);
+    assert.equal(
+      groups.reduce((n, g) => n + g.amount_cents, 0),
+      SAME_DAY.reduce((n, l) => n + l.amount_cents, 0),
+    );
+  });
+
+  test('carries the prices each change moved between', () => {
+    const [current, earlier] = groupProrationLines(SAME_DAY, PERIOD_START, SAME_DAY_PRICES);
+    assert.equal(current.from_price_id, 'price_optimize');
+    assert.equal(current.to_price_id, 'price_scale');
+    assert.equal(earlier.from_price_id, 'price_grow');
+    assert.equal(earlier.to_price_id, 'price_optimize');
+  });
+
+  test('an earlier same-day chain reads as its two ends', () => {
+    // Grow → Optimize → Scale, both unpaid, then Scale → Pro now.
+    const lines = [
+      { description: '', amount_cents: -1000, period_start: PERIOD_START, price_id: 'price_grow' },
+      { description: '', amount_cents: 2500, period_start: PERIOD_START, price_id: 'price_optimize' },
+      { description: '', amount_cents: -2500, period_start: PERIOD_START, price_id: 'price_optimize' },
+      { description: '', amount_cents: 4950, period_start: PERIOD_START, price_id: 'price_scale' },
+      { description: '', amount_cents: -4950, period_start: PERIOD_START, price_id: 'price_scale' },
+      { description: '', amount_cents: 9900, period_start: PERIOD_START, price_id: 'price_pro' },
+    ];
+    const [, earlier] = groupProrationLines(lines, PERIOD_START, { newPriceId: 'price_pro', currentPriceId: 'price_scale' });
+    assert.equal(earlier.from_price_id, 'price_grow');
+    assert.equal(earlier.to_price_id, 'price_scale');
+  });
+
+  test('without prices the old instant-based grouping is unchanged', () => {
+    const groups = groupProrationLines(DOUBLE_UPGRADE, AUG_24, SAME_DAY_PRICES);
+    assert.equal(groups.length, 2);
+    assert.equal(groups[0].amount_cents, 2219);
+  });
+});
+
+describe('nameChangeGroups', () => {
+  test('names earlier changes by price, monthly or yearly', async () => {
+    const sql = createFakeSql();
+    sql.when(/FROM subscription_plans/, [
+      { name: 'Grow Plan', stripe_price_id: 'price_grow', stripe_price_id_yearly: 'price_grow_y' },
+      { name: 'Starter Plan', stripe_price_id: 'price_optimize', stripe_price_id_yearly: null },
+    ]);
+    const groups = await nameChangeGroups(sql, [
+      { at: PERIOD_START, is_current: true, amount_cents: 0, charge_cents: 0, credit_cents: 0, from_price_id: 'price_optimize', to_price_id: 'price_scale' },
+      { at: PERIOD_START, is_current: false, amount_cents: 0, charge_cents: 0, credit_cents: 0, from_price_id: 'price_grow_y', to_price_id: 'price_optimize' },
+    ]);
+    assert.equal(groups[1].from_plan, 'Grow Plan');
+    assert.equal(groups[1].to_plan, 'Starter Plan');
+    assert.equal(groups[0].from_plan, undefined, 'the current change is named by the route, not here');
+  });
+
+  test('a lookup failure still returns the groups unnamed', async () => {
+    const sql = createFakeSql().failOn(/FROM subscription_plans/);
+    const groups = await nameChangeGroups(sql, [
+      { at: PERIOD_START, is_current: false, amount_cents: 1500, charge_cents: 2500, credit_cents: -1000, from_price_id: 'price_grow' },
+    ]);
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].amount_cents, 1500);
+  });
+});
+
+describe('chargeProrationNow', () => {
+  const fakeInvoices = (amountDue: number) => {
+    const calls: Record<string, any[]> = { create: [], pay: [], voidInvoice: [] };
+    const api = {
+      invoices: {
+        async create(params: any) { calls.create.push(params); return { id: 'in_1', amount_due: amountDue, currency: 'usd' }; },
+        async pay(id: string) {
+          calls.pay.push(id);
+          return { id, status: 'paid', amount_paid: amountDue, currency: 'usd', hosted_invoice_url: 'https://receipt' };
+        },
+        async voidInvoice(id: string) { calls.voidInvoice.push(id); return { id }; },
+      },
+    };
+    return { api: api as any, calls };
+  };
+
+  test('REGRESSION: the invoice includes the pending proration items', async () => {
+    // Without this flag Stripe excludes pending items, the invoice totals $0,
+    // it is voided, and the upgrade is reported paid while nothing is collected.
+    const { api, calls } = fakeInvoices(2450);
+    await chargeProrationNow(api, { customerId: 'cus_1', subscriptionId: 'sub_1' });
+    assert.equal(calls.create[0].pending_invoice_items_behavior, 'include');
+    assert.equal(calls.create[0].subscription, 'sub_1');
+  });
+
+  test('pays what the invoice carries', async () => {
+    const { api, calls } = fakeInvoices(2450);
+    const charge = await chargeProrationNow(api, { customerId: 'cus_1', subscriptionId: 'sub_1' });
+    assert.deepEqual(calls.pay, ['in_1']);
+    assert.equal(charge.paid, true);
+    assert.equal(charge.amountCents, 2450);
+  });
+
+  test('a genuinely empty invoice is voided, not paid', async () => {
+    const { api, calls } = fakeInvoices(0);
+    const charge = await chargeProrationNow(api, { customerId: 'cus_1', subscriptionId: 'sub_1' });
+    assert.deepEqual(calls.voidInvoice, ['in_1']);
+    assert.equal(calls.pay.length, 0);
+    assert.equal(charge.amountCents, 0);
   });
 });

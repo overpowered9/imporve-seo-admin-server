@@ -106,7 +106,7 @@ import {
   releaseOrphanedSchedules,
   isLiveStatus,
 } from '../services/billing/subscription-state.js';
-import { periodEndOf, periodEndOrWarn } from '../services/billing/subscription-period.js';
+import { periodEndOf, periodEndOrWarn, periodStartOf } from '../services/billing/subscription-period.js';
 import {
   recordTransaction,
   transactionsFromInvoice,
@@ -122,6 +122,7 @@ import {
   settleDisclosure,
   isProrationLine,
   chargeProrationNow,
+  dayAlignedProrationDate,
   groupProrationLines,
   nameChangeGroups,
   type ProrationQuote,
@@ -2379,12 +2380,15 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
     }
 
     // Every figure below comes from Stripe. See services/billing/proration.ts
-    // for why none of it is computed here.
+    // for why none of it is computed here. The period start lets the quote be
+    // priced from the start of today's billing day rather than to the second
+    // (dayAlignedProrationDate).
     const quote = await previewUpgrade(stripe, {
       customerId: stripeSubscription.customer as string,
       subscriptionId: currentSub.stripe_subscription_id,
       subscriptionItemId: itemId,
       newPriceId: newPlan.stripe_price_id,
+      periodStart: periodStartOf(stripeSubscription),
     });
 
     // ── The period this quote is priced against ──────────────────────────────
@@ -2414,12 +2418,15 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
     //
     // Grouped by the change that produced each pair of lines, so a second
     // upgrade in the same period reads as two decisions rather than four
-    // accounting entries, and named from our own disclosure records because
-    // Stripe's line says only "ImproveSEO Subscription".
+    // accounting entries, and named from each line's price because Stripe's
+    // description says only "ImproveSEO Subscription". The prices also pick out
+    // this change's pair when an earlier one shares today's proration instant.
     const changes = await nameChangeGroups(
       sql,
-      user_id,
-      groupProrationLines(quote.lines, quote.prorationDate),
+      groupProrationLines(quote.lines, quote.prorationDate, {
+        newPriceId: newPlan.stripe_price_id,
+        currentPriceId: stripeSubscription.items.data[0]?.price?.id ?? null,
+      }),
     );
 
     // The balance the grant lands on. Read here rather than in the dialog: that
@@ -2433,11 +2440,13 @@ router.post('/preview-plan-change', async (req: Request, res: Response) => {
       console.error('⚠️ Could not read the balance for the upgrade preview:', balanceErr);
     }
 
-    // Whole days left, for "the N days left in this period". Ceil so a change
-    // made with a few hours to run still reads as "1 day" rather than "0".
+    // Whole days left, for "the N days left in this period" — measured from the
+    // SAME instant Stripe priced (the start of today's billing day), so the
+    // label and the amounts describe one window. Ceil only matters in the
+    // fallback where the period start was unknown and pricing stayed per-second.
     const daysRemaining = periodEndIso
       ? Math.max(0, Math.ceil(
-        (new Date(periodEndIso).getTime() - Date.now()) / 86_400_000,
+        (new Date(periodEndIso).getTime() - quote.prorationDate * 1000) / 86_400_000,
       ))
       : null;
 
@@ -2817,11 +2826,20 @@ router.post('/change-plan', async (req: Request, res: Response) => {
         // production.
         //
         // The right answer is to handle the rejection. We send the quoted
-        // timestamp; if Stripe refuses it as out of range, we retry once
-        // WITHOUT it, which is exactly the old behaviour. The customer gets an
-        // exact quote in the overwhelmingly common case and a working upgrade
-        // in the rare stale one, instead of one or the other by configuration.
-        const applyPlanChange = (withProrationDate: boolean) =>
+        // timestamp; if Stripe refuses it as out of range (the period renewed
+        // while the dialog was open), we retry once with the start of today's
+        // billing day in the NEW period. The customer gets an exact quote in the
+        // overwhelmingly common case and a working upgrade in the rare stale
+        // one, instead of one or the other by configuration.
+        //
+        // Never plain "now": that is per-second proration, whose odd cents are
+        // what dayAlignedProrationDate exists to remove. A caller that skipped
+        // the preview is priced the same whole-day way.
+        const alignedToday = () => dayAlignedProrationDate(
+          periodStartOf(stripeSubscription),
+          Math.floor(Date.now() / 1000),
+        );
+        const applyPlanChange = (prorationDate: number) =>
           stripe.subscriptions.update(currentSub.stripe_subscription_id!, {
             items: [{
               id: stripeSubscription.items.data[0].id,
@@ -2830,11 +2848,11 @@ router.post('/change-plan', async (req: Request, res: Response) => {
             proration_behavior: isUpgrade ? 'create_prorations' : 'none',
             billing_cycle_anchor: 'unchanged', // Keep same billing date
             cancel_at_period_end: false,
-            ...(withProrationDate && isUpgrade && proration_date ? { proration_date } : {}),
+            ...(isUpgrade ? { proration_date: prorationDate } : {}),
           }, idempotencyKeyFor('change-plan', user_id, idempotency_key));
 
         try {
-          await applyPlanChange(true);
+          await applyPlanChange(proration_date ?? alignedToday());
         } catch (prorationError: any) {
           // Only an out-of-range proration_date is retried. Anything else —
           // a declined card, a missing price — must surface, or a real failure
@@ -2847,10 +2865,10 @@ router.post('/change-plan', async (req: Request, res: Response) => {
 
           console.warn(
             `⚠️ Quoted proration_date ${proration_date} was rejected as out of range for user ${user_id}; ` +
-            'repricing at now. The customer may be charged marginally differently from the quote — ' +
-            'settleDisclosure below will record it if so.',
+            'repricing from the start of today in the current period. The customer may be charged ' +
+            'differently from the quote — settleDisclosure below will record it if so.',
           );
-          await applyPlanChange(false);
+          await applyPlanChange(alignedToday());
         }
 
         console.log(`✅ Stripe subscription updated successfully`);
@@ -2915,6 +2933,18 @@ router.post('/change-plan', async (req: Request, res: Response) => {
               ? `charge-proration:${user_id}:${idempotency_key}`
               : undefined,
           });
+          // A "paid" $0 against a proration the preview says is owed means the
+          // invoice collected nothing — the failure chargeProrationNow had
+          // before it included pending items. Report it as not collected, so
+          // the ledger says pending instead of claiming a payment that did not
+          // happen; Stripe still bills the item on the renewal invoice.
+          if (charge.paid && charge.amountCents === 0 && (proratedCents ?? 0) > 0) {
+            console.error(
+              `🚨 Upgrade invoice for user ${user_id} collected $0 while ${proratedCents} was owed; `
+              + 'recording the charge as pending.',
+            );
+            charge = { ...charge, paid: false, error: 'invoice collected nothing' };
+          }
           if (charge.paid) {
             console.log(`💳 Prorated charge of ${charge.amountCents} collected for user ${user_id}`);
             // What Stripe actually took beats the preview's estimate.

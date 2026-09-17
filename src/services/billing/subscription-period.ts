@@ -72,6 +72,26 @@ export function periodEndOf(subscription: SubscriptionLike | null | undefined): 
 }
 
 /**
+ * The START of the current billing period, in unix SECONDS, or null.
+ *
+ * Same shape rules as periodEndOf. The MINIMUM across items, because the period
+ * a proration has to fall inside began when the earliest item's did. Upgrade
+ * proration is aligned to whole days counted from here — see
+ * dayAlignedProrationDate.
+ */
+export function periodStartOf(subscription: SubscriptionLike | null | undefined): number | null {
+  if (!subscription) return null;
+
+  const items: any[] = (subscription as any)?.items?.data ?? [];
+  const itemStarts = items
+    .map((item) => asTimestamp(item?.current_period_start))
+    .filter((start): start is number => start !== null);
+  if (itemStarts.length > 0) return Math.min(...itemStarts);
+
+  return asTimestamp((subscription as any).current_period_start);
+}
+
+/**
  * The same, but loud about coming back empty.
  *
  * Callers write this to next_billing_date, so "we could not tell" has to be

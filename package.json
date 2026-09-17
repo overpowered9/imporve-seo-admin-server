@@ -28,6 +28,7 @@
     "backfill:receipts": "tsx src/scripts/backfill-credit-purchase-receipts.ts",
     "backfill:credit-expiry": "tsx src/scripts/backfill-credit-expiry.ts",
     "backfill:billing-dates": "tsx src/scripts/backfill-next-billing-date.ts",
+    "report:pending-prorations": "tsx src/scripts/report-pending-upgrade-prorations.ts",
     "seed:expiring": "tsx src/scripts/seed-expiring-credits.ts",
     "migrations:print": "tsx src/scripts/print-migrations.ts",
     "monitor:ledger-gaps": "tsx src/scripts/check-ledger-gaps.ts",

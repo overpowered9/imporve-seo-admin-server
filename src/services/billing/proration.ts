@@ -47,6 +47,16 @@ export interface PreviewLine {
    * (13–19 digits) is written there. A millisecond timestamp is 13 digits.
    */
   period_start?: number | null;
+  /**
+   * The Stripe price this line prorates. A charge line carries the plan moved
+   * TO, a credit line the plan moved FROM.
+   *
+   * Needed since proration became day-aligned: two upgrades on the same day
+   * share one proration instant, so `period_start` alone can no longer tell
+   * this change's pair from an earlier one. The price, read with the sign,
+   * can — and it names the plans exactly, with no lookup by time.
+   */
+  price_id?: string | null;
 }
 
 /**
@@ -71,7 +81,10 @@ export interface ChangeGroup {
   charge_cents: number;
   /** The credit half (time unused on the old plan), negative. */
   credit_cents: number;
-  /** Filled in by the route from our own records; Stripe does not know them. */
+  /** The price credited back (plan left) and charged (plan joined), when known. */
+  from_price_id?: string | null;
+  to_price_id?: string | null;
+  /** Filled in from subscription_plans by price; Stripe's line names only the product. */
   from_plan?: string | null;
   to_plan?: string | null;
 }
@@ -179,7 +192,54 @@ export const describeProrationLines = (lines: any[]): PreviewLine[] =>
     // listing four raw lines. Optional because older previews — and the test
     // fixtures written before this existed — have no period at all.
     period_start: typeof line?.period?.start === 'number' ? line.period.start : null,
+    price_id: priceIdOf(line),
   }));
+
+/**
+ * The price a previewed line prorates, across API shapes: clover puts it under
+ * pricing.price_details (an id, or the object when expanded); older payloads
+ * carry a top-level `price`.
+ */
+const priceIdOf = (line: any): string | null => {
+  const candidate = line?.pricing?.price_details?.price ?? line?.price ?? null;
+  if (typeof candidate === 'string') return candidate;
+  if (candidate && typeof candidate.id === 'string') return candidate.id;
+  return null;
+};
+
+const DAY_SECONDS = 86_400;
+
+/**
+ * The proration instant for a plan change: the start of today's BILLING day.
+ *
+ * ── WHY NOT "NOW" ───────────────────────────────────────────────────────────
+ * Stripe prorates to the second. Priced at "now", an upgrade made half an hour
+ * into a 30-day period quoted "Scale plan for the 30 days left — $49.42" and
+ * "Unused time on Optimize — −$24.97": correct to the second, and read by
+ * everyone as a miscalculation, because the label counts whole days and the
+ * amounts did not.
+ *
+ * Stripe has no whole-day proration setting, but it accepts any
+ * `proration_date` inside the current period. Snapping to a whole number of
+ * days after the period start makes Stripe's own arithmetic whole-day: the
+ * change counts from the start of today, so the customer pays for today on the
+ * new plan and is credited today on the old one. Day 0 of a 30-day period is
+ * then exactly $49.50 and −$25.00.
+ *
+ * Periods that are not 30 days still produce cents (30 of 31 days of $49.50 is
+ * $47.90). That is whole-day maths, not drift.
+ *
+ * Returns `nowSec` unchanged when the period start is unknown or in the future,
+ * so a malformed subscription degrades to the old per-second pricing rather
+ * than to a date Stripe would reject.
+ */
+export function dayAlignedProrationDate(periodStart: number | null | undefined, nowSec: number): number {
+  if (typeof periodStart !== 'number' || !Number.isFinite(periodStart) || periodStart > nowSec) {
+    return nowSec;
+  }
+  const wholeDays = Math.floor((nowSec - periodStart) / DAY_SECONDS);
+  return periodStart + wholeDays * DAY_SECONDS;
+}
 
 /**
  * The proration lines, grouped into the changes that produced them.
@@ -195,40 +255,81 @@ export const describeProrationLines = (lines: any[]): PreviewLine[] =>
  * Lines with no period at all collapse into one group with `at: null`. That is
  * the pre-2025 payload shape and the older test fixtures; treating them as the
  * current change keeps the single-upgrade case rendering exactly as before.
+ *
+ * ── SAME-DAY CHANGES ────────────────────────────────────────────────────────
+ * Proration is day-aligned (dayAlignedProrationDate), so two upgrades made on
+ * the same day carry the SAME instant and cannot be told apart by time. When
+ * `prices` is given, this change's pair is picked out by price and sign
+ * instead: the charge on the plan being bought, the credit on the plan being
+ * left. Anything else at that instant is an earlier change still unpaid.
  */
 export function groupProrationLines(
   lines: PreviewLine[],
   currentProrationDate?: number | null,
+  prices?: { newPriceId?: string | null; currentPriceId?: string | null },
 ): ChangeGroup[] {
-  const byInstant = new Map<number | null, ChangeGroup>();
+  // Matched with a tolerance because /change-plan may retry with a re-aligned
+  // proration_date when Stripe rejects the quoted one as out of range.
+  const TOLERANCE_SECONDS = 120;
+  const nearCurrent = (at: number | null) =>
+    typeof currentProrationDate === 'number' && at != null
+    && Math.abs(at - currentProrationDate) <= TOLERANCE_SECONDS;
+
+  const newPriceId = prices?.newPriceId ?? null;
+  const currentPriceId = prices?.currentPriceId ?? null;
+  const isCurrentPair = (line: PreviewLine, at: number | null) =>
+    !!newPriceId && !!currentPriceId && nearCurrent(at) && (
+      (line.amount_cents >= 0 && line.price_id === newPriceId)
+      || (line.amount_cents < 0 && line.price_id === currentPriceId)
+    );
+  const matchesByPrice = lines.some((line) =>
+    isCurrentPair(line, typeof line.period_start === 'number' ? line.period_start : null));
+
+  const byKey = new Map<string, ChangeGroup & { credited: string[]; charged: string[] }>();
 
   for (const line of lines) {
     const at = typeof line.period_start === 'number' ? line.period_start : null;
-    const existing = byInstant.get(at) ?? {
+    const key = matchesByPrice && isCurrentPair(line, at) ? 'current' : `at:${at}`;
+    const existing = byKey.get(key) ?? {
       at,
       is_current: false,
       amount_cents: 0,
       charge_cents: 0,
       credit_cents: 0,
+      credited: [],
+      charged: [],
     };
     existing.amount_cents += line.amount_cents;
     // Split by SIGN rather than by Stripe's wording, which is prose and
     // localised. A negative line is time the customer already paid for.
-    if (line.amount_cents < 0) existing.credit_cents += line.amount_cents;
-    else existing.charge_cents += line.amount_cents;
-    byInstant.set(at, existing);
+    if (line.amount_cents < 0) {
+      existing.credit_cents += line.amount_cents;
+      if (line.price_id) existing.credited.push(line.price_id);
+    } else {
+      existing.charge_cents += line.amount_cents;
+      if (line.price_id) existing.charged.push(line.price_id);
+    }
+    byKey.set(key, existing);
   }
 
-  const groups = [...byInstant.values()];
+  const groups: ChangeGroup[] = [...byKey.entries()].map(([key, { credited, charged, ...group }]) => {
+    // A group holding a chain (Grow → Optimize → Scale, both earlier the same
+    // day) reads as its ends: the price only ever credited is where it started,
+    // the price only ever charged is where it finished.
+    const from = credited.find((p) => !charged.includes(p)) ?? credited[0] ?? null;
+    const to = charged.find((p) => !credited.includes(p)) ?? charged[charged.length - 1] ?? null;
+    return {
+      ...group,
+      is_current: key === 'current',
+      ...(from ? { from_price_id: from } : {}),
+      ...(to ? { to_price_id: to } : {}),
+    };
+  });
 
-  // Which group is the change being made now. Matched with a tolerance because
-  // /change-plan retries WITHOUT the quoted proration_date when Stripe rejects
-  // it as out of range, and Stripe then prices at "now" — seconds adrift.
-  const TOLERANCE_SECONDS = 120;
-  let current: ChangeGroup | undefined;
-  if (typeof currentProrationDate === 'number') {
+  let current = groups.find((g) => g.is_current);
+  if (!current && typeof currentProrationDate === 'number') {
     current = groups
-      .filter((g) => g.at != null && Math.abs(g.at - currentProrationDate) <= TOLERANCE_SECONDS)
+      .filter((g) => nearCurrent(g.at))
       .sort((a, b) => Math.abs((a.at ?? 0) - currentProrationDate)
         - Math.abs((b.at ?? 0) - currentProrationDate))[0];
   }
@@ -346,6 +447,10 @@ export async function settleDisclosure(
  * path can replay it: preview at 10:00:00, commit at 10:00:07, and the amounts
  * differ because seven more seconds of the old plan have been consumed. Showing
  * one number and charging another — even by a cent — is what generates disputes.
+ *
+ * Without an explicit `prorationDate`, the instant is the start of today's
+ * billing day (dayAlignedProrationDate) when `periodStart` is known, so the
+ * quote is whole-day rather than per-second.
  */
 export async function previewUpgrade(
   stripe: Pick<Stripe, 'invoices'> | any,
@@ -355,9 +460,11 @@ export async function previewUpgrade(
     subscriptionItemId: string;
     newPriceId: string;
     prorationDate?: number;
+    periodStart?: number | null;
   },
 ): Promise<{ amountDueCents: number; currency: string; lines: PreviewLine[]; prorationDate: number }> {
-  const prorationDate = params.prorationDate ?? Math.floor(Date.now() / 1000);
+  const prorationDate = params.prorationDate
+    ?? dayAlignedProrationDate(params.periodStart, Math.floor(Date.now() / 1000));
 
   const preview = await stripe.invoices.createPreview({
     customer: params.customerId,
@@ -432,11 +539,20 @@ export async function chargeProrationNow(
   };
 
   try {
-    // `subscription` scopes the draft to this subscription's pending items, so
+    // ── THE PENDING ITEMS MUST BE ASKED FOR ─────────────────────────────────
+    // `invoices.create` does NOT sweep pending invoice items unless told to —
+    // on this API version the default is `exclude`. Without the flag below the
+    // draft came back with zero lines, was voided as "nothing to bill", and this
+    // function reported a paid $0 while the proration stayed pending until the
+    // renewal invoice. The visible symptom: a second upgrade in the same period
+    // quoted the first one's charge again, because it had never been collected.
+    //
+    // `subscription` scopes the sweep to this subscription's pending items, so
     // an unrelated pending item on the customer cannot be swept into it.
     const draft = await stripe.invoices.create({
       customer: params.customerId,
       subscription: params.subscriptionId,
+      pending_invoice_items_behavior: 'include',
       // We pay it explicitly below; letting Stripe advance it too invites a
       // race where both attempt collection.
       auto_advance: false,
@@ -472,23 +588,16 @@ export async function chargeProrationNow(
 }
 
 /**
- * Name the plans behind each change group.
+ * Name the plans behind each earlier change group.
  *
  * Stripe's line says "ImproveSEO Subscription" — the product, not the plan — so
- * "your change from Grow to Optimize" cannot come from the invoice. It comes
- * from our own disclosure record, which stores from_plan_id and to_plan_id and,
- * crucially, the same `proration_date` Stripe stamped onto the lines. That makes
- * this an exact join rather than a guess from the dates in the prose.
+ * "your change from Grow to Optimize" cannot come from the description. It
+ * comes from the PRICE on each line, looked up against subscription_plans
+ * (monthly or yearly price). That is an exact lookup.
  *
- * ── ONLY CONFIRMED DISCLOSURES ──────────────────────────────────────────────
- * A row is written every time the modal is opened, so the table holds far more
- * abandoned quotes than real changes. Only settleDisclosure sets confirmed_at,
- * so that column is what separates "what the customer did" from "what they
- * looked at". Matching an abandoned quote would name a plan they never moved to.
- *
- * Tolerance rather than equality: /change-plan retries WITHOUT the quoted
- * proration_date when Stripe rejects it as stale, and Stripe then prices at
- * "now" — a few seconds adrift from what was recorded.
+ * It replaced a join on billing_disclosures.proration_date, which stopped being
+ * able to work once proration became day-aligned: two changes on the same day
+ * share one instant, so a match by time names the wrong one.
  *
  * Best effort throughout. An unnamed adjustment still shows its amount and its
  * date, which is enough to recognise; failing the whole quote because a label
@@ -496,37 +605,33 @@ export async function chargeProrationNow(
  */
 export async function nameChangeGroups(
   sql: SqlLike,
-  userId: number,
   groups: ChangeGroup[],
 ): Promise<ChangeGroup[]> {
-  const earlier = groups.filter((g) => !g.is_current && g.at != null);
+  const earlier = groups.filter((g) => !g.is_current && (g.from_price_id || g.to_price_id));
   if (earlier.length === 0) return groups;
+
+  const priceIds = [...new Set(earlier.flatMap((g) => [g.from_price_id, g.to_price_id]))]
+    .filter((id): id is string => !!id);
 
   try {
     const rows = await sql`
-      SELECT d.proration_date,
-             fp.name AS from_plan,
-             tp.name AS to_plan
-      FROM   billing_disclosures d
-      LEFT   JOIN subscription_plans fp ON fp.id = d.from_plan_id
-      LEFT   JOIN subscription_plans tp ON tp.id = d.to_plan_id
-      WHERE  d.user_id = ${userId}
-        AND  d.confirmed_at IS NOT NULL
-        AND  d.proration_date IS NOT NULL
-      ORDER  BY d.confirmed_at DESC
-      LIMIT  50
+      SELECT name, stripe_price_id, stripe_price_id_yearly
+      FROM   subscription_plans
+      WHERE  stripe_price_id = ANY(${priceIds})
+         OR  stripe_price_id_yearly = ANY(${priceIds})
     `;
 
-    const TOLERANCE_SECONDS = 120;
+    const nameFor = (priceId?: string | null): string | null => {
+      if (!priceId) return null;
+      const row = (rows as any[]).find(
+        (r) => r.stripe_price_id === priceId || r.stripe_price_id_yearly === priceId,
+      );
+      return row?.name ?? null;
+    };
+
     for (const group of earlier) {
-      const match = (rows as any[])
-        .map((r) => ({ r, delta: Math.abs(Number(r.proration_date) - (group.at as number)) }))
-        .filter((c) => c.delta <= TOLERANCE_SECONDS)
-        .sort((a, b) => a.delta - b.delta)[0];
-      if (match) {
-        group.from_plan = match.r.from_plan ?? null;
-        group.to_plan = match.r.to_plan ?? null;
-      }
+      group.from_plan = nameFor(group.from_price_id);
+      group.to_plan = nameFor(group.to_price_id);
     }
   } catch (err) {
     console.error('⚠️ Could not name earlier plan changes (quote still served):', err);
