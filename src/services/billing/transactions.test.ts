@@ -466,6 +466,31 @@ describe('receipt links for credit purchases', () => {
     assert.equal(receiptUrlFromSession(session), 'https://pay.stripe.com/receipts/abc');
   });
 
+  test('prefers the hosted invoice when the session created one', () => {
+    // Checkout now runs with invoice_creation, so a credit pack links to the
+    // same hosted-invoice page as every subscription purchase instead of the
+    // charge's email-style receipt.
+    const session = {
+      id: 'cs_test_2',
+      invoice: { hosted_invoice_url: 'https://invoice.stripe.com/i/xyz', invoice_pdf: 'https://pdf' },
+      payment_intent: { latest_charge: { receipt_url: 'https://pay.stripe.com/receipts/abc' } },
+    };
+    assert.equal(receiptUrlFromSession(session), 'https://invoice.stripe.com/i/xyz');
+  });
+
+  test('falls back to the charge receipt when there is no usable invoice', () => {
+    const charge = { latest_charge: { receipt_url: 'https://pay.stripe.com/receipts/abc' } };
+    // Older sessions: no invoice at all.
+    assert.equal(receiptUrlFromSession({ invoice: null, payment_intent: charge }), 'https://pay.stripe.com/receipts/abc');
+    // Unexpanded invoice id must not be stored as a URL.
+    assert.equal(receiptUrlFromSession({ invoice: 'in_123', payment_intent: charge }), 'https://pay.stripe.com/receipts/abc');
+    // An invoice not yet finalized has no hosted URL.
+    assert.equal(
+      receiptUrlFromSession({ invoice: { hosted_invoice_url: null }, payment_intent: charge }),
+      'https://pay.stripe.com/receipts/abc',
+    );
+  });
+
   test('an UNEXPANDED payment_intent reads as absent, not as a receipt', () => {
     // This is the shape the webhook actually receives — a bare id string. Had
     // this returned something truthy, we would have stored an id as a URL.
@@ -500,7 +525,7 @@ describe('receipt links for credit purchases', () => {
     assert.equal(await fetchCheckoutReceiptUrl(stripe, 'cs_1'), 'https://r/1');
     // Without the expand the retrieve returns a bare id and this whole thing is
     // a no-op that silently keeps storing null.
-    assert.deepEqual(calls[0].params, { expand: ['payment_intent.latest_charge'] });
+    assert.deepEqual(calls[0].params, { expand: ['invoice', 'payment_intent.latest_charge'] });
   });
 
   test('a Stripe failure returns null instead of throwing', async () => {

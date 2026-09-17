@@ -23,7 +23,7 @@
  */
 import sql from '../data/db.js';
 import Stripe from 'stripe';
-import { receiptUrlFromSession } from '../services/billing/transactions.js';
+import { receiptUrlFromSession, CHECKOUT_RECEIPT_EXPAND } from '../services/billing/transactions.js';
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
   apiVersion: '2025-10-29.clover',
@@ -79,7 +79,7 @@ async function main() {
 
     try {
       const session = await stripe.checkout.sessions.retrieve(sessionId, {
-        expand: ['payment_intent.latest_charge'],
+        expand: CHECKOUT_RECEIPT_EXPAND,
       });
       const receiptUrl = receiptUrlFromSession(session);
 

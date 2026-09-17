@@ -151,24 +151,39 @@ export async function recordTransaction(
  * The receipt link for a one-off Checkout payment.
  *
  * Invoice-backed rows get theirs from `hosted_invoice_url` (see
- * transactionsFromInvoice). A credit top-up has no invoice — it is a Checkout
- * Session in `payment` mode — so its receipt lives one level down, on the
- * charge behind the payment intent. Nothing was reading it, which is why every
- * credit_purchase row in the ledger has a null receipt_url while Stripe has had
- * the URL all along. Those are precisely the rows a customer wants a receipt
- * for; a plan change at least appears on the next invoice.
+ * transactionsFromInvoice). A credit top-up is a Checkout Session in `payment`
+ * mode, which has no invoice UNLESS the session was created with
+ * `invoice_creation` enabled — which /buy-credits now does.
+ *
+ * ── PREFER THE INVOICE ──────────────────────────────────────────────────────
+ * Without an invoice the only link is the charge's `receipt_url`, a different
+ * Stripe page (the email-style "Receipt from ImproveSEO") from the hosted
+ * invoice every subscription, renewal, plan change and saved-card pack links
+ * to. QA reported the two looking different in Account Activity. So the
+ * session's invoice wins, and the charge receipt stays as the fallback for
+ * sessions created before invoice_creation was switched on (and for an invoice
+ * not yet finalized when this runs).
  *
  * Pure, and separate from the fetch below, so the shape-handling is testable
- * without a network: the webhook payload carries `payment_intent` as a bare id
- * string, and an unexpanded field must read as "absent", not as a receipt.
+ * without a network: the webhook payload carries `payment_intent` and `invoice`
+ * as bare id strings, and an unexpanded field must read as "absent", not as a
+ * receipt.
  */
 export function receiptUrlFromSession(session: any): string | null {
+  const invoice = session?.invoice;
+  if (invoice && typeof invoice !== 'string') {
+    const invoiceUrl = invoice.hosted_invoice_url || invoice.invoice_pdf || null;
+    if (invoiceUrl) return invoiceUrl;
+  }
   const intent = session?.payment_intent;
   if (!intent || typeof intent === 'string') return null;
   const charge = intent.latest_charge;
   if (!charge || typeof charge === 'string') return null;
   return charge.receipt_url || null;
 }
+
+/** Everything receiptUrlFromSession reads, expanded. */
+export const CHECKOUT_RECEIPT_EXPAND = ['invoice', 'payment_intent.latest_charge'];
 
 /** The minimum of a Stripe client this needs — structural, like SqlLike. */
 type CheckoutRetriever = {
@@ -192,7 +207,7 @@ export async function fetchCheckoutReceiptUrl(
   if (!sessionId) return null;
   try {
     const session = await stripe.checkout.sessions.retrieve(sessionId, {
-      expand: ['payment_intent.latest_charge'],
+      expand: CHECKOUT_RECEIPT_EXPAND,
     });
     return receiptUrlFromSession(session);
   } catch (error) {

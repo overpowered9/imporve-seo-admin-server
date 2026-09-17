@@ -882,7 +882,7 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
     } = buyCreditSchema.parse(req.body);
 
     // Get user email
-    const userResult = await sql`SELECT email FROM users WHERE id = ${user_id}`;
+    const userResult = await sql`SELECT email, stripe_customer_id FROM users WHERE id = ${user_id}`;
     if (userResult.length === 0) {
       return res.status(404).json({
         success: false,
@@ -891,6 +891,7 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
     }
 
     const userEmail = userResult[0].email;
+    const existingCustomerId = (userResult[0].stripe_customer_id as string | null) || null;
 
     // ── Packages, not per-credit pricing ──────────────────────────────────────
     // This sold `{credit_type, quantity}` at {images: $1, content: $2,
@@ -966,7 +967,12 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
 
     // Create Stripe checkout session for one-time payment
     const session = await stripe.checkout.sessions.create({
-      customer_email: userEmail,
+      // An existing Stripe customer is reused so the invoice below lands on the
+      // same customer as their subscription invoices (and charge.refunded can
+      // find them). Without one, Stripe creates a customer for the invoice.
+      ...(existingCustomerId
+        ? { customer: existingCustomerId }
+        : { customer_email: userEmail }),
       // Stripe collects the billing address at checkout, so nothing has to be
       // demanded at signup or gated before a purchase. It is REQUIRED rather
       // than auto: the reason we ask at all is tax and a valid invoice, and
@@ -994,6 +1000,25 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
         },
       ],
       mode: 'payment',
+      // ── A real invoice, so the receipt matches every other purchase ───────
+      // A payment-mode session on its own produces only a charge, whose receipt
+      // is a different Stripe page from the hosted invoice that subscriptions,
+      // renewals, plan changes and saved-card packs all link to. QA reported the
+      // two looking different in Account Activity. With this, the ledger row
+      // links to this invoice instead (receiptUrlFromSession). The invoice is
+      // paid by the session and has no subscription, so the
+      // invoice.payment_succeeded handler ignores it — no second grant or row.
+      invoice_creation: {
+        enabled: true,
+        invoice_data: {
+          description: 'ImproveSEO credit pack',
+          metadata: {
+            user_id: user_id.toString(),
+            package_id: pkg.id,
+            purchase_type: 'credit_topup',
+          },
+        },
+      },
       success_url: withSessionId(success_url),
       cancel_url: cancel_url,
       metadata: {
