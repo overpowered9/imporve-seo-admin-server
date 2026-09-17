@@ -81,9 +81,19 @@ describe('credit packages', () => {
     assert.equal(packs.length, 2, 'the storefront sells two sizes');
     const [small, medium] = packs;
     assert.equal(small.credits, 60);
-    assert.equal(small.approx_pieces, 3);   // 60 / 19, rounded
+    assert.equal(small.approx_pieces, 3);   // 60 / 19, floored
     assert.equal(medium.credits, 140);
-    assert.equal(medium.approx_pieces, 7);  // 140 / 19, rounded
+    assert.equal(medium.approx_pieces, 7);  // 140 / 19, floored
+  });
+
+  test('piecesForCredits floors, and never goes negative or NaN', async () => {
+    const { piecesForCredits } = (await load()) as any;
+    assert.equal(piecesForCredits(100), 5);   // 5.26 — the trial grant
+    assert.equal(piecesForCredits(1200), 63); // 63.2
+    assert.equal(piecesForCredits(18), 0);    // cannot finish one piece
+    assert.equal(piecesForCredits(0), 0);
+    assert.equal(piecesForCredits(-5), 0);
+    assert.equal(piecesForCredits(NaN), 0);
   });
 
   test('bigger packages are better value per credit', async () => {

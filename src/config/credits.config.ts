@@ -197,6 +197,23 @@ export const creditsPerPiece = (): number =>
     + 0.4 * costs.image_regen,
   );
 
+/**
+ * How many finished pieces a number of credits buys — THE estimate.
+ *
+ * Every "≈ N pieces" figure (CMS balance, plan cards, trial, credit packs, the
+ * plugin's settings panel) comes from here, served by GET /credits/estimate.
+ * They used to be computed in four places with three rounding rules and two
+ * rates, so 100 credits read as 5 pieces in the CMS and 7 in the plugin.
+ *
+ * Floored: a partial piece is not a piece, so the figure is always one the
+ * balance can actually produce.
+ */
+export const piecesForCredits = (credits: number): number => {
+  const c = Number(credits);
+  if (!Number.isFinite(c) || c <= 0) return 0;
+  return Math.floor(c / creditsPerPiece());
+};
+
 /** The top-up packages, frozen. Ordered smallest first for the storefront. */
 const packages: readonly CreditPackage[] = Object.freeze([
   {
@@ -211,7 +228,7 @@ const packages: readonly CreditPackage[] = Object.freeze([
     price_cents: env.ISEO_PACKAGE_MEDIUM_PRICE_CENTS,
     price_cents_free: env.ISEO_PACKAGE_MEDIUM_PRICE_CENTS_FREE,
   },
-].map((p) => Object.freeze({ ...p, approx_pieces: Math.max(1, Math.round(p.credits / creditsPerPiece())) })) as CreditPackage[]);
+].map((p) => Object.freeze({ ...p, approx_pieces: piecesForCredits(p.credits) })) as CreditPackage[]);
 
 export const creditPackages = (): readonly CreditPackage[] => packages;
 
