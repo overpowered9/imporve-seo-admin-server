@@ -11,9 +11,9 @@ import assert from 'node:assert/strict';
 import { createFakeSql } from '../../test/helpers/fake-sql.js';
 import {
   enqueueEmail, claimDueEmails, markSent, markFailed, markSuppressed,
-  suppressionReason, backoffSeconds, MAX_ATTEMPTS,
+  suppressionReason, backoffSeconds, MAX_ATTEMPTS, normalizePayload,
 } from './email-outbox.js';
-import { RENDERERS } from './email-worker.js';
+import { RENDERERS, unrenderedTokensIn } from './email-worker.js';
 import { billingEmailTemplates } from '../email.service.js';
 
 describe('enqueueEmail', () => {
@@ -272,33 +272,251 @@ describe('templates', () => {
     assert.match(out.text, /no remaining credits/);
   });
 
-  test('the placeholder templates are unmistakably not final copy', () => {
-    // BILL-007/008 require obvious placeholder text so nobody ships it by
-    // accident believing it was reviewed.
-    const expiry = billingEmailTemplates.creditsExpiringPlaceholder({
-      firstName: 'Sam', expiringAmount: '50 content credits', expiryDate: 'September 1, 2026',
-      remainingAfter: '10 credits', ctaUrl: 'https://x', leadTimeLabel: 'in 14 days',
+  test('the lifecycle templates carry final copy, not placeholders', () => {
+    // This assertion is INVERTED from what it used to say. It previously
+    // required the word PLACEHOLDER to be present, which was the right test
+    // while the copy was unwritten — but the gate that was supposed to keep
+    // those templates off a real domain had already been switched on, so the
+    // next account to cross a 14-day expiry boundary would have received them.
+    const expiry = billingEmailTemplates.creditsExpiring({
+      firstName: 'Sam', expiringAmount: '50 plan credits', expiryDate: 'September 1, 2026',
+      remainingAfter: '10 credits', ctaUrl: 'https://x', leadTimeLabel: 'in 14 days', pieces: 7,
     });
-    assert.match(expiry.subject, /PLACEHOLDER/);
-    assert.match(expiry.html, /PLACEHOLDER/);
+    assert.doesNotMatch(expiry.subject, /PLACEHOLDER/i);
+    assert.doesNotMatch(expiry.html, /PLACEHOLDER/i);
+    assert.match(expiry.text, /50 plan credits/);
+    assert.match(expiry.text, /September 1, 2026/);
+    assert.match(expiry.text, /7 complete articles/, 'the balance is translated into work the reader recognises');
 
-    const inactivity = billingEmailTemplates.inactivityPlaceholder({
+    const inactivity = billingEmailTemplates.inactivityNudge({
       firstName: 'Sam', creditBalance: '120 credits', nearestExpiry: 'September 1, 2026',
       planName: 'Grow', ctaUrl: 'https://x',
     });
-    assert.match(inactivity.subject, /PLACEHOLDER/);
-    // …but the DATA is real, so the copy owner can see what they are writing around.
+    assert.doesNotMatch(inactivity.subject, /PLACEHOLDER/i);
     assert.match(inactivity.text, /120 credits/);
     assert.match(inactivity.text, /Grow/);
+
+    const trial = billingEmailTemplates.trialEnded({ firstName: 'Sam', ctaUrl: 'https://x' });
+    assert.doesNotMatch(trial.subject, /PLACEHOLDER/i);
+    assert.match(trial.text, /Free plan/);
+  });
+
+  test('a null optional field never reaches the reader as the word "null"', () => {
+    // The worker refuses to send anything containing "null", so a template that
+    // interpolates an absent field does not produce an ugly email — it produces
+    // a dead letter and no email at all. Every optional field must be branched
+    // on, and this is the test that keeps that true as templates are added.
+    const noExpiry = billingEmailTemplates.inactivityNudge({
+      firstName: 'Sam', creditBalance: '120 credits', nearestExpiry: null,
+      planName: 'Grow', ctaUrl: 'https://x',
+    });
+    assert.deepEqual(unrenderedTokensIn(noExpiry), []);
+
+    const openEndedPause = billingEmailTemplates.billingPaused({
+      firstName: 'Sam', planName: 'Grow', resumesOn: null,
+      creditsNote: 'Your credits stay on your account.', billingUrl: 'https://x',
+    });
+    assert.deepEqual(unrenderedTokensIn(openEndedPause), []);
+
+    const noCard = billingEmailTemplates.refundIssued({
+      firstName: 'Sam', amountRefunded: '$49.00', reasonLabel: 'your Grow subscription',
+      cardBrand: null, cardLast4: null, arrivalWindow: '5–10 business days',
+      creditsNote: null, billingUrl: 'https://x',
+    });
+    assert.deepEqual(unrenderedTokensIn(noCard), []);
+    assert.match(noCard.text, /your card on file/, 'an unknown card is described honestly, not omitted');
+  });
+});
+
+/**
+ * REGRESSION — "Welcome to undefined".
+ *
+ * A live customer received an upgrade receipt reading "Welcome to undefined /
+ * Hi undefined / Charged today undefined". The existing tests could not catch
+ * it because every one of them hands claimDueEmails a payload that is ALREADY
+ * an object, which is the one thing production did not do: the row came back
+ * from Postgres as a JSON string, and every property access on a string is
+ * undefined.
+ *
+ * So these tests exercise the seam the fake sql used to paper over.
+ */
+describe('payload round-trip', () => {
+  test('a payload that comes back as a JSON string is still an object', () => {
+    const p = normalizePayload('{"firstName":"Zaid","newPlan":"Grow","amountCharged":"$49.00"}');
+    assert.equal(p.firstName, 'Zaid');
+    assert.equal(p.newPlan, 'Grow');
+  });
+
+  test('a payload that comes back as an object is passed through untouched', () => {
+    const obj = { firstName: 'Zaid' };
+    assert.equal(normalizePayload(obj), obj);
+  });
+
+  test('unparseable or non-object payloads become {} rather than throwing', () => {
+    // Throwing here would be retried six times for a fault no retry can fix.
+    assert.deepEqual(normalizePayload('not json at all'), {});
+    assert.deepEqual(normalizePayload(null), {});
+    assert.deepEqual(normalizePayload(42), {});
+    assert.deepEqual(normalizePayload(['a']), {});
+  });
+
+  test('claimDueEmails normalises, so the renderer never sees a string', async () => {
+    const sql = createFakeSql();
+    sql.when(/SELECT id, user_id, recipient/, [{
+      id: 1, user_id: 7, recipient: 'a@b.c', template: 'billing.upgrade',
+      category: 'transactional', event_key: 'k', attempts: 0,
+      // Exactly what production handed the worker.
+      payload: '{"firstName":"Zaid","newPlan":"Grow","amountCharged":"$49.00","billingUrl":"https://x"}',
+    }]);
+
+    const [job] = await claimDueEmails(sql, 10);
+
+    assert.equal(typeof job.payload, 'object');
+    const rendered = RENDERERS['billing.upgrade'](job.payload);
+    assert.match(rendered.subject, /Grow/);
+    assert.doesNotMatch(rendered.text, /undefined/);
+  });
+});
+
+describe('the unrendered-token guard', () => {
+  test('catches the exact email that reached a customer', () => {
+    // Renders billing.upgrade against the empty payload the broken row produced.
+    const broken = RENDERERS['billing.upgrade']({});
+    const leaked = unrenderedTokensIn(broken);
+
+    assert.ok(leaked.includes('undefined'), 'the guard must catch "Welcome to undefined"');
+    assert.match(broken.subject, /undefined/, 'sanity: this really is the broken render');
+  });
+
+  test('a correctly rendered receipt passes', () => {
+    const good = RENDERERS['billing.upgrade']({
+      firstName: 'Zaid', oldPlan: null, newPlan: 'Grow',
+      amountCharged: '$49.00', lines: [{ description: 'Grow — first month', amount: '$49.00' }],
+      nextAmount: '$49.00', nextBillingDate: 'October 18, 2026',
+      cardBrand: 'visa', cardLast4: '4242', billingUrl: 'https://x/credits', timezone: 'UTC',
+    });
+    assert.deepEqual(unrenderedTokensIn(good), [], 'a good receipt must not be blocked');
+  });
+
+  test('catches an object interpolated where a string belonged', () => {
+    assert.ok(unrenderedTokensIn({
+      subject: 'Your plan changed', text: 'Charged today: [object Object]', html: '',
+    }).includes('[object Object]'));
+  });
+
+  test('catches a template literal that was never evaluated', () => {
+    assert.ok(unrenderedTokensIn({
+      subject: 'Welcome to ${planName}', text: 'hi', html: '',
+    }).includes('an unevaluated ${...} template literal'));
   });
 });
 
 describe('the renderer registry', () => {
   test('every template the billing code queues has a renderer', () => {
     // A missing renderer dead-letters the email, so this is the guard against
-    // a receipt silently never arriving because of a typo.
-    for (const name of ['billing.upgrade', 'billing.cancellation', 'lifecycle.credit_expiry', 'lifecycle.inactivity']) {
+    // a receipt silently never arriving because of a typo. Every name here must
+    // match a `queueBillingEmail(..., '<name>', ...)` call in stripe.routes.ts
+    // or a job's `template` in notification-jobs.ts.
+    for (const name of [
+      'billing.upgrade', 'billing.downgrade', 'billing.cancellation',
+      'billing.paused', 'billing.resumed',
+      'billing.credit_purchase', 'billing.renewal', 'billing.refund', 'billing.payment_failed',
+      'lifecycle.credit_expiry', 'lifecycle.inactivity', 'lifecycle.trial_ended',
+    ]) {
       assert.equal(typeof RENDERERS[name], 'function', `no renderer for ${name}`);
     }
+  });
+
+  /**
+   * Every template, rendered against a realistic payload, must produce a
+   * complete email.
+   *
+   * This is the test the "Welcome to undefined" bug needed and did not have.
+   * It is deliberately a loop over the WHOLE registry rather than one test per
+   * template: a new template added without a case here would silently not be
+   * covered, whereas a new registry entry with no fixture fails loudly on the
+   * `payload` lookup below.
+   */
+  const FIXTURES: Record<string, any> = {
+    'billing.upgrade': {
+      firstName: 'Zaid', oldPlan: 'Optimize', newPlan: 'Scale', amountCharged: '$24.13',
+      lines: [{ description: 'Scale (prorated)', amount: '$24.13' }],
+      nextAmount: '$99.00', nextBillingDate: 'October 18, 2026',
+      cardBrand: 'visa', cardLast4: '4242', billingUrl: 'https://x/credits', timezone: 'UTC',
+    },
+    'billing.downgrade': {
+      firstName: 'Zaid', oldPlan: 'Scale', newPlan: 'Optimize', effectiveDate: 'October 18, 2026',
+      nextAmount: '$49.00', creditsNote: 'Your existing credits stay on your account.',
+      billingUrl: 'https://x/credits', timezone: 'UTC',
+    },
+    'billing.cancellation': {
+      firstName: 'Zaid', planName: 'Scale', accessUntil: 'October 18, 2026',
+      creditsNote: 'You have 240 credits remaining.',
+      resubscribeUrl: 'https://x/credits?view=plans', billingUrl: 'https://x/credits', timezone: 'UTC',
+    },
+    'billing.paused': {
+      firstName: 'Zaid', planName: 'Scale', resumesOn: null,
+      creditsNote: 'Your credits stay on your account.', billingUrl: 'https://x/credits',
+    },
+    'billing.resumed': {
+      firstName: 'Zaid', planName: 'Scale', nextAmount: '$99.00',
+      nextBillingDate: 'October 18, 2026', creditsNote: 'Your allowance restarts next cycle.',
+      billingUrl: 'https://x/credits', timezone: 'UTC',
+    },
+    'billing.credit_purchase': {
+      firstName: 'Zaid', packName: '500 credits — about 20 pieces', creditsAdded: '500 credits',
+      newBalance: '740 credits', amountCharged: '$40.00', cardBrand: 'visa', cardLast4: '4242',
+      receiptUrl: 'https://stripe/r', expiresOn: 'September 18, 2027', creditsUrl: 'https://x/credits',
+    },
+    'billing.renewal': {
+      firstName: 'Zaid', planName: 'Scale', amountCharged: '$99.00', periodLabel: 'another month',
+      creditsNote: 'Your monthly allowance has been added.', nextBillingDate: 'November 18, 2026',
+      cardBrand: 'visa', cardLast4: '4242', receiptUrl: 'https://stripe/r', billingUrl: 'https://x/credits',
+      timezone: 'UTC',
+    },
+    'billing.refund': {
+      firstName: 'Zaid', amountRefunded: '$99.00', reasonLabel: 'your ImproveSEO account',
+      cardBrand: 'visa', cardLast4: '4242', arrivalWindow: '5–10 business days',
+      creditsNote: null, billingUrl: 'https://x/credits',
+    },
+    'billing.payment_failed': {
+      firstName: 'Zaid', planName: 'Scale', amountDue: '$99.00', cardBrand: 'visa', cardLast4: '4242',
+      attemptNumber: 1, nextAttemptDate: 'September 22, 2026', accessEndsOn: 'October 2, 2026',
+      creditsNote: 'Your plan credits are paused.', updatePaymentUrl: 'https://x/credits',
+      invoiceUrl: 'https://stripe/i',
+    },
+    'lifecycle.credit_expiry': {
+      firstName: 'Zaid', expiringAmount: '214 plan credits', expiryDate: 'October 1, 2026',
+      remainingAfter: '30 credits', ctaUrl: 'https://x/credits', leadTimeLabel: 'in 14 days', pieces: 8,
+    },
+    'lifecycle.inactivity': {
+      firstName: 'Zaid', creditBalance: '120 credits', nearestExpiry: 'October 1, 2026',
+      planName: 'Grow', ctaUrl: 'https://x/overview', pieces: 5,
+    },
+    'lifecycle.trial_ended': {
+      firstName: 'Zaid', ctaUrl: 'https://x/credits', pagesCreated: 3, freeBalance: '10 credits',
+    },
+  };
+
+  for (const name of Object.keys(RENDERERS)) {
+    test(`${name} renders a complete email`, () => {
+      const payload = FIXTURES[name];
+      assert.ok(payload, `no fixture for ${name} — add one when you add a template`);
+
+      const rendered = RENDERERS[name](payload);
+
+      assert.ok(rendered.subject.length > 0, 'a subject line');
+      assert.ok(rendered.html.includes('<html'), 'a full HTML document');
+      assert.ok(rendered.text.length > 0, 'a plain-text part — mail without one scores as spam');
+      assert.deepEqual(unrenderedTokensIn(rendered), [], 'no placeholder tokens leaked');
+      assert.doesNotMatch(rendered.subject, /PLACEHOLDER/i);
+      // The reader's name proves the payload reached the template at all —
+      // the exact thing that silently failed in production.
+      assert.match(rendered.text, /Zaid/);
+    });
+  }
+
+  test('an unknown template is not silently rendered as something else', () => {
+    assert.equal(RENDERERS['billing.nonexistent'], undefined);
   });
 });

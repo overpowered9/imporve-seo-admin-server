@@ -111,6 +111,42 @@ export async function enqueueEmail(
 }
 
 /**
+ * Coerce a payload read back from the database into a plain object.
+ *
+ * WHY THIS EXISTS: a customer received a receipt reading "Welcome to undefined
+ * / Charged today undefined". Every value in that payload is produced by a
+ * helper that cannot return undefined — formatCents() always returns a string,
+ * firstNameOf() falls back to 'there' — so the keys were not missing when the
+ * job was queued. They went missing on the way back out of Postgres, where the
+ * payload arrived as a JSON *string* rather than an object, and every property
+ * access on a string is undefined.
+ *
+ * The two ways that happens are a `payload` column that is TEXT rather than
+ * JSONB (CREATE TABLE IF NOT EXISTS in migration 007 leaves a pre-existing
+ * table's column types alone), and a value stored as a jsonb string scalar
+ * instead of a jsonb object. Both look identical here, and both are fixed by
+ * the same three lines, so this normalises rather than assuming which.
+ *
+ * Deliberately total: anything that is not an object after parsing becomes {},
+ * so a corrupt row renders as a detectably-empty email that the worker's
+ * placeholder guard will refuse to send — instead of throwing inside the
+ * renderer and being retried six times for a fault no retry can fix.
+ */
+export function normalizePayload(raw: unknown): Record<string, unknown> {
+  let value = raw;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch (_) {
+      return {};
+    }
+  }
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+/**
  * Claim due jobs for this worker.
  *
  * FOR UPDATE SKIP LOCKED is what makes several workers (or several instances of
@@ -140,7 +176,10 @@ export async function claimDueEmails(sql: SqlLike, limit = 25): Promise<EmailJob
       SET    status = 'sending', attempts = attempts + 1, updated_at = NOW()
       WHERE  id = ANY(${ids})
     `;
-    return rows as EmailJob[];
+    // Normalised HERE rather than in the worker so that every consumer of a
+    // claimed job — the worker, the drain CLI, any future replay tool — gets an
+    // object, and none of them has to remember to parse.
+    return rows.map((r: any) => ({ ...r, payload: normalizePayload(r.payload) })) as EmailJob[];
   });
 }
 

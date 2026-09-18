@@ -41,12 +41,62 @@ export interface RenderedEmail {
  * amount of waiting fixes it.
  */
 export const RENDERERS: Record<string, (payload: any) => RenderedEmail> = {
+  // Subscription lifecycle
   'billing.upgrade': (p) => billingEmailTemplates.billingPlanChanged(p),
+  'billing.downgrade': (p) => billingEmailTemplates.billingDowngraded(p),
   'billing.cancellation': (p) => billingEmailTemplates.billingCancelled(p),
-  'lifecycle.credit_expiry': (p) => billingEmailTemplates.creditsExpiringPlaceholder(p),
-  'lifecycle.inactivity': (p) => billingEmailTemplates.inactivityPlaceholder(p),
-  'lifecycle.trial_ended': (p) => billingEmailTemplates.trialEndedPlaceholder(p),
+  'billing.paused': (p) => billingEmailTemplates.billingPaused(p),
+  'billing.resumed': (p) => billingEmailTemplates.billingResumed(p),
+  // Money in, money out
+  'billing.credit_purchase': (p) => billingEmailTemplates.creditPurchase(p),
+  'billing.renewal': (p) => billingEmailTemplates.renewalReceipt(p),
+  'billing.refund': (p) => billingEmailTemplates.refundIssued(p),
+  'billing.payment_failed': (p) => billingEmailTemplates.paymentFailed(p),
+  // Lifecycle — suppressible by a marketing opt-out
+  'lifecycle.credit_expiry': (p) => billingEmailTemplates.creditsExpiring(p),
+  'lifecycle.inactivity': (p) => billingEmailTemplates.inactivityNudge(p),
+  'lifecycle.trial_ended': (p) => billingEmailTemplates.trialEnded(p),
 };
+
+/**
+ * Strings that prove a template rendered against a payload it did not get.
+ *
+ * A customer received a receipt headed "Welcome to undefined" that said
+ * "Charged today: undefined". Nothing in the pipeline objected, because every
+ * stage did its job: the payload was captured correctly, the row was queued
+ * correctly, the renderer substituted exactly what it was handed, and Mailgun
+ * delivered it. The gap is that NOTHING EVER LOOKED AT THE OUTPUT.
+ *
+ * So this looks. These four tokens cannot occur in legitimate billing copy —
+ * plan names, money and dates are all formatted by helpers that return real
+ * strings — which makes their presence proof of a broken payload rather than a
+ * style problem.
+ *
+ * `${` catches a template literal that was stored as source text instead of
+ * being evaluated; `[object Object]` catches an object interpolated where a
+ * string belonged.
+ */
+const UNRENDERED_TOKENS: Array<[RegExp, string]> = [
+  [/\bundefined\b/, 'undefined'],
+  [/\bnull\b/, 'null'],
+  [/\bNaN\b/, 'NaN'],
+  [/\[object Object\]/, '[object Object]'],
+  [/\$\{/, 'an unevaluated ${...} template literal'],
+];
+
+/**
+ * Which placeholder tokens leaked into a rendered email, if any.
+ *
+ * Checks the subject and the plain-text body. The HTML is deliberately NOT
+ * checked: it carries CSS and URLs where these substrings can appear
+ * legitimately, and the text part is generated from the same payload, so a
+ * broken payload shows up there too. Scanning both would trade a guarantee for
+ * false positives that block real receipts.
+ */
+export function unrenderedTokensIn(rendered: RenderedEmail): string[] {
+  const haystack = `${rendered.subject}\n${rendered.text}`;
+  return UNRENDERED_TOKENS.filter(([re]) => re.test(haystack)).map(([, name]) => name);
+}
 
 /**
  * Process one batch. Returns counts so a scheduler can log them.
@@ -109,7 +159,40 @@ async function processOne(
     return 'deadLettered';
   }
 
-  const rendered = render(job.payload);
+  // Resolved BEFORE rendering, because lifecycle templates put the link in the
+  // footer as well as the header. A List-Unsubscribe header with no visible
+  // link in the body is what gets mail marked as spam by recipients who cannot
+  // find the off switch — and the footer link is the one most people use.
+  //
+  // Receipts get neither: `unsubscribeUrlFor` is only consulted for lifecycle
+  // mail, so a transactional template renders the billing footer instead.
+  const unsubscribeUrl = job.category === 'lifecycle'
+    ? await unsubscribeUrlFor(sql, job.user_id)
+    : null;
+
+  const rendered = render(
+    unsubscribeUrl ? { ...job.payload, unsubscribeUrl } : job.payload,
+  );
+
+  // The last gate before a customer sees it. Dead-lettered rather than retried:
+  // the payload is already stored, so every retry renders the identical broken
+  // text — waiting cannot fix it, and six attempts would mean six chances to
+  // send it if the check were ever loosened. A human has to look.
+  const leaked = unrenderedTokensIn(rendered);
+  if (leaked.length > 0) {
+    await markFailed(
+      sql,
+      { ...job, attempts: 99 },
+      `refused to send: rendered copy contains ${leaked.join(', ')} — the payload is missing keys this template needs`,
+    );
+    console.error(
+      `🚨 [email-worker] BLOCKED a broken email — template=${job.template} ` +
+      `event=${job.event_key} user=${job.user_id} recipient=${job.recipient}. ` +
+      `Subject would have read "${rendered.subject}". Payload keys present: ` +
+      `[${Object.keys(job.payload || {}).join(', ') || 'none'}].`,
+    );
+    return 'deadLettered';
+  }
 
   if (dryRun) {
     console.log(
@@ -119,13 +202,9 @@ async function processOne(
     return 'sent';
   }
 
-  // Transactional headers. List-Unsubscribe on lifecycle mail only: putting it
+  // List-Unsubscribe goes on lifecycle mail only (resolved above): putting it
   // on a receipt invites a customer to "unsubscribe" from being told what they
   // were charged, which we cannot honour anyway.
-  const unsubscribeUrl = job.category === 'lifecycle'
-    ? await unsubscribeUrlFor(sql, job.user_id)
-    : null;
-
   const ok = await sendEmail({
     to: job.recipient,
     subject: rendered.subject,
@@ -149,15 +228,35 @@ async function processOne(
   return deadLettered ? 'deadLettered' : 'failed';
 }
 
-/** The per-user unsubscribe link, from the token minted by migration 007. */
+/**
+ * The per-user unsubscribe link, from the token minted by migration 007.
+ *
+ * ── THIS USED TO POINT AT A 404 ─────────────────────────────────────────────
+ * It built `${CMS_BASE_URL}/unsubscribe?token=…`, but the CMS has no such
+ * route: the URL fell through the SPA's `/*` catch-all and redirected to the
+ * login page. So every lifecycle email carried a List-Unsubscribe header
+ * promising something that could not happen, and Gmail's one-click POST — which
+ * mailbox providers require of bulk senders and monitor for compliance — hit a
+ * front-end that cannot process it.
+ *
+ * It now points at the API route that actually handles it, which serves a real
+ * confirmation page to a browser and JSON to the One-Click POST. Override with
+ * PUBLIC_API_URL if the server is reached on a different hostname than the one
+ * it thinks it has.
+ */
 async function unsubscribeUrlFor(sql: SqlLike, userId: number | null): Promise<string | null> {
   if (!userId) return null;
   try {
     const rows = await sql`SELECT unsubscribe_token FROM users WHERE id = ${userId} LIMIT 1`;
     const token = rows[0]?.unsubscribe_token;
     if (!token) return null;
-    const base = (process.env.CMS_BASE_URL || 'https://account.improveseoplugin.com').replace(/\/$/, '');
-    return `${base}/unsubscribe?token=${token}`;
+    // Defaults to the Render host the CMS is configured to call, so this works
+    // without new configuration. Set PUBLIC_API_URL when that host changes —
+    // the same value the Stripe webhook URL has to track.
+    const base = (process.env.PUBLIC_API_URL || 'https://imporve-seo-admin-server-nzbm.onrender.com')
+      .replace(/\/$/, '')
+      .replace(/\/api\/v1$/, '');
+    return `${base}/api/v1/users/unsubscribe?token=${token}`;
   } catch (_) {
     return null;
   }
