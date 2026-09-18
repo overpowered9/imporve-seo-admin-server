@@ -114,10 +114,18 @@ describe('the balance breakdown groups by day, not by instant', () => {
   test('getCreditLotSummary buckets on the UTC date', () => {
     const body = functionBody(models, 'getCreditLotSummary');
     assert.match(body, /AT TIME ZONE 'UTC'\)::date/);
-    // Grouped on the plan too (via the subscription_plans join, for is_free) —
-    // a free-plan lot and a paid-plan lot expiring the same day must stay
-    // separate buckets, not merge into one row.
-    assert.match(body, /GROUP {2}BY cl\.source, sp\.slug, \(cl\.expires_at AT TIME ZONE 'UTC'\)::date/);
+    // Grouped on the FREE/PAID BOOLEAN (via the subscription_plans join, for
+    // is_free), not on sp.slug itself. A free-plan lot and a paid lot expiring
+    // the same day must stay separate buckets — the trial grant is voided when
+    // the trial ends whatever its date says. Two PAID lots sharing a day must
+    // NOT: a mid-cycle upgrade leaves the original grant on the old plan's id
+    // and the bump on the new one, both anchored to the same cycle expiry, and
+    // grouping on the slug showed them as two identical "Plan credits" rows.
+    assert.match(body, /GROUP {2}BY cl\.source, COALESCE\(sp\.slug = 'free', false\), \(cl\.expires_at AT TIME ZONE 'UTC'\)::date/);
+    assert.ok(
+      !/GROUP {2}BY cl\.source, sp\.slug,/.test(body),
+      'grouping by the slug itself splits an upgraded account\'s plan credits into two identical rows',
+    );
     // Soonest first — the order the panel shows AND the order they are spent.
     assert.match(body, /ORDER {2}BY \(cl\.expires_at AT TIME ZONE 'UTC'\)::date ASC/);
     assert.match(body, /cl\.remaining > 0 AND cl\.expires_at > NOW\(\)/);

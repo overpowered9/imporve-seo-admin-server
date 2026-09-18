@@ -1616,7 +1616,20 @@ export const getCreditLotSummary = async (user_id: number): Promise<CreditLotBuc
     FROM   credit_lots cl
     LEFT JOIN subscription_plans sp ON sp.id = cl.plan_id
     WHERE  cl.user_id = ${user_id} AND cl.remaining > 0 AND cl.expires_at > NOW()
-    GROUP  BY cl.source, sp.slug, (cl.expires_at AT TIME ZONE 'UTC')::date
+    -- Grouped by the free/paid BOOLEAN, not by sp.slug. Grouping on the slug
+    -- itself split batches that differ only in which plan minted them: a
+    -- mid-cycle upgrade leaves the original grant on the old plan's id and the
+    -- bump on the new one, and since upgradeIncludedCredits anchors the bump to
+    -- the cycle's own expiry (currentCyclePlanExpiry) both lapse on the SAME
+    -- day. A grow→optimize account therefore saw two "Plan credits" rows,
+    -- identical date, no visible reason for being apart — and, because the CMS
+    -- keys rows on (source, date), two rows with the same key.
+    --
+    -- The distinction worth keeping is the one is_free already names: a free
+    -- trial's grant is zeroed when the trial ends (suspendPlanCredits) whatever
+    -- its stored date says, so it genuinely does not lapse with a paid lot that
+    -- shares its day. Every paid slug behaves identically and belongs together.
+    GROUP  BY cl.source, COALESCE(sp.slug = 'free', false), (cl.expires_at AT TIME ZONE 'UTC')::date
     ORDER  BY (cl.expires_at AT TIME ZONE 'UTC')::date ASC, cl.source ASC
   `;
   return (rows as unknown as CreditLotBucket[]).map((r) => ({
