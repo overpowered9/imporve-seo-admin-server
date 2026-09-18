@@ -110,3 +110,4 @@ add_stripe_price_id.sql
 # creates, and --remove deletes exactly those.
 !/src/scripts/seed-expiring-credits.ts
 /claude reference
+email-previews/
