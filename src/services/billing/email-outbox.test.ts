@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { createFakeSql } from '../../test/helpers/fake-sql.js';
 import {
   enqueueEmail, claimDueEmails, markSent, markFailed, markSuppressed,
-  suppressionReason, backoffSeconds, MAX_ATTEMPTS, normalizePayload,
+  suppressionReason, backoffSeconds, MAX_ATTEMPTS, normalizePayload, releaseClaim,
 } from './email-outbox.js';
 import { RENDERERS, unrenderedTokensIn } from './email-worker.js';
 import { billingEmailTemplates } from '../email.service.js';
@@ -95,6 +95,34 @@ describe('claimDueEmails', () => {
     // Claimed and counted in the same transaction, so a crash leaves rows
     // visibly stuck rather than silently re-sent.
     assert.match(sql.matching(/UPDATE email_sends/)[0].text, /status = 'sending', attempts = attempts \+ 1/);
+  });
+
+  test('reclaims rows a dead worker left marked "sending"', async () => {
+    // Before this, the claim query matched only 'pending' and 'failed'. A row
+    // marked 'sending' by a worker that then crashed matched NOTHING, forever:
+    // not retried, no error recorded, nothing to alert on. The email simply
+    // never went, and the row looked busy rather than broken.
+    const sql = createFakeSql();
+    sql.when(/SELECT id, user_id, recipient/, []);
+    await claimDueEmails(sql, 10);
+
+    const where = sql.matching(/FROM email_sends/)[0].text;
+    assert.match(where, /status = 'sending'/, 'stale claims must be reclaimable');
+    assert.match(where, /updated_at </, 'and only after a staleness window, so it cannot race a live send');
+  });
+
+  test('a dry run hands its claim straight back', async () => {
+    // `email:drain` without --apply exists to inspect the queue safely. It
+    // claimed every row, wrote nothing back, and walked away — leaving them
+    // 'sending' and invisible. The command whose job is to look at the queue
+    // was the fastest way to strand all of it.
+    const sql = createFakeSql();
+    await releaseClaim(sql, 42);
+
+    const q = sql.matching(/UPDATE email_sends/)[0];
+    assert.match(q.text, /status = 'pending'/, 'the row goes back in the queue');
+    assert.match(q.text, /attempts = GREATEST\(attempts - 1, 0\)/, 'and the unused attempt is given back');
+    assert.match(q.text, /AND *status = 'sending'/, 'and only a row this worker actually holds is released');
   });
 
   test('an empty queue does no writes', async () => {

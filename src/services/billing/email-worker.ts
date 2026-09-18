@@ -21,7 +21,7 @@
  */
 import type { SqlLike } from './payment-methods.js';
 import {
-  claimDueEmails, markSent, markFailed, markSuppressed, suppressionReason,
+  claimDueEmails, markSent, markFailed, markSuppressed, suppressionReason, releaseClaim,
   type EmailJob,
 } from './email-outbox.js';
 import { sendEmail, billingEmailTemplates } from '../email.service.js';
@@ -199,6 +199,9 @@ async function processOne(
       `[email-worker] DRY RUN — would send "${rendered.subject}" to ${job.recipient} ` +
       `(${job.template}/${job.event_key})`,
     );
+    // Give the claim back. A dry run that leaves rows marked 'sending' does not
+    // "inspect" a queue, it empties one into a state nothing reads.
+    await releaseClaim(sql, job.id);
     return 'sent';
   }
 

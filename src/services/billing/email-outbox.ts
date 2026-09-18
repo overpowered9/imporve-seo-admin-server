@@ -66,6 +66,14 @@ export interface EmailJob {
 export const MAX_ATTEMPTS = 6;
 
 /**
+ * How long a row may sit in 'sending' before another worker may reclaim it.
+ *
+ * A real send resolves in seconds, so anything still 'sending' after this long
+ * belongs to a worker that died or to a dry run that walked away from its claim.
+ */
+export const STALE_CLAIM_MINUTES = 15;
+
+/**
  * Backoff schedule, in seconds: ~1m, 5m, 25m, 2h, 10h, capped at 24h.
  *
  * Exponential with a cap rather than unbounded: a provider outage lasting a day
@@ -174,8 +182,21 @@ export async function claimDueEmails(sql: SqlLike, limit = 25): Promise<EmailJob
     const rows = await tx`
       SELECT id, user_id, recipient, template, category, event_key, attempts, payload
       FROM   email_sends
-      WHERE  status IN ('pending', 'failed')
-        AND  next_attempt_at <= NOW()
+      WHERE  (
+               (status IN ('pending', 'failed') AND next_attempt_at <= NOW())
+               -- Rows a previous worker claimed and never finished. Without
+               -- this they are stranded: 'sending' was in no other branch of
+               -- this WHERE, so a worker that crashed — or a DRY RUN, which
+               -- claims and then writes nothing back — left its rows invisible
+               -- to every future pass. Not "retried later"; never sent, with no
+               -- error recorded and nothing to alert on.
+               --
+               -- The window is long enough that it cannot race a live worker
+               -- mid-send: a real attempt resolves in seconds, and attempts
+               -- still increments on reclaim, so a row that keeps dying reaches
+               -- the dead-letter cap instead of looping forever.
+               OR (status = 'sending' AND updated_at < NOW() - ${STALE_CLAIM_MINUTES} * interval '1 minute')
+             )
       ORDER  BY next_attempt_at, id
       LIMIT  ${limit}
       FOR UPDATE SKIP LOCKED
@@ -193,6 +214,28 @@ export async function claimDueEmails(sql: SqlLike, limit = 25): Promise<EmailJob
     // object, and none of them has to remember to parse.
     return rows.map((r: any) => ({ ...r, payload: normalizePayload(r.payload) })) as EmailJob[];
   });
+}
+
+/**
+ * Hand a claimed job back, untouched.
+ *
+ * For the dry run, which has no business consuming an attempt or holding a row
+ * hostage for the staleness window. Without this, `npm run email:drain` — the
+ * command whose whole purpose is to inspect the queue SAFELY — was the fastest
+ * way to strand every email in it.
+ *
+ * `attempts` is decremented back because the claim spent one and no send was
+ * tried; otherwise inspecting a queue six times would dead-letter it.
+ */
+export async function releaseClaim(sql: SqlLike, jobId: number): Promise<void> {
+  await sql`
+    UPDATE email_sends
+    SET    status = 'pending',
+           attempts = GREATEST(attempts - 1, 0),
+           updated_at = NOW()
+    WHERE  id = ${jobId}
+      AND  status = 'sending'
+  `;
 }
 
 /** Record a successful send. */
