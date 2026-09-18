@@ -603,8 +603,15 @@ export const getUserCreditBalances = async (user_id: number): Promise<CreditBala
  * stamp a new cycle. Purchased credits are intentionally left untouched.
  *
  * Called on subscription creation and on every successful monthly invoice. Idempotent.
+ *
+ * Returns how many credits were granted, for the same reason
+ * upgradeIncludedCredits does: the caller has to tell the customer the real
+ * figure — Account Activity's "Subscription started" row showed no credits at
+ * all, because the only way to fill that column was to re-derive the allotment
+ * beside the call and hope the two agreed.
  */
-export const refillPlanCredits = async (user_id: number, plan: any, reason = 'Plan credits refill'): Promise<void> => {
+export const refillPlanCredits = async (user_id: number, plan: any, reason = 'Plan credits refill'): Promise<number> => {
+  let granted = 0;
   await sql.begin(async sql => {
     for (const creditType of CREDIT_TYPES) {
       const allotment = planAllotment(plan, creditType);
@@ -640,8 +647,11 @@ export const refillPlanCredits = async (user_id: number, plan: any, reason = 'Pl
         INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
         VALUES (${user_id}, ${creditType}, ${allotment}, ${reason})
       `;
+
+      granted += allotment;
     }
   });
+  return granted;
 };
 
 /**

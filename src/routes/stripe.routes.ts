@@ -107,6 +107,7 @@ import {
   isLiveStatus,
 } from '../services/billing/subscription-state.js';
 import { periodEndOf, periodEndOrWarn, periodStartOf } from '../services/billing/subscription-period.js';
+import type { RecordTransactionInput } from '../services/billing/transactions.js';
 import {
   recordTransaction,
   transactionsFromInvoice,
@@ -321,9 +322,15 @@ const activateSubscriptionInDb = async (params: {
   `;
 
   const planResult = await sql`SELECT * FROM subscription_plans WHERE id = ${planId}`;
+  // What the plan actually granted, carried to the ledger row below so Account
+  // Activity's Credits column reads "+200" rather than "—". Taken from the
+  // grant itself rather than re-derived from the plan here: two readings of an
+  // allotment are two numbers that can disagree, and the one the customer sees
+  // must be the one they received.
+  let planCreditsGranted: number | null = null;
   if (planResult.length > 0) {
     // Reset the plan (included) credits; purchased top-ups are preserved.
-    await refillPlanCredits(userId, planResult[0], 'Subscription activated');
+    planCreditsGranted = await refillPlanCredits(userId, planResult[0], 'Subscription activated');
   }
 
   // ── Record the ledger row HERE, not only from invoice.payment_succeeded ──
@@ -367,6 +374,8 @@ const activateSubscriptionInDb = async (params: {
       amountCents: firstCharge?.amountCents ?? null,
       currency: firstCharge?.currency ?? null,
       receiptUrl: firstCharge?.receiptUrl ?? null,
+      creditType: planCreditsGranted === null ? null : ISEO_CREDIT_TYPE,
+      creditDelta: planCreditsGranted,
     });
   } catch (ledgerError) {
     // recordTransaction never throws; this guards anything around it. A
@@ -2540,6 +2549,11 @@ router.post('/change-plan', async (req: Request, res: Response) => {
   // sees quotes the same figures the ledger row recorded.
   let proratedCents: number | null = null;
   let charge: Awaited<ReturnType<typeof chargeProrationNow>> | null = null;
+  // The upgrade's ledger row, kept so the credits it granted can be settled
+  // into it once changePlan reports them — see where it is written. Held as
+  // the whole input rather than just its key: re-listing the fields for the
+  // second call is how a settle ends up contradicting the row it settles.
+  let upgradeLedgerRow: RecordTransactionInput | null = null;
   try {
     // `proration_date` is the timestamp returned by /preview-plan-change. When
     // present it is replayed to Stripe so the customer is charged exactly the
@@ -3029,7 +3043,7 @@ router.post('/change-plan', async (req: Request, res: Response) => {
         // disclosure, so the ledger and the audit trail cannot disagree.
         try {
           if (isUpgrade) {
-            await recordTransaction(sql, {
+            upgradeLedgerRow = {
               userId: user_id,
               type: 'plan_upgrade',
               description: describePlanUpgraded(currentPlan.name, newPlan.name),
@@ -3049,7 +3063,8 @@ router.post('/change-plan', async (req: Request, res: Response) => {
                 `plan_change:${currentSub.stripe_subscription_id}:${new_plan_id}:${Math.floor(Date.now() / 1000)}`,
               providerObjectId: charge?.invoiceId || currentSub.stripe_subscription_id,
               planId: new_plan_id,
-            });
+            };
+            await recordTransaction(sql, upgradeLedgerRow);
           } else {
             // A downgrade raises no invoice — proration_behavior is 'none' and
             // nothing is charged today. It is still an event the customer needs
@@ -3106,6 +3121,26 @@ router.post('/change-plan', async (req: Request, res: Response) => {
 
     // Update database (only after Stripe succeeds)
     const { creditsGranted } = await changePlan(user_id, new_plan_id, isUpgrade);
+
+    // ── Settle the granted credits into the row written above ───────────────
+    // Account Activity showed "—" in the Credits column for every plan change,
+    // because the ledger row is written BEFORE the grant runs — deliberately,
+    // so a proration that was collected is recorded even if the database write
+    // that follows it fails — and nothing ever went back to say how many
+    // credits the change produced.
+    //
+    // The same input object is re-sent with the figure added, so the upsert
+    // matches on its key and fills the column in place. Re-sending the object
+    // rather than a fresh one keeps the settle from disagreeing with the row
+    // it settles: a second literal here would be a second chance to state the
+    // status or the amount differently.
+    if (upgradeLedgerRow && creditsGranted > 0) {
+      await recordTransaction(sql, {
+        ...upgradeLedgerRow,
+        creditType: ISEO_CREDIT_TYPE,
+        creditDelta: creditsGranted,
+      });
+    }
 
     // Read AFTER the grant, so the confirmation quotes the balance the user
     // will actually see when the page refreshes behind the dialog.

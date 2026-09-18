@@ -97,6 +97,25 @@ describe('recordTransaction', () => {
     assert.ok(!q.params.includes('USD'));
   });
 
+  test('a later arrival can add the credits it granted, and cannot blank them', async () => {
+    // A plan change writes its row BEFORE the grant runs, then re-sends the
+    // same input with the figure once changePlan reports it. Without this
+    // COALESCE the Credits column stayed '—' however many times we settled.
+    const sql = createFakeSql();
+    sql.when(/INSERT INTO billing_transactions/, okInsert());
+
+    await recordTransaction(sql, {
+      userId: 7, type: 'plan_upgrade', description: 'Plan upgraded',
+      amountCents: 1550, currency: 'usd', providerEventId: 'plan_change:sub_1:3:1',
+      creditType: 'iseo', creditDelta: 400,
+    });
+
+    const q = sql.matching(/INSERT INTO billing_transactions/)[0];
+    assert.match(q.text, /credit_delta\s*=\s*COALESCE\(EXCLUDED\.credit_delta/);
+    assert.match(q.text, /credit_type\s*=\s*COALESCE\(EXCLUDED\.credit_type/);
+    assert.ok(q.params.includes(400), 'the granted figure is written');
+  });
+
   test('a ledger failure NEVER propagates — the money already moved', async () => {
     const sql = createFakeSql().failOn(/INSERT INTO billing_transactions/);
     const result = await recordTransaction(sql, {

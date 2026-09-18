@@ -128,6 +128,13 @@ export async function recordTransaction(
         receipt_url  = COALESCE(EXCLUDED.receipt_url, billing_transactions.receipt_url),
         amount_cents = COALESCE(EXCLUDED.amount_cents, billing_transactions.amount_cents),
         currency     = COALESCE(EXCLUDED.currency, billing_transactions.currency),
+        -- Credits arrive late on a plan change: the row is written before the
+        -- grant runs (so a charge that succeeded is recorded even if the
+        -- database write that follows it fails), and the caller settles the
+        -- figure in afterwards. Same COALESCE rule as the money — a later
+        -- arrival may only add what it knows.
+        credit_delta = COALESCE(EXCLUDED.credit_delta, billing_transactions.credit_delta),
+        credit_type  = COALESCE(EXCLUDED.credit_type, billing_transactions.credit_type),
         updated_at   = NOW()
       RETURNING id, (xmax = 0) AS inserted
     `;
