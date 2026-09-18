@@ -622,12 +622,52 @@ export const refillPlanCredits = async (user_id: number, plan: any, reason = 'Pl
       // Under a two-month life they are still the customer's to spend, so the
       // new grant is an additional LOT and the old one lives out its term.
       // Whichever expires first is spent first; see burnFromLots.
-      await sql`
+      const granted_lot = (await sql`
         INSERT INTO credit_lots (user_id, source, granted, remaining, expires_at, plan_id, reason)
         VALUES (${user_id}, 'plan', ${allotment}, ${allotment},
                 NOW() + ${`${PLAN_CREDIT_LIFETIME_MONTHS} months`}::interval,
                 ${plan?.id ?? null}, ${reason})
-      `;
+        RETURNING expires_at
+      `) as unknown as Array<{ expires_at: Date }>;
+
+      // ── Buying a plan absorbs what the free trial left ────────────────────
+      // The trial's grant is a lot like any other, minted by the FREE plan. On
+      // subscribing, the customer holds two plan balances that differ in
+      // nothing they can see or act on — same source, same rules, both
+      // spendable — so the card showed "Plan credits 600" above "Plan credits
+      // 100" and invited the question of what the difference was. There is
+      // none: the answer is one balance.
+      //
+      // The trial lot is moved onto THIS plan and carried out to this cycle's
+      // expiry, which is the merge — the breakdown groups by (source, free or
+      // paid, day), so matching all three is what makes them one row.
+      //
+      // GREATEST, never a plain assignment: the new expiry is later than the
+      // trial's in every ordinary case, but a lot must never come out of this
+      // with LESS life than it had. If that ever happened the two would stay
+      // separate rows, which is the harmless half of the trade.
+      //
+      // Scoped to the FREE plan's own lots. A previous PAID cycle's lot is not
+      // swept up: those expire on their own cycle's schedule, which is the
+      // whole of "plan credits stay usable for two billing cycles".
+      //
+      // Only when this grant is itself a paid plan's — a free plan refilling
+      // its own grant would otherwise extend the trial indefinitely.
+      if (plan?.id && plan?.slug !== 'free' && granted_lot[0]?.expires_at) {
+        await sql`
+          UPDATE credit_lots cl
+          SET    plan_id    = ${plan.id},
+                 expires_at = GREATEST(cl.expires_at, ${granted_lot[0].expires_at}::timestamptz),
+                 updated_at = NOW()
+          FROM   subscription_plans sp
+          WHERE  sp.id = cl.plan_id
+            AND  sp.slug = 'free'
+            AND  cl.user_id = ${user_id}
+            AND  cl.source = 'plan'
+            AND  cl.remaining > 0
+            AND  cl.expires_at > NOW()
+        `;
+      }
 
       // included_allotment stays the plan's headline number (what a cycle
       // grants), which is what the usage bar and the upgrade bump compare

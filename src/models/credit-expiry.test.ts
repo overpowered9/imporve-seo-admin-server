@@ -82,6 +82,23 @@ describe('plan credits expire with their cycle', () => {
       'a refill starts a new cycle and must not inherit the old expiry',
     );
   });
+
+  test('buying a plan absorbs the free trial lot into it', () => {
+    // A subscriber held two plan balances that differed in nothing they could
+    // see or act on — "Plan credits 600" above "Plan credits 100" — because
+    // the trial's grant was minted by the FREE plan and the breakdown groups
+    // on free-vs-paid. Moving it onto the plan bought, and out to that plan's
+    // expiry, is what makes the two one row and one balance.
+    const body = functionBody(models, 'refillPlanCredits');
+    assert.match(body, /UPDATE credit_lots/);
+    assert.match(body, /sp\.slug = 'free'/, 'only the free plan\'s own lots');
+    assert.match(body, /GREATEST\(cl\.expires_at/, 'a lot must never lose life here');
+    assert.match(body, /plan\?\.slug !== 'free'/, 'a free plan must not extend its own grant');
+    // A previous PAID cycle's lot keeps its own date — that is the whole of
+    // "plan credits stay usable for two billing cycles".
+    assert.match(body, /cl\.source = 'plan'/);
+    assert.match(body, /cl\.remaining > 0/);
+  });
 });
 
 describe('purchased credits share one expiry', () => {
