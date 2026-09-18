@@ -539,20 +539,35 @@ export async function chargeProrationNow(
   };
 
   try {
-    // ── THE PENDING ITEMS MUST BE ASKED FOR ─────────────────────────────────
-    // `invoices.create` does NOT sweep pending invoice items unless told to —
-    // on this API version the default is `exclude`. Without the flag below the
-    // draft came back with zero lines, was voided as "nothing to bill", and this
-    // function reported a paid $0 while the proration stayed pending until the
-    // renewal invoice. The visible symptom: a second upgrade in the same period
-    // quoted the first one's charge again, because it had never been collected.
+    // ── `subscription` IS THE SWEEP — DO NOT ALSO SEND A BEHAVIOUR FLAG ─────
+    // An invoice created FOR a subscription already picks up that
+    // subscription's pending items; `pending_invoice_items_behavior` is for
+    // customer-level invoices that have no subscription, and sending both is
+    // rejected. The rejection is the worst possible shape: `invoices.create`
+    // throws, so no invoice exists to pay, and the catch below reports a
+    // charge that never happened.
     //
-    // `subscription` scopes the sweep to this subscription's pending items, so
-    // an unrelated pending item on the customer cannot be swept into it.
+    // It was added on the belief that the default `exclude` was leaving the
+    // draft empty. The ledger disproves that. With this call UNCHANGED except
+    // for that one parameter:
+    //
+    //   Sep 12  no flag    → in_1UEv1a…, $15.49 collected, row succeeded
+    //   Sep 17  flag added → no invoice on the customer at all, both proration
+    //                        items (−$9.50 and +$25.00) still pending, and the
+    //                        row stuck at `pending` with the subscription id
+    //                        where an invoice id belongs
+    //
+    // Two accounts, same day, same result. Whatever produced the $0 drafts the
+    // flag was meant to cure, it was not this call missing it.
+    //
+    // A REGRESSION TEST CANNOT CATCH THIS from the fake Stripe — the fake
+    // accepts any parameters, so the test that locked the flag in passed
+    // while production could not raise an invoice. The assertion now runs the
+    // other way; the fake still cannot prove Stripe's rule, only that we
+    // stopped breaking it.
     const draft = await stripe.invoices.create({
       customer: params.customerId,
       subscription: params.subscriptionId,
-      pending_invoice_items_behavior: 'include',
       // We pay it explicitly below; letting Stripe advance it too invites a
       // race where both attempt collection.
       auto_advance: false,
