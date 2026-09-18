@@ -93,9 +93,21 @@ export async function enqueueEmail(
   }
 
   try {
+    // `::jsonb` is not decoration. The column IS jsonb — that was checked
+    // against production after the "Welcome to undefined" receipt — which rules
+    // out a TEXT column and leaves one way for a payload to come back as a
+    // string: being stored as a jsonb STRING SCALAR rather than an object.
+    //
+    // A bare `${JSON.stringify(payload)}` is a string parameter with no declared
+    // type, so whether Postgres parses it into an object or wraps it as a scalar
+    // depends on how the driver labels the parameter. The cast settles it here
+    // instead of leaving it to inference: text in, object stored, every time.
+    //
+    // normalizePayload() on the read side still stands. This stops new bad rows;
+    // that one rescues the rows already written.
     const rows = await sql`
       INSERT INTO email_sends (user_id, recipient, template, category, event_key, payload)
-      VALUES (${userId}, ${recipient}, ${template}, ${category}, ${eventKey}, ${JSON.stringify(payload)})
+      VALUES (${userId}, ${recipient}, ${template}, ${category}, ${eventKey}, ${JSON.stringify(payload)}::jsonb)
       ON CONFLICT (template, event_key) DO NOTHING
       RETURNING id
     `;

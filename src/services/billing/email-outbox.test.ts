@@ -31,6 +31,12 @@ describe('enqueueEmail', () => {
     assert.ok(q.params.includes('billing.upgrade'));
     assert.ok(q.params.includes('plan_change:disc-1'));
     assert.match(String(q.params[5]), /24\.13/, 'the payload must be stored, not rebuilt later');
+    // The cast is load-bearing, not tidiness. Without a declared type the
+    // parameter is an untyped string, and whether Postgres parses it into a
+    // jsonb OBJECT or wraps it as a jsonb STRING SCALAR is left to inference —
+    // the scalar case is what made every field of a live receipt `undefined`.
+    // Placeholder-agnostic: the fake renders `?`, postgres.js renders `$6`.
+    assert.match(q.text, /(\?|\$\d+)::jsonb\)/, 'the payload parameter must be cast to jsonb');
   });
 
   test('IDEMPOTENCY: the same event queued twice sends once', async () => {
