@@ -572,13 +572,25 @@ describe('chargeProrationNow', () => {
     return { api: api as any, calls };
   };
 
-  test('REGRESSION: the invoice includes the pending proration items', async () => {
-    // Without this flag Stripe excludes pending items, the invoice totals $0,
-    // it is voided, and the upgrade is reported paid while nothing is collected.
+  test('REGRESSION: the invoice is raised FOR the subscription, with no behaviour flag', async () => {
+    // The subscription is what sweeps its own pending proration items.
+    // `pending_invoice_items_behavior` belongs to customer-level invoices with
+    // no subscription, and sending both is rejected — invoices.create throws,
+    // nothing is raised, and the upgrade's ledger row sits at `pending` with
+    // the proration still uncollected in Stripe. Two accounts hit that on
+    // 17 Sep 2026; the same call without the flag collected $15.49 on 12 Sep.
+    //
+    // This assertion cannot prove Stripe's rule — the fake accepts anything,
+    // which is exactly why the previous version of this test passed while
+    // production could not raise an invoice at all. It only pins the call
+    // shape that is known to work.
     const { api, calls } = fakeInvoices(2450);
     await chargeProrationNow(api, { customerId: 'cus_1', subscriptionId: 'sub_1' });
-    assert.equal(calls.create[0].pending_invoice_items_behavior, 'include');
     assert.equal(calls.create[0].subscription, 'sub_1');
+    assert.ok(
+      !('pending_invoice_items_behavior' in calls.create[0]),
+      'the flag conflicts with `subscription` and makes invoices.create throw',
+    );
   });
 
   test('pays what the invoice carries', async () => {
