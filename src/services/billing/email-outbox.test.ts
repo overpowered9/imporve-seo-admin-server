@@ -297,7 +297,11 @@ describe('the renderer registry', () => {
   test('every template the billing code queues has a renderer', () => {
     // A missing renderer dead-letters the email, so this is the guard against
     // a receipt silently never arriving because of a typo.
-    for (const name of ['billing.upgrade', 'billing.cancellation', 'lifecycle.credit_expiry', 'lifecycle.inactivity']) {
+    for (const name of [
+      'billing.upgrade', 'billing.cancellation', 'lifecycle.credit_expiry', 'lifecycle.inactivity',
+      // queued by POST /auth/set-password (security-emails.ts)
+      'security.password_set', 'security.password_changed',
+    ]) {
       assert.equal(typeof RENDERERS[name], 'function', `no renderer for ${name}`);
     }
   });

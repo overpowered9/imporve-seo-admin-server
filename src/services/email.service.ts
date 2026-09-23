@@ -1086,6 +1086,17 @@ export interface TrialEndedPayload {
   ctaUrl: string;
 }
 
+/** Password set/changed notice — filled by queuePasswordConfirmation (security-emails.ts). */
+export interface PasswordNoticePayload {
+  firstName: string;
+  /** Already formatted, e.g. "September 23, 2026 at 14:05 UTC". */
+  changedAt: string;
+  /** "your account Settings" or "a password reset link". */
+  method: string;
+  resetUrl: string;
+  settingsUrl: string;
+}
+
 export const billingEmailTemplates = {
   /**
    * Plan change / upgrade receipt. (BILL-006)
@@ -1267,6 +1278,71 @@ export const billingEmailTemplates = {
     ].join('\n');
 
     return { subject: '[PLACEHOLDER] Your free trial has ended', html, text };
+  },
+
+  /**
+   * Settings → Update Security, Scenario 2: an account with no password (Google
+   * sign-up) set one. Queued by POST /auth/set-password (security-emails.ts).
+   *
+   * INTERIM COPY — final wording to follow. Same text as the 16-9-26 branch's
+   * security-templates.ts, on this branch's shell.
+   */
+  passwordSet: (p: PasswordNoticePayload) => {
+    const html = billingShell(
+      'Your password is set',
+      `<p style="font-size:15px;color:#333;">Hi ${p.firstName},</p>
+       <p style="font-size:15px;color:#333;">A password was set for your ImproveSEO account on <strong>${p.changedAt}</strong> via ${p.method}.</p>
+       <p style="font-size:15px;color:#333;">You can now sign in with your email address and this password. Google sign-in keeps working as before.</p>
+       <p style="font-size:15px;color:#333;"><strong>Wasn't you?</strong> Reset your password now and reply to this email so we can secure your account.</p>
+       <p style="font-size:13px;color:#666;">Manage your sign-in options in <a href="${p.settingsUrl}">Settings</a>.</p>`,
+      'Reset my password',
+      p.resetUrl,
+    );
+
+    const text = [
+      `Hi ${p.firstName},`,
+      '',
+      `A password was set for your ImproveSEO account on ${p.changedAt} via ${p.method}.`,
+      `You can now sign in with your email address and this password. Google sign-in keeps working as before.`,
+      '',
+      `Wasn't you? Reset your password now and reply to this email so we can secure your account:`,
+      p.resetUrl,
+      '',
+      `Manage your sign-in options: ${p.settingsUrl}`,
+    ].join('\n');
+
+    return { subject: 'Your ImproveSEO password is set', html, text };
+  },
+
+  /**
+   * Settings → Update Security, Scenarios 1 and 3, and a forgot-password reset:
+   * an existing password changed. INTERIM COPY — final wording to follow.
+   */
+  passwordChanged: (p: PasswordNoticePayload) => {
+    const html = billingShell(
+      'Your password was changed',
+      `<p style="font-size:15px;color:#333;">Hi ${p.firstName},</p>
+       <p style="font-size:15px;color:#333;">The password for your ImproveSEO account was changed on <strong>${p.changedAt}</strong> via ${p.method}.</p>
+       <p style="font-size:15px;color:#333;">If you made this change, there's nothing else to do.</p>
+       <p style="font-size:15px;color:#333;"><strong>Wasn't you?</strong> Reset your password now and reply to this email so we can secure your account.</p>
+       <p style="font-size:13px;color:#666;">Manage your sign-in options in <a href="${p.settingsUrl}">Settings</a>.</p>`,
+      'Reset my password',
+      p.resetUrl,
+    );
+
+    const text = [
+      `Hi ${p.firstName},`,
+      '',
+      `The password for your ImproveSEO account was changed on ${p.changedAt} via ${p.method}.`,
+      `If you made this change, there's nothing else to do.`,
+      '',
+      `Wasn't you? Reset your password now and reply to this email so we can secure your account:`,
+      p.resetUrl,
+      '',
+      `Manage your sign-in options: ${p.settingsUrl}`,
+    ].join('\n');
+
+    return { subject: 'Your ImproveSEO password was changed', html, text };
   },
 };
 

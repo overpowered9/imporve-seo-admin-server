@@ -46,6 +46,9 @@ export const RENDERERS: Record<string, (payload: any) => RenderedEmail> = {
   'lifecycle.credit_expiry': (p) => billingEmailTemplates.creditsExpiringPlaceholder(p),
   'lifecycle.inactivity': (p) => billingEmailTemplates.inactivityPlaceholder(p),
   'lifecycle.trial_ended': (p) => billingEmailTemplates.trialEndedPlaceholder(p),
+  // Account security — transactional; queued by POST /auth/set-password
+  'security.password_set': (p) => billingEmailTemplates.passwordSet(p),
+  'security.password_changed': (p) => billingEmailTemplates.passwordChanged(p),
 };
 
 /**
