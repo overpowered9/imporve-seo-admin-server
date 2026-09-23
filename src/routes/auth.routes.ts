@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import { supabaseAdmin } from '../services/supabase.service.js';
 import { checkAdminPassword, issueAdminToken } from '../middleware/adminAuth.middleware.js';
 import { rateLimitPerIp } from '../middleware/rateLimit.middleware.js';
+import { PASSWORD_EVENTS, confirmPasswordChange } from '../services/security-emails.js';
 import sql from '../data/db.js';
 import { findUserByEmail, findUserByOAuth, createUser, createOAuthUser, updateUserOAuthData, initializeUserCredits, ensureSignupGrant, generateApiKey, getFreePlanId, setPasswordHash, createWebsite, findWebsiteByDomain, findWebsiteByUserAndDomain, getUserWebsites, getUserWithPlan, startUserTrial, type User } from '../models/user.models.js';
 
@@ -275,11 +276,16 @@ router.post('/verify-reset-eligibility', async (req, res) => {
 });
 
 // Mark that an OAuth user has set a password (called from Settings after supabase.auth.updateUser)
+//
+// Also where the password confirmation email is queued: Settings (Scenarios 1–3)
+// and the forgot-password page all end here. `event` says which it was, and the
+// email goes only with a session for this same account — see security-emails.ts.
 router.post('/set-password', async (req, res) => {
   try {
-    const { email, password } = z.object({
+    const { email, password, event } = z.object({
       email: z.string().email(),
       password: z.string().min(8),
+      event: z.enum(PASSWORD_EVENTS).optional(),
     }).parse(req.body);
 
     const user = await findUserByEmail(email);
@@ -289,7 +295,17 @@ router.post('/set-password', async (req, res) => {
 
     await setPasswordHash(user.id, password);
 
-    return res.json({ success: true, message: 'Password set successfully.' });
+    // After the write, and never able to fail it: the password has changed.
+    const confirmation = await confirmPasswordChange(sql, {
+      user,
+      event,
+      authorization: req.headers.authorization,
+    }).catch((err) => {
+      console.error('[security-emails] could not queue the password confirmation:', err);
+      return 'skipped' as const;
+    });
+
+    return res.json({ success: true, message: 'Password set successfully.', confirmation });
   } catch (error) {
     res.status(400).json({
       success: false,

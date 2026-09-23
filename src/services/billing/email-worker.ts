@@ -25,6 +25,7 @@ import {
   type EmailJob,
 } from './email-outbox.js';
 import { sendEmail, billingEmailTemplates } from '../email.service.js';
+import { securityEmailTemplates } from '../email/security-templates.js';
 
 export interface RenderedEmail {
   subject: string;
@@ -56,6 +57,9 @@ export const RENDERERS: Record<string, (payload: any) => RenderedEmail> = {
   'lifecycle.credit_expiry': (p) => billingEmailTemplates.creditsExpiring(p),
   'lifecycle.inactivity': (p) => billingEmailTemplates.inactivityNudge(p),
   'lifecycle.trial_ended': (p) => billingEmailTemplates.trialEnded(p),
+  // Account security — transactional; queued by POST /auth/set-password
+  'security.password_set': (p) => securityEmailTemplates.passwordSet(p),
+  'security.password_changed': (p) => securityEmailTemplates.passwordChanged(p),
 };
 
 /**

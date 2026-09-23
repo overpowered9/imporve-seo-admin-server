@@ -456,6 +456,8 @@ describe('the renderer registry', () => {
       'billing.paused', 'billing.resumed',
       'billing.credit_purchase', 'billing.renewal', 'billing.refund', 'billing.payment_failed',
       'lifecycle.credit_expiry', 'lifecycle.inactivity', 'lifecycle.trial_ended',
+      // queued by POST /auth/set-password (security-emails.ts)
+      'security.password_set', 'security.password_changed',
     ]) {
       assert.equal(typeof RENDERERS[name], 'function', `no renderer for ${name}`);
     }
@@ -529,6 +531,14 @@ describe('the renderer registry', () => {
     },
     'lifecycle.trial_ended': {
       firstName: 'Zaid', ctaUrl: 'https://x/credits', pagesCreated: 3, freeBalance: '10 credits',
+    },
+    'security.password_set': {
+      firstName: 'Zaid', changedAt: 'September 23, 2026 at 14:05 UTC', method: 'your account Settings',
+      resetUrl: 'https://x/forgot-password', settingsUrl: 'https://x/settings',
+    },
+    'security.password_changed': {
+      firstName: 'Zaid', changedAt: 'September 23, 2026 at 14:05 UTC', method: 'a password reset link',
+      resetUrl: 'https://x/forgot-password', settingsUrl: 'https://x/settings',
     },
   };
 

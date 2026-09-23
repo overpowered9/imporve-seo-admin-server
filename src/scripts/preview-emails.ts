@@ -21,12 +21,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { billingEmailTemplates } from '../services/email/billing-templates.js';
 import { emailTemplates } from '../services/email/product-templates.js';
+import { securityEmailTemplates } from '../services/email/security-templates.js';
 import { unrenderedTokensIn } from '../services/billing/email-worker.js';
 
 interface Sample { group: string; name: string; note: string; rendered: { subject: string; html: string; text: string } }
 
 const B = billingEmailTemplates;
 const P = emailTemplates;
+const S = securityEmailTemplates;
 
 const samples: Sample[] = [
   // ── Subscription ────────────────────────────────────────────────────────
@@ -161,6 +163,24 @@ const samples: Sample[] = [
       firstName: 'Zaid', ctaUrl: 'https://account.improveseoplugin.com/credits',
       pagesCreated: 3, freeBalance: '10 credits',
       unsubscribeUrl: 'https://api.example/api/v1/users/unsubscribe?token=demo',
+    }),
+  },
+
+  // ── Account security ────────────────────────────────────────────────────
+  {
+    group: 'Security', name: 'Password set', note: 'INTERIM COPY — Scenario 2 (Google account sets a password)',
+    rendered: S.passwordSet({
+      firstName: 'Zaid', changedAt: 'September 23, 2026 at 14:05 UTC', method: 'your account Settings',
+      resetUrl: 'https://account.improveseoplugin.com/forgot-password',
+      settingsUrl: 'https://account.improveseoplugin.com/settings',
+    }),
+  },
+  {
+    group: 'Security', name: 'Password changed', note: 'INTERIM COPY — Scenarios 1 and 3, and a reset',
+    rendered: S.passwordChanged({
+      firstName: 'Zaid', changedAt: 'September 23, 2026 at 14:05 UTC', method: 'a password reset link',
+      resetUrl: 'https://account.improveseoplugin.com/forgot-password',
+      settingsUrl: 'https://account.improveseoplugin.com/settings',
     }),
   },
 

@@ -103,6 +103,16 @@ const FIXTURES: Record<string, any> = {
     pagesCreated: 3, freeBalance: '10 credits',
     unsubscribeUrl: 'https://example.invalid/unsubscribe?token=test',
   },
+  'security.password_set': {
+    firstName: 'Zaid', changedAt: 'September 23, 2026 at 14:05 UTC', method: 'your account Settings',
+    resetUrl: 'https://account.improveseoplugin.com/forgot-password',
+    settingsUrl: 'https://account.improveseoplugin.com/settings',
+  },
+  'security.password_changed': {
+    firstName: 'Zaid', changedAt: 'September 23, 2026 at 14:05 UTC', method: 'a password reset link',
+    resetUrl: 'https://account.improveseoplugin.com/forgot-password',
+    settingsUrl: 'https://account.improveseoplugin.com/settings',
+  },
 };
 
 async function main() {
