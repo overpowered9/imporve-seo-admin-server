@@ -485,6 +485,81 @@ export async function previewUpgrade(
   };
 }
 
+/**
+ * "…after 12 Sep 2026" → "…after Sep 12, 2026".
+ *
+ * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+ * Stripe writes every proration line in one fixed shape — "Unused time on Grow
+ * plan after 12 Sep 2026" — and that text is what the hosted invoice page and
+ * the invoice PDF print. Day-month order is not how a US customer reads a date,
+ * and QA reported it on the invoice.
+ *
+ * Setting the customer's preferred_locales to en-US does NOT change it. That was
+ * checked in test mode on 23 Sep 2026: a customer with ['en-US'] got
+ * "after 23 Sep 2026" exactly like one with no locale. The line description is
+ * the only lever, and it can be edited while the invoice is still a draft —
+ * which the upgrade invoice is, because we raise it ourselves (see
+ * chargeProrationNow).
+ *
+ * A pure reorder of the words Stripe already wrote, not a re-format of a
+ * timestamp: re-deriving the date from `period.start` would have to pick a
+ * timezone, and picking the wrong one moves the day. Anything that does not end
+ * in Stripe's date shape — a line already rewritten, a description from another
+ * API version — comes back unchanged.
+ */
+const STRIPE_PRORATION_DATE = /\bafter (\d{1,2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4})$/;
+
+export const usDateProrationDescription = (description: string): string =>
+  description.replace(
+    STRIPE_PRORATION_DATE,
+    (_match, day: string, month: string, year: string) => `after ${month} ${Number(day)}, ${year}`,
+  );
+
+/**
+ * Rewrite the proration lines on a DRAFT invoice to US date order, in place.
+ *
+ * Best effort by design, like everything chargeProrationNow does: a line that
+ * cannot be rewritten keeps Stripe's wording, and nothing here may stop the
+ * charge. The worst outcome is the invoice this replaced.
+ *
+ * `invoices.updateLineItem` and not `invoiceItems.update`: on 2025-10-29.clover
+ * the proration lines on a subscription invoice have a subscription_item_details
+ * parent, and updating the line on the draft is the call Stripe accepts for
+ * them (verified in test mode — the finalized, paid invoice keeps the new text).
+ *
+ * @returns how many lines were rewritten, for the log and the tests.
+ */
+export async function usDateProrationLines(stripe: any, draft: any): Promise<number> {
+  if (!draft?.id) return 0;
+  // Only a draft can be edited. A replayed idempotent create can hand back an
+  // invoice that was already finalized and paid by the first attempt.
+  if (draft.status && draft.status !== 'draft') return 0;
+
+  let lines: any[] = draft.lines?.data ?? [];
+  if (draft.lines?.has_more) {
+    try {
+      const all = await stripe.invoices.listLineItems(draft.id, { limit: 100 });
+      lines = all?.data ?? lines;
+    } catch (err: any) {
+      console.warn(`⚠️ Could not list every line of ${draft.id}; rewriting the first page only:`, err?.message || err);
+    }
+  }
+
+  let rewritten = 0;
+  for (const line of lines) {
+    if (!isProrationLine(line) || !line?.id || typeof line.description !== 'string') continue;
+    const description = usDateProrationDescription(line.description);
+    if (description === line.description) continue;
+    try {
+      await stripe.invoices.updateLineItem(draft.id, line.id, { description });
+      rewritten += 1;
+    } catch (err: any) {
+      console.warn(`⚠️ Kept Stripe's date format on ${draft.id}/${line.id}:`, err?.message || err);
+    }
+  }
+  return rewritten;
+}
+
 /** What actually happened when we tried to bill the proration at upgrade time. */
 export interface ProrationCharge {
   /** True only when Stripe reports the invoice as paid. */
@@ -583,6 +658,12 @@ export async function chargeProrationNow(
       try { await stripe.invoices.voidInvoice(draft.id); } catch { /* a draft may simply be deleted */ }
       return { ...nothingToBill, currency: draft.currency || 'usd' };
     }
+
+    // US date order on the lines the customer reads — see
+    // usDateProrationDescription. After the $0 check, so an invoice about to be
+    // voided costs no extra calls; before `pay`, because a paid invoice can no
+    // longer be edited. Never throws.
+    await usDateProrationLines(stripe, draft);
 
     const paid = await stripe.invoices.pay(draft.id);
     return {

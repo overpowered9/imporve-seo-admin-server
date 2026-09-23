@@ -13,6 +13,8 @@ import { createFakeSql } from '../../test/helpers/fake-sql.js';
 import { createFakeStripe } from '../../test/helpers/fake-stripe.js';
 import {
   chargeProrationNow,
+  usDateProrationDescription,
+  usDateProrationLines,
   dayAlignedProrationDate,
   groupProrationLines,
   nameChangeGroups,
@@ -607,5 +609,141 @@ describe('chargeProrationNow', () => {
     assert.deepEqual(calls.voidInvoice, ['in_1']);
     assert.equal(calls.pay.length, 0);
     assert.equal(charge.amountCents, 0);
+  });
+});
+
+// ── US date order on the upgrade invoice ─────────────────────────────────────
+//
+// QA: the invoice read "Remaining time on Scale plan after 12 Sep 2026", and a
+// US customer reads dates as "Sep 12, 2026". Stripe writes that text itself and
+// ignores preferred_locales for it (checked in test mode), so the draft's lines
+// are rewritten before the invoice is paid.
+describe('usDateProrationDescription', () => {
+  test('reorders Stripe\'s date into US order', () => {
+    assert.equal(
+      usDateProrationDescription('Remaining time on Scale plan after 12 Sep 2026'),
+      'Remaining time on Scale plan after Sep 12, 2026',
+    );
+    assert.equal(
+      usDateProrationDescription('Unused time on Optimize plan after 12 Sep 2026'),
+      'Unused time on Optimize plan after Sep 12, 2026',
+    );
+  });
+
+  test('drops a leading zero rather than printing "Sep 01"', () => {
+    assert.equal(
+      usDateProrationDescription('Unused time on Grow plan after 01 Oct 2026'),
+      'Unused time on Grow plan after Oct 1, 2026',
+    );
+    assert.equal(
+      usDateProrationDescription('Unused time on Grow plan after 3 Jan 2027'),
+      'Unused time on Grow plan after Jan 3, 2027',
+    );
+  });
+
+  test('anything else comes back untouched — including a line already rewritten', () => {
+    for (const text of [
+      'Remaining time on Scale plan after Sep 12, 2026',
+      'Optimize × 1 (2 Sep 2026 – 2 Oct 2026)',
+      'Prorated charge for your plan upgrade',
+      '',
+    ]) {
+      assert.equal(usDateProrationDescription(text), text);
+    }
+  });
+});
+
+describe('usDateProrationLines / chargeProrationNow', () => {
+  const draftWith = (lines: any[], over: any = {}) => ({
+    id: 'in_1', status: 'draft', amount_due: 1549, currency: 'usd',
+    lines: { data: lines, has_more: false }, ...over,
+  });
+
+  const CLOVER_DRAFT_LINES = [
+    {
+      id: 'il_unused',
+      description: 'Unused time on Grow plan after 20 Sep 2026',
+      amount: -950,
+      parent: { subscription_item_details: { proration: true, invoice_item: 'ii_1' } },
+    },
+    {
+      id: 'il_remaining',
+      description: 'Remaining time on Optimize plan after 20 Sep 2026',
+      amount: 2500,
+      parent: { subscription_item_details: { proration: true, invoice_item: 'ii_2' } },
+    },
+    {
+      id: 'il_recurring',
+      description: 'Optimize × 1 (20 Sep 2026 – 20 Oct 2026)',
+      amount: 2500,
+      parent: { subscription_item_details: { proration: false } },
+    },
+  ];
+
+  const fakeStripe = (draft: any, { failUpdate = false } = {}) => {
+    const calls: Record<string, any[]> = { updateLineItem: [], pay: [], listLineItems: [] };
+    const api = {
+      invoices: {
+        async create() { return draft; },
+        async updateLineItem(invoiceId: string, lineId: string, params: any) {
+          calls.updateLineItem.push([invoiceId, lineId, params]);
+          if (failUpdate) throw new Error('This line cannot be updated');
+          return {};
+        },
+        async listLineItems(invoiceId: string, params: any) {
+          calls.listLineItems.push([invoiceId, params]);
+          return { data: CLOVER_DRAFT_LINES };
+        },
+        async pay(id: string) {
+          calls.pay.push(id);
+          return { id, status: 'paid', amount_paid: draft.amount_due, currency: 'usd', hosted_invoice_url: 'https://receipt' };
+        },
+        async voidInvoice(id: string) { return { id }; },
+      },
+    };
+    return { api: api as any, calls };
+  };
+
+  test('rewrites the proration lines, and only those, before paying', async () => {
+    const { api, calls } = fakeStripe(draftWith(CLOVER_DRAFT_LINES));
+    const charge = await chargeProrationNow(api, { customerId: 'cus_1', subscriptionId: 'sub_1' });
+
+    assert.deepEqual(calls.updateLineItem, [
+      ['in_1', 'il_unused', { description: 'Unused time on Grow plan after Sep 20, 2026' }],
+      ['in_1', 'il_remaining', { description: 'Remaining time on Optimize plan after Sep 20, 2026' }],
+    ]);
+    assert.deepEqual(calls.pay, ['in_1']);
+    assert.equal(charge.paid, true);
+  });
+
+  test('a refused rewrite never stops the charge', async () => {
+    const { api, calls } = fakeStripe(draftWith(CLOVER_DRAFT_LINES), { failUpdate: true });
+    const charge = await chargeProrationNow(api, { customerId: 'cus_1', subscriptionId: 'sub_1' });
+
+    assert.equal(calls.updateLineItem.length, 2, 'both were attempted');
+    assert.deepEqual(calls.pay, ['in_1']);
+    assert.equal(charge.paid, true);
+    assert.equal(charge.error, null);
+  });
+
+  test('an invoice that is no longer a draft is left alone', async () => {
+    const { api, calls } = fakeStripe(draftWith(CLOVER_DRAFT_LINES, { status: 'paid' }));
+    assert.equal(await usDateProrationLines(api, draftWith(CLOVER_DRAFT_LINES, { status: 'paid' })), 0);
+    assert.equal(calls.updateLineItem.length, 0);
+  });
+
+  test('reads every line when the draft only carries the first page', async () => {
+    const { api, calls } = fakeStripe(draftWith([], { lines: { data: [], has_more: true } }));
+    const rewritten = await usDateProrationLines(api, draftWith([], { lines: { data: [], has_more: true } }));
+
+    assert.equal(calls.listLineItems.length, 1);
+    assert.equal(rewritten, 2);
+  });
+
+  test('a $0 invoice is voided without spending calls on its lines', async () => {
+    const { api, calls } = fakeStripe(draftWith(CLOVER_DRAFT_LINES, { amount_due: 0 }));
+    await chargeProrationNow(api, { customerId: 'cus_1', subscriptionId: 'sub_1' });
+    assert.equal(calls.updateLineItem.length, 0);
+    assert.equal(calls.pay.length, 0);
   });
 });
