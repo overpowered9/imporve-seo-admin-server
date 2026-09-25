@@ -2099,6 +2099,29 @@ export const clearWebsiteConnection = async (website_id: number): Promise<void> 
 };
 
 
+/**
+ * Re-point a website (and so its site code) at a different domain.
+ *
+ * Called from apiAuth when the plugin SAVES a valid API key + site code on a WordPress site
+ * whose domain differs from the one stored for that code (`x-site-claim`). "Last save wins":
+ * the saving site becomes this website, and the domain it was registered to before is refused
+ * from then on by the domain check, so it drops to disconnected on its own. No row is created,
+ * so plan website limits are untouched; trials are per account, so nothing trial-related moves.
+ *
+ * `domain` must already be normalised (bare host, no www) — the shape POST /websites stores.
+ * Only an active row is moved: a soft-deleted website cannot authenticate in the first place.
+ *
+ * Awaited by its caller and allowed to throw: it is the whole point of the claiming request,
+ * so a failed write must surface instead of letting a claim silently not happen.
+ */
+export const rebindWebsiteDomain = async (website_id: number, domain: string): Promise<void> => {
+  await sql`
+    UPDATE websites
+    SET domain = ${domain}
+    WHERE id = ${website_id} AND active = true
+  `;
+};
+
 export const deleteWebsite = async (website_id: number): Promise<void> => {
   // Soft delete — preserves domain history so trial_used flag is never lost
   await sql`
