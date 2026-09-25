@@ -1,10 +1,21 @@
 import { Request, Response, NextFunction } from 'express';
-import { findUserByApiKey, findWebsiteByCode, getUserCreditBalance, reconcileTrialCredits, touchWebsiteConnection, rebindWebsiteDomain, ISEO_CREDIT_TYPE } from '../models/user.models.js';
-import { normalizeDomain, isSiteClaim } from '../utils/siteDomain.js';
+import { findUserByApiKey, findWebsiteByCode, getUserCreditBalance, reconcileTrialCredits, touchWebsiteConnection, ISEO_CREDIT_TYPE } from '../models/user.models.js';
 
 export interface AuthenticatedRequest extends Request {
   user?: any;
   website?: any;
+}
+
+/** Strips scheme, "www.", path, query, trailing dot and port so "https://www.example.com/" and "example.com:443" compare equal. */
+function normalizeDomain(input: string): string {
+  return input
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .replace(/[/?#].*$/, '')
+    .replace(/:\d+$/, '')
+    .replace(/\.$/, '');
 }
 
 /**
@@ -96,61 +107,27 @@ const authenticate = ({ stampConnection }: { stampConnection: boolean }) =>
     // plugin, and refusing them would lock out sites that are correctly connected today.
     // website.domain being empty is treated the same way: a legacy row with no domain
     // recorded must not reject the one site it actually belongs to.
-    //
-    // ── Claim on save: "last save wins" ─────────────────────────────────────
-    // A site code is not welded to the domain it was first registered for. When someone SAVES
-    // a valid API key + site code on their WordPress Settings screen, the plugin sends
-    // `x-site-claim: 1` with its x-site-domain (utils/siteDomain.ts isSiteClaim), and a
-    // mismatch then MOVES that website to the saving domain instead of refusing it. The site
-    // that saved becomes this website (the CMS shows it Active once the plugin pings), and the
-    // domain it was registered to before is refused from here on by this same check — so it
-    // drops to disconnected by itself. The plugin reports the pair it just replaced as
-    // disconnected too, so the website this site used to be connected as goes Inactive.
-    //
-    // Only a claim moves anything. Generation, heartbeat and the "Confirm website connection"
-    // button never send the header, so they are still refused on a mismatch, and background
-    // traffic from two sites holding the same code cannot flip it back and forth. What a claim
-    // proves is what this check could ever prove: x-site-domain is asserted by the plugin (see
-    // the note on DOMAIN_ENFORCEMENT), so the caller already holds the account's API key and
-    // one of its own site codes — the guard is against a code pasted into the wrong site by
-    // mistake, and a deliberate save of that code on this site is the owner saying it is not
-    // a mistake.
     const claimedDomain = (req.headers['x-site-domain'] as string) || origin;
 
-    if (DOMAIN_ENFORCEMENT !== 'off' && claimedDomain) {
+    if (DOMAIN_ENFORCEMENT !== 'off' && claimedDomain && website.domain) {
       const claimed = normalizeDomain(claimedDomain);
-      const registered = website.domain ? normalizeDomain(website.domain) : '';
+      const registered = normalizeDomain(website.domain);
 
-      if (claimed && claimed !== registered) {
-        if (isSiteClaim(req.headers)) {
-          // Awaited: moving the website is the point of this request, and everything after
-          // this line (the status response, the connection stamp) must see the new domain.
-          await rebindWebsiteDomain(website.id, claimed);
-          console.info(
-            `ISEO_SITE_CLAIMED user=${user.id} website=${website.id} site_code=${site_code} ` +
-            `from=${registered || '(none)'} to=${claimed} path=${req.originalUrl}`
-          );
-          website.domain = claimed;
-        } else if (registered) {
-          // One greppable line per mismatch — this is the signal that says whether flipping
-          // ISEO_DOMAIN_ENFORCEMENT to 'enforce' would break real customers.
-          console.warn(
-            `ISEO_DOMAIN_MISMATCH mode=${DOMAIN_ENFORCEMENT} user=${user.id} website=${website.id} ` +
-            `site_code=${site_code} registered=${registered} claimed=${claimed} ` +
-            `source=${req.headers['x-site-domain'] ? 'x-site-domain' : 'origin'} path=${req.originalUrl}`
-          );
+      if (claimed !== registered) {
+        // One greppable line per mismatch — this is the signal that says whether flipping
+        // ISEO_DOMAIN_ENFORCEMENT to 'enforce' would break real customers.
+        console.warn(
+          `ISEO_DOMAIN_MISMATCH mode=${DOMAIN_ENFORCEMENT} user=${user.id} website=${website.id} ` +
+          `site_code=${site_code} registered=${registered} claimed=${claimed} ` +
+          `source=${req.headers['x-site-domain'] ? 'x-site-domain' : 'origin'} path=${req.originalUrl}`
+        );
 
-          if (DOMAIN_ENFORCEMENT === 'enforce') {
-            return res.status(403).json({
-              success: false,
-              error: "This Site Code does not belong to this website's domain.",
-              // Stable, machine-readable: lets a client tell this refusal apart from a wrong
-              // API key (401) or a site code from another account (403 without this code).
-              code: 'SITE_DOMAIN_MISMATCH',
-            });
-          }
+        if (DOMAIN_ENFORCEMENT === 'enforce') {
+          return res.status(403).json({
+            success: false,
+            error: "This Site Code does not belong to this website's domain."
+          });
         }
-        // No claim and no domain on record: a legacy row, left permissive as before.
       }
     }
 
