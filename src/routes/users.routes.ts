@@ -1002,9 +1002,46 @@ router.post('/regenerate-api-key/:user_id', async (req, res) => {
  * Note this suppresses LIFECYCLE mail only. Billing receipts continue, because
  * a customer who is being charged has to be told — see suppressionReason.
  */
-const handleUnsubscribe = async (token: string, res: ExpressResponse) => {
+/**
+ * The page a browser gets. (One-Click POST still gets JSON.)
+ *
+ * Served from here rather than redirecting to the CMS because the CMS has no
+ * /unsubscribe route — the link in every lifecycle email pointed at
+ * `${CMS_BASE_URL}/unsubscribe`, fell through the SPA's catch-all, and bounced
+ * the reader to a login screen. An unsubscribe link that demands a login is a
+ * broken unsubscribe link, and mailbox providers judge us on it.
+ *
+ * Self-contained HTML with no assets: this has to render for someone who has
+ * just told us to stop emailing them, which is the worst possible moment for a
+ * dependency to fail.
+ */
+const unsubscribePage = (ok: boolean, message: string): string => `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${ok ? 'Unsubscribed' : 'Link expired'} &middot; ImproveSEO</title></head>
+<body style="margin:0;background:#FAF9FB;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">
+  <div style="max-width:520px;margin:0 auto;padding:64px 20px;">
+    <div style="font-size:19px;font-weight:700;color:#0B1229;letter-spacing:-0.3px;margin-bottom:24px;">Improve<span style="color:#FF7A59;">SEO</span></div>
+    <div style="background:#fff;border:1px solid #E8E8ED;border-radius:12px;padding:36px 32px;">
+      <h1 style="margin:0 0 14px;font-size:21px;color:#0B1229;">${ok ? "You're unsubscribed" : 'This link is no longer valid'}</h1>
+      <p style="margin:0 0 10px;font-size:15px;line-height:1.65;color:#3A3F44;">${message}</p>
+    </div>
+    <p style="margin:18px 0 0;font-size:12px;color:#6B7280;">&copy; ${new Date().getFullYear()} ImproveSEO</p>
+  </div>
+</body></html>`;
+
+const handleUnsubscribe = async (
+  token: string,
+  res: ExpressResponse,
+  format: 'html' | 'json' = 'json',
+) => {
+  /** Answer in whichever shape the caller asked for. */
+  const reply = (status: number, ok: boolean, message: string) =>
+    format === 'html'
+      ? res.status(status).type('html').send(unsubscribePage(ok, message))
+      : res.status(status).json(ok ? { success: true, message } : { success: false, error: message });
+
   if (!token || token.length < 16) {
-    return res.status(400).json({ success: false, error: 'Invalid unsubscribe link.' });
+    return reply(400, false, 'That unsubscribe link looks incomplete. Please use the link exactly as it appears in the email.');
   }
 
   const rows = await sql`
@@ -1018,22 +1055,23 @@ const handleUnsubscribe = async (token: string, res: ExpressResponse) => {
     // Do not distinguish "no such token" from any other failure: the endpoint
     // is unauthenticated, and a precise answer turns it into an oracle for
     // probing valid tokens.
-    return res.status(400).json({ success: false, error: 'This unsubscribe link is no longer valid.' });
+    return reply(400, false, 'This unsubscribe link is no longer valid. If you are still receiving product emails, reply to one of them and we will stop them by hand.');
   }
 
   console.log(`[unsubscribe] user ${rows[0].id} opted out of lifecycle email`);
-  return res.json({
-    success: true,
-    message: 'You have been unsubscribed from product emails. You will still receive billing receipts.',
-  });
+  return reply(
+    200,
+    true,
+    'You will not receive any more product emails from us. You will still get billing receipts — we have to tell you when your card is charged.',
+  );
 };
 
 router.get('/unsubscribe', async (req, res) => {
   try {
-    await handleUnsubscribe(String(req.query.token || ''), res);
+    await handleUnsubscribe(String(req.query.token || ''), res, 'html');
   } catch (error) {
     console.error('Unsubscribe error:', error);
-    res.status(500).json({ success: false, error: 'Could not process the unsubscribe. Please contact support.' });
+    res.status(500).type('html').send(unsubscribePage(false, 'Something went wrong on our end. Please reply to any of our emails and we will unsubscribe you by hand.'));
   }
 });
 

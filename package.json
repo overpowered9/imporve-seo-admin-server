@@ -45,7 +45,10 @@
     "migrate:websites-domain-index": "tsx src/migrations/018-websites-domain-index.ts",
     "migrate:keyword-daily-usage": "tsx src/migrations/019-keyword-daily-usage.ts",
     "migrate:website-limits-v2": "tsx src/migrations/020-plan-website-limits-v2.ts",
-    "migrate:plan-stripe-products": "tsx src/migrations/021-plan-stripe-products.ts"
+    "migrate:plan-stripe-products": "tsx src/migrations/021-plan-stripe-products.ts",
+    "email:preview": "tsx src/scripts/preview-emails.ts",
+    "email:requeue": "tsx src/scripts/requeue-blocked-emails.ts",
+    "email:test": "tsx src/scripts/send-test-email.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",

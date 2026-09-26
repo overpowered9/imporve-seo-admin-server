@@ -187,7 +187,21 @@ export async function runNotificationJob<T extends Candidate>(
 
     for (const candidate of candidates) {
       result.scanned++;
-      const key = job.dedupeKey(candidate);
+
+      // Inside its own try, because it was outside every try and it CAN throw:
+      // trial_ended builds its key with `new Date(...).toISOString()`, which
+      // raises RangeError on a null or malformed timestamp. One such row used
+      // to abort the entire pass — not just that job, but every job after it in
+      // runAllNotificationJobs, silently, for every other account. A single bad
+      // row must cost one email, not the whole night's run.
+      let key: string;
+      try {
+        key = job.dedupeKey(candidate);
+      } catch (err) {
+        result.errors++;
+        console.error(`[${job.name}] skipping user ${candidate.user_id}: cannot build a dedupe key:`, err);
+        continue;
+      }
 
       if (dryRun) {
         result.wouldEmail.push({ userId: candidate.user_id, email: candidate.email, dedupeKey: key });
@@ -519,7 +533,19 @@ export const trialEndedJob = (cfg: NotificationConfig): JobDefinition => ({
   // The trial-end timestamp identifies the occurrence. `kind` is already
   // 'trial_ended' in the composite (user_id, kind, dedupe_key) key, so the
   // key itself does not need to repeat that.
-  dedupeKey: (c) => `ended:${new Date(c.trial_end).toISOString()}`,
+  //
+  // Guarded against an unparseable timestamp. The candidate query only selects
+  // rows with a trial end, but this is the one key in the file built by parsing
+  // a date, and an invalid Date here throws rather than returning something
+  // odd. Falling back to the user id still identifies the occurrence uniquely —
+  // a trial ends once per account — so a strange row is still deduped, just not
+  // by date.
+  dedupeKey: (c) => {
+    const endedAt = new Date(c.trial_end);
+    return Number.isNaN(endedAt.getTime())
+      ? `ended:user:${c.user_id}`
+      : `ended:${endedAt.toISOString()}`;
+  },
 
   payload: (c, config) => ({
     firstName: firstNameOf(c.name, c.email),
@@ -537,38 +563,17 @@ export async function runAllNotificationJobs(
 
   // ── BILL-007 — one pass per configured lead time ─────────────────────────
   //
-  // GATED SEPARATELY from LIFECYCLE_EMAILS_ENABLED, because the template this
-  // queues still reads "[PLACEHOLDER] Your credits expire in 14 days" and the
-  // runbook's claim that the lifecycle gate keeps it off is no longer true —
-  // LIFECYCLE_EMAILS_ENABLED is set, the scheduler runs daily, and the only
-  // reason nothing has been sent is that the job matches EXACTLY N days out and
-  // no account has yet been that close to expiry. The first one to cross 14
-  // days would have received placeholder copy from a live domain.
+  // The per-job gate ISEO_CREDIT_EXPIRY_EMAILS_ENABLED is GONE. It existed for
+  // one reason — this job's template was [PLACEHOLDER] copy that
+  // LIFECYCLE_EMAILS_ENABLED alone would not have kept off a live domain — and
+  // that reason no longer holds: the template carries final copy, and the
+  // worker now refuses to send any render containing placeholder tokens, so the
+  // failure the gate was defending against cannot reach a customer regardless.
   //
-  // Scoped to this job alone so the inactivity job and the rest of the
-  // lifecycle machinery keep working. Dry runs still report exactly who would
-  // be emailed, so the trigger stays demonstrable while it is switched off.
-  //
-  // Flip ISEO_CREDIT_EXPIRY_EMAILS_ENABLED=true once the real copy is in
-  // email.service.ts (creditsExpiringPlaceholder).
-  const creditExpiryEmailsEnabled =
-    String(process.env.ISEO_CREDIT_EXPIRY_EMAILS_ENABLED || 'false').toLowerCase() === 'true';
-
+  // Keeping it would mean a switch whose only remaining effect is to silently
+  // disable a working email, which is how an expiry warning goes unnoticed for
+  // a year. LIFECYCLE_EMAILS_ENABLED remains the one switch for all of this.
   for (const leadDays of cfg.creditExpiryLeadDays) {
-    if (!creditExpiryEmailsEnabled) {
-      // Reported rather than skipped silently: a job that vanishes from the
-      // output looks like a bug, and the runbook's dry run is how anyone
-      // checks what this scheduler does.
-      results.push({
-        name: `credit_expiry(${leadDays}d) — DISABLED (ISEO_CREDIT_EXPIRY_EMAILS_ENABLED)`,
-        scanned: 0,
-        queued: 0,
-        skippedDuplicate: 0,
-        errors: 0,
-        wouldEmail: [],
-      });
-      continue;
-    }
     const result = await runNotificationJob(sql, creditExpiryJob(leadDays, cfg), cfg, options);
     result.name = `credit_expiry(${leadDays}d)`;
     results.push(result);
@@ -579,29 +584,10 @@ export async function runAllNotificationJobs(
 
   // ── Trial ended → moved to Free plan ──────────────────────────────────────
   //
-  // Gated the same way credit_expiry is, and for the identical reason: the
-  // template this queues is still [PLACEHOLDER] copy. LIFECYCLE_EMAILS_ENABLED
-  // alone was already shown (see the credit_expiry comment above) not to be a
-  // safe substitute for a per-job gate — it is set in production for
-  // inactivity, and a broader "lifecycle emails are on" flag says nothing
-  // about whether THIS job's specific copy is ready. Flip
-  // TRIAL_ENDED_EMAIL_ENABLED=true once the real copy replaces
-  // trialEndedPlaceholder in email.service.ts.
-  const trialEndedEmailsEnabled =
-    String(process.env.TRIAL_ENDED_EMAIL_ENABLED || 'false').toLowerCase() === 'true';
-
-  if (!trialEndedEmailsEnabled) {
-    results.push({
-      name: 'trial_ended — DISABLED (TRIAL_ENDED_EMAIL_ENABLED)',
-      scanned: 0,
-      queued: 0,
-      skippedDuplicate: 0,
-      errors: 0,
-      wouldEmail: [],
-    });
-  } else {
-    results.push(await runNotificationJob(sql, trialEndedJob(cfg), cfg, options));
-  }
+  // TRIAL_ENDED_EMAIL_ENABLED is gone for the same reason as the credit-expiry
+  // gate above: it guarded placeholder copy that no longer exists, and a switch
+  // that only ever disables a finished email is a trap rather than a safeguard.
+  results.push(await runNotificationJob(sql, trialEndedJob(cfg), cfg, options));
 
   // ── The sweep that actually takes the credits away ────────────────────────
   // Runs AFTER the warnings, so a lot that reaches zero lead time is warned

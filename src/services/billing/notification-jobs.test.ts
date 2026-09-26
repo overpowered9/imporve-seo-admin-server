@@ -426,55 +426,41 @@ describe('shared runner', () => {
     );
   });
 
-  test('the placeholder credit-expiry email is OFF unless explicitly enabled', async () => {
-    // It queues a template that literally reads "[PLACEHOLDER] Your credits
-    // expire in 14 days", from a live Mailgun domain, to every account that
-    // crosses the threshold. LIFECYCLE_EMAILS_ENABLED does NOT hold it back —
-    // that is set, and the scheduler runs daily.
-    const previous = process.env.ISEO_CREDIT_EXPIRY_EMAILS_ENABLED;
-    delete process.env.ISEO_CREDIT_EXPIRY_EMAILS_ENABLED;
-    try {
-      const { sql, queued } = sqlWithConstraints([candidate({ expiring_total: 100 })]);
-      // dryRun: true deliberately. The gate is checked before the runner, so a
-      // dry run proves it just as well — and runExpirySweep() ignores the
-      // injected sql and writes to the REAL database, so a test that passes
-      // dryRun:false expires production lots. Found the hard way.
-      const results = await runAllNotificationJobs(sql, { dryRun: true });
-      const expiry = results.filter((r) => /^credit_expiry\(/.test(r.name));
+  test('the credit-expiry job runs now that its copy is final', async () => {
+    // INVERTED from what this used to assert. It previously required the job to
+    // be OFF, because the template it queues read "[PLACEHOLDER] Your credits
+    // expire in 14 days" and would have gone to the first account to cross the
+    // threshold. The copy is now final and the per-job gate
+    // (ISEO_CREDIT_EXPIRY_EMAILS_ENABLED) has been deleted, so the thing this
+    // test must now protect is the opposite: that the warning actually fires.
+    //
+    // dryRun: true deliberately — runExpirySweep() ignores the injected sql and
+    // writes to the REAL database, so dryRun:false here expires production
+    // lots. Found the hard way.
+    const { sql } = sqlWithConstraints([candidate({ expiring_total: 100 })]);
+    const results = await runAllNotificationJobs(sql, { dryRun: true });
+    const expiry = results.filter((r) => /^credit_expiry\(/.test(r.name));
 
-      assert.equal(expiry.length, 3, 'the passes are still reported');
-      for (const r of expiry) {
-        assert.match(r.name, /DISABLED/, 'and are visibly marked as off');
-        assert.equal(r.queued, 0);
-        assert.equal(r.wouldEmail.length, 0);
-      }
-      assert.equal(queued.size, 0, 'nothing reached the outbox');
-    } finally {
-      if (previous === undefined) delete process.env.ISEO_CREDIT_EXPIRY_EMAILS_ENABLED;
-      else process.env.ISEO_CREDIT_EXPIRY_EMAILS_ENABLED = previous;
+    assert.equal(expiry.length, 3, 'one pass per configured lead time');
+    for (const r of expiry) {
+      assert.doesNotMatch(r.name, /DISABLED/, 'no gate silently holds this back any more');
     }
+    assert.ok(
+      expiry.some((r) => r.wouldEmail.length > 0),
+      'an account at the threshold is actually warned',
+    );
   });
 
-  test('the placeholder trial-ended email is OFF unless explicitly enabled', async () => {
-    // Same reasoning as credit_expiry above: the queued template still reads
-    // "[PLACEHOLDER] Your free trial has ended" — this must not reach a real
-    // inbox until TRIAL_ENDED_EMAIL_ENABLED is flipped on.
-    const previous = process.env.TRIAL_ENDED_EMAIL_ENABLED;
-    delete process.env.TRIAL_ENDED_EMAIL_ENABLED;
-    try {
-      const { sql, queued } = sqlWithConstraints([candidate()]);
-      const results = await runAllNotificationJobs(sql, { dryRun: true });
-      const trialEnded = results.find((r) => /^trial_ended/.test(r.name));
+  test('the trial-ended job runs now that its copy is final', async () => {
+    // Also inverted, for the same reason as credit_expiry above: the
+    // TRIAL_ENDED_EMAIL_ENABLED gate guarded placeholder copy that no longer
+    // exists, so what needs protecting is that the email fires at all.
+    const { sql } = sqlWithConstraints([candidate()]);
+    const results = await runAllNotificationJobs(sql, { dryRun: true });
+    const trialEnded = results.find((r) => /^trial_ended/.test(r.name));
 
-      assert.ok(trialEnded, 'the pass is still reported');
-      assert.match(trialEnded.name, /DISABLED/, 'and visibly marked as off');
-      assert.equal(trialEnded.queued, 0);
-      assert.equal(trialEnded.wouldEmail.length, 0);
-      assert.equal(queued.size, 0, 'nothing reached the outbox');
-    } finally {
-      if (previous === undefined) delete process.env.TRIAL_ENDED_EMAIL_ENABLED;
-      else process.env.TRIAL_ENDED_EMAIL_ENABLED = previous;
-    }
+    assert.ok(trialEnded, 'the job is reported');
+    assert.doesNotMatch(trialEnded.name, /DISABLED/, 'no gate silently holds it back');
   });
 });
 

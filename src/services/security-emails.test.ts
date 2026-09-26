@@ -12,12 +12,7 @@ import {
   confirmPasswordChange, queuePasswordConfirmation, passwordTemplateFor, passwordMethodFor,
   verifiedSessionEmail, sameEmail, formatChangedAt, type TokenResolver,
 } from './security-emails.js';
-import { RENDERERS } from './billing/email-worker.js';
-
-/** This branch has no worker-side guard; the same check, locally. */
-const unrenderedTokensIn = (r: { subject: string; text: string }): string[] =>
-  [/\bundefined\b/, /\bnull\b/, /\bNaN\b/, /\[object Object\]/, /\$\{/]
-    .filter((re) => re.test(`${r.subject}\n${r.text}`)).map(String);
+import { RENDERERS, unrenderedTokensIn } from './billing/email-worker.js';
 
 const USER = { id: 51, email: 'Owner@Example.com', name: 'Muhammad Waleed Hassan' };
 const AT = new Date('2026-09-23T14:05:00Z');

@@ -107,6 +107,7 @@ import {
   isLiveStatus,
 } from '../services/billing/subscription-state.js';
 import { periodEndOf, periodEndOrWarn, periodStartOf } from '../services/billing/subscription-period.js';
+import type { RecordTransactionInput } from '../services/billing/transactions.js';
 import {
   recordTransaction,
   transactionsFromInvoice,
@@ -321,9 +322,15 @@ const activateSubscriptionInDb = async (params: {
   `;
 
   const planResult = await sql`SELECT * FROM subscription_plans WHERE id = ${planId}`;
+  // What the plan actually granted, carried to the ledger row below so Account
+  // Activity's Credits column reads "+200" rather than "—". Taken from the
+  // grant itself rather than re-derived from the plan here: two readings of an
+  // allotment are two numbers that can disagree, and the one the customer sees
+  // must be the one they received.
+  let planCreditsGranted: number | null = null;
   if (planResult.length > 0) {
     // Reset the plan (included) credits; purchased top-ups are preserved.
-    await refillPlanCredits(userId, planResult[0], 'Subscription activated');
+    planCreditsGranted = await refillPlanCredits(userId, planResult[0], 'Subscription activated');
   }
 
   // ── Record the ledger row HERE, not only from invoice.payment_succeeded ──
@@ -367,6 +374,8 @@ const activateSubscriptionInDb = async (params: {
       amountCents: firstCharge?.amountCents ?? null,
       currency: firstCharge?.currency ?? null,
       receiptUrl: firstCharge?.receiptUrl ?? null,
+      creditType: planCreditsGranted === null ? null : ISEO_CREDIT_TYPE,
+      creditDelta: planCreditsGranted,
     });
   } catch (ledgerError) {
     // recordTransaction never throws; this guards anything around it. A
@@ -439,6 +448,40 @@ const applyCreditTopupOnce = async (session: Stripe.Checkout.Session): Promise<b
   });
 
   if (!granted) return false;
+
+  // ── Credit pack receipt, Checkout path ────────────────────────────────────
+  // Queued HERE rather than in the webhook case, because this function is also
+  // reached from /verify-session when the browser comes back before the webhook
+  // lands. Putting it at the grant means the receipt follows the credits
+  // wherever they were granted from, and `granted` being true exactly once is
+  // what keeps it to a single email.
+  const packBalance = await getLiveBalance(userId).then((b) => b.total).catch(() => null);
+  const packCard = await getLocalDefaultPaymentMethod(sql, userId).catch(() => null);
+  const topupExpiry = new Date();
+  topupExpiry.setMonth(topupExpiry.getMonth() + PURCHASED_CREDIT_LIFETIME_MONTHS);
+
+  await queueBillingEmail(
+    userId,
+    'billing.credit_purchase',
+    `credit_purchase:${session.id}`,
+    (firstName) => ({
+      firstName,
+      packName: `${quantity.toLocaleString()} ISEO credits`,
+      creditsAdded: `${quantity.toLocaleString()} credits`,
+      newBalance: packBalance !== null
+        ? `${Number(packBalance).toLocaleString()} credits`
+        : `${quantity.toLocaleString()} credits added`,
+      amountCharged: formatCents(
+        typeof session.amount_total === 'number' ? session.amount_total : 0,
+        session.currency || 'usd',
+      ),
+      cardBrand: packCard?.brand ?? null,
+      cardLast4: packCard?.last4 ?? null,
+      receiptUrl,
+      expiresOn: topupExpiry.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+      creditsUrl: CMS_BILLING_URL,
+    }),
+  );
 
   console.log(`✅ Applied top-up of ${quantity} ${creditType} credits to user ${userId} (session ${session.id})`);
   return true;
@@ -541,6 +584,14 @@ interface CreditPackCharge {
   paid: boolean;
   receiptUrl: string | null;
   reason: string | null;
+  /**
+   * The invoice this purchase was charged on.
+   *
+   * Carried back out so the receipt email can be keyed on the billing event
+   * rather than on the moment the request happened — a key derived from a
+   * timestamp would make every retry a second email.
+   */
+  invoiceId?: string | null;
 }
 
 /**
@@ -571,7 +622,7 @@ const chargeCreditPackOnCard = async (params: {
   amountCents: number;
   paymentMethodId: string | null;
 }): Promise<CreditPackCharge> => {
-  const nope = (reason: string): CreditPackCharge => ({ paid: false, receiptUrl: null, reason });
+  const nope = (reason: string): CreditPackCharge => ({ paid: false, receiptUrl: null, reason, invoiceId: null });
 
   try {
     const rows = await sql`SELECT stripe_customer_id FROM users WHERE id = ${params.userId}`;
@@ -683,7 +734,7 @@ const chargeCreditPackOnCard = async (params: {
       `✅ Charged ${params.amountCents} for ${params.pkg.credits} credits to user ${params.userId}`
       + ` on file (invoice ${paid.id})`,
     );
-    return { paid: true, receiptUrl, reason: null };
+    return { paid: true, receiptUrl, reason: null, invoiceId: paid.id ?? null };
   } catch (err: any) {
     // Declines, authentication_required, Stripe unreachable — all the same to
     // the caller: the card route did not work, use Checkout.
@@ -946,6 +997,47 @@ router.post('/buy-credits', async (req: Request, res: Response) => {
       });
 
       if (charged.paid) {
+        // ── Credit pack receipt ────────────────────────────────────────────
+        // There was none. A customer could be charged for a pack and receive
+        // nothing in writing at all — the largest single source of "did my
+        // payment go through?" tickets, and in most jurisdictions a receipt for
+        // a completed sale is not optional.
+        //
+        // Keyed on the invoice, so the fallback-to-Checkout path below and a
+        // retried request cannot both produce one.
+        const balanceAfter = await getLiveBalance(user_id).then((b) => b.total).catch(() => null);
+        const cardForReceipt = await getLocalDefaultPaymentMethod(sql, user_id);
+        // Calendar months, not 30-day blocks: the grant itself expires on a
+        // calendar boundary, and a receipt that names a date two days off the
+        // real one is worse than naming no date.
+        const packExpiry = new Date();
+        packExpiry.setMonth(packExpiry.getMonth() + PURCHASED_CREDIT_LIFETIME_MONTHS);
+
+        await queueBillingEmail(
+          user_id,
+          'billing.credit_purchase',
+          `credit_purchase:${charged.invoiceId ?? `${user_id}:${pkg.id}:${amountCents}`}`,
+          (firstName) => ({
+            firstName,
+            packName: `${pkg.credits.toLocaleString()} credits — about ${pkg.approx_pieces} piece${pkg.approx_pieces === 1 ? '' : 's'} of content`,
+            creditsAdded: `${pkg.credits.toLocaleString()} credits`,
+            // Branches rather than interpolating: a failed balance read must
+            // cost one row of the receipt, never the receipt.
+            newBalance: balanceAfter !== null
+              ? `${Number(balanceAfter).toLocaleString()} credits`
+              : `${pkg.credits.toLocaleString()} credits added`,
+            amountCharged: formatCents(amountCents, 'usd'),
+            cardBrand: cardForReceipt?.brand ?? null,
+            cardLast4: cardForReceipt?.last4 ?? null,
+            receiptUrl: charged.receiptUrl,
+            // Stated on the receipt, not only in the expiry warning: "I didn't
+            // know they expired" is not answerable if the confirmation of
+            // purchase never mentioned it.
+            expiresOn: packExpiry.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+            creditsUrl: CMS_BILLING_URL,
+          }),
+        );
+
         return res.json({
           success: true,
           data: {
@@ -1392,7 +1484,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
         if (paidSubscriptionId) {
           // Find user by subscription ID
           const subResult = await sql`
-            SELECT user_id, plan_id FROM subscriptions
+            SELECT user_id, plan_id, billing_interval, next_billing_date FROM subscriptions
             WHERE stripe_subscription_id = ${paidSubscriptionId}
           `;
 
@@ -1410,6 +1502,43 @@ router.post('/webhook', async (req: Request, res: Response) => {
             if (isRenewalInvoice(invoice) && planResult.length > 0) {
               await refillPlanCredits(user_id, planResult[0], 'Monthly plan credits refill');
               console.log(`✅ Monthly plan credits refilled for user ${user_id} (invoice paid)`);
+
+              // ── Renewal receipt ──────────────────────────────────────────
+              // Nothing was sent on renewal: the charge happened, the credits
+              // were topped up, and the customer was told neither. A recurring
+              // charge nobody confirms is the one people find on a statement
+              // months later and dispute.
+              //
+              // Queued inside the isRenewalInvoice guard deliberately, so it
+              // shares exactly the condition that decides a genuine renewal —
+              // a proration invoice from an upgrade must not produce a second
+              // "your plan renewed" email on top of the upgrade receipt.
+              //
+              // Keyed on the INVOICE, which is the billing event itself, so a
+              // redelivered webhook cannot send it twice.
+              const renewalCard = await getLocalDefaultPaymentMethod(sql, user_id).catch(() => null);
+              const isYearly = String(subResult[0].billing_interval || 'month') === 'year';
+
+              await queueBillingEmail(
+                user_id,
+                'billing.renewal',
+                `renewal:${invoice.id}`,
+                (firstName) => ({
+                  firstName,
+                  planName: planResult[0]?.name ?? 'your plan',
+                  amountCharged: formatCents(invoice.amount_paid ?? 0, invoice.currency || 'usd'),
+                  periodLabel: isYearly ? 'another year' : 'another month',
+                  creditsNote: `Your ${isYearly ? 'annual' : 'monthly'} credit allowance has been added to your account.`,
+                  nextBillingDate: subResult[0].next_billing_date
+                    ? new Date(subResult[0].next_billing_date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+                    : null,
+                  cardBrand: renewalCard?.brand ?? null,
+                  cardLast4: renewalCard?.last4 ?? null,
+                  receiptUrl: invoice.hosted_invoice_url || invoice.invoice_pdf || null,
+                  billingUrl: CMS_BILLING_URL,
+                  timezone: 'UTC',
+                }),
+              );
             }
 
             // ── Record only the invoices no other path owns ─────────────────
@@ -1476,8 +1605,10 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
         if (failedSubscriptionId) {
           const subResult = await sql`
-            SELECT user_id FROM subscriptions
-            WHERE stripe_subscription_id = ${failedSubscriptionId}
+            SELECT s.user_id, s.next_billing_date, sp.name AS plan_name
+            FROM   subscriptions s
+            LEFT JOIN subscription_plans sp ON sp.id = s.plan_id
+            WHERE  s.stripe_subscription_id = ${failedSubscriptionId}
           `;
 
           if (subResult.length > 0) {
@@ -1506,6 +1637,56 @@ router.post('/webhook', async (req: Request, res: Response) => {
               providerEventId: `invoice_failed:${invoice.id}`,
               providerObjectId: invoice.id as string,
             });
+
+            // ── Dunning ──────────────────────────────────────────────────────
+            // Nothing was sent here. The subscription was suspended and the
+            // plan credits revoked SILENTLY, so the first a customer knew of a
+            // failed card was their credits not working — with no email to
+            // search for, and no way to tell a billing failure from a bug in
+            // the product. That is the most expensive silence in this file.
+            //
+            // A failed card is almost always an expiry or a bank block rather
+            // than a decision, so the copy treats it as a fixable annoyance
+            // (see the template) and escalates only on the final attempt.
+            //
+            // Keyed on the invoice AND the attempt number: Stripe raises this
+            // event once per retry, and each retry is a genuinely new thing to
+            // tell the customer — but a redelivery of the same attempt is not.
+            const attemptNumber = Number((invoice as any).attempt_count ?? 1);
+            const nextAttempt = (invoice as any).next_payment_attempt as number | null | undefined;
+            const failedCard = await getLocalDefaultPaymentMethod(sql, userId).catch(() => null);
+
+            await queueBillingEmail(
+              userId,
+              'billing.payment_failed',
+              `payment_failed:${invoice.id}:${attemptNumber}`,
+              (firstName) => ({
+                firstName,
+                planName: subResult[0].plan_name || 'your',
+                amountDue: formatCents((invoice as any).amount_due ?? 0, invoice.currency || 'usd'),
+                cardBrand: failedCard?.brand ?? null,
+                cardLast4: failedCard?.last4 ?? null,
+                attemptNumber,
+                nextAttemptDate: nextAttempt
+                  ? new Date(nextAttempt * 1000).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+                  : null,
+                accessEndsOn: subResult[0].next_billing_date
+                  ? new Date(subResult[0].next_billing_date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+                  : null,
+                // States what suspendPlanCredits just did, rather than a
+                // future tense that would be a lie — the credits are already
+                // gone by the time this email is read, and the customer has
+                // very likely noticed. Purchased credits genuinely survive, and
+                // saying so prevents the panicked "I lost what I paid for"
+                // ticket this exact moment generates.
+                creditsNote:
+                  'Your plan credits have been paused while this is outstanding. '
+                  + 'Any credits you purchased separately are untouched and still usable, '
+                  + 'and your plan allowance comes straight back once the payment goes through.',
+                updatePaymentUrl: CMS_BILLING_URL,
+                invoiceUrl: invoice.hosted_invoice_url || null,
+              }),
+            );
 
             console.warn(`⚠️ Payment failed for user ${userId} - subscription suspended, plan credits revoked`);
           }
@@ -1549,6 +1730,39 @@ router.post('/webhook', async (req: Request, res: Response) => {
             providerObjectId: charge.id,
             receiptUrl: charge.receipt_url ?? null,
           });
+
+          // ── Refund confirmation ──────────────────────────────────────────
+          // Support issues refunds in the Stripe dashboard, so until now the
+          // customer's only notice was Stripe's own charge email — if the
+          // account had one configured — and a row appearing in Account
+          // Activity if they went looking. Someone who asked for a refund is
+          // already unhappy; leaving them to wonder whether it happened is the
+          // cheapest unhappiness to remove.
+          //
+          // Keyed on the refunded total, the same key the ledger row uses, so
+          // a partial refund followed by another sends two emails and a
+          // redelivered event sends none.
+          const refundCard = await getLocalDefaultPaymentMethod(sql, owner[0].id).catch(() => null);
+          await queueBillingEmail(
+            owner[0].id,
+            'billing.refund',
+            `refund:${charge.id}:${refunded}`,
+            (firstName) => ({
+              firstName,
+              amountRefunded: formatCents(Math.abs(refunded), charge.currency || 'usd'),
+              // Deliberately vague about the reason: this event carries no
+              // reliable one, and a receipt that guesses why someone was
+              // refunded is worse than a receipt that states only the fact.
+              reasonLabel: 'your ImproveSEO account',
+              cardBrand: refundCard?.brand ?? null,
+              cardLast4: refundCard?.last4 ?? null,
+              // Card networks, not us. Naming the window here is what stops
+              // the "you said you refunded me three days ago" ticket.
+              arrivalWindow: '5–10 business days',
+              creditsNote: null,
+              billingUrl: CMS_BILLING_URL,
+            }),
+          );
 
           console.log(`✅ Refund of ${refunded} recorded for user ${owner[0].id}`);
         } else {
@@ -2540,6 +2754,11 @@ router.post('/change-plan', async (req: Request, res: Response) => {
   // sees quotes the same figures the ledger row recorded.
   let proratedCents: number | null = null;
   let charge: Awaited<ReturnType<typeof chargeProrationNow>> | null = null;
+  // The upgrade's ledger row, kept so the credits it granted can be settled
+  // into it once changePlan reports them — see where it is written. Held as
+  // the whole input rather than just its key: re-listing the fields for the
+  // second call is how a settle ends up contradicting the row it settles.
+  let upgradeLedgerRow: RecordTransactionInput | null = null;
   try {
     // `proration_date` is the timestamp returned by /preview-plan-change. When
     // present it is replayed to Stripe so the customer is charged exactly the
@@ -3029,7 +3248,7 @@ router.post('/change-plan', async (req: Request, res: Response) => {
         // disclosure, so the ledger and the audit trail cannot disagree.
         try {
           if (isUpgrade) {
-            await recordTransaction(sql, {
+            upgradeLedgerRow = {
               userId: user_id,
               type: 'plan_upgrade',
               description: describePlanUpgraded(currentPlan.name, newPlan.name),
@@ -3049,7 +3268,8 @@ router.post('/change-plan', async (req: Request, res: Response) => {
                 `plan_change:${currentSub.stripe_subscription_id}:${new_plan_id}:${Math.floor(Date.now() / 1000)}`,
               providerObjectId: charge?.invoiceId || currentSub.stripe_subscription_id,
               planId: new_plan_id,
-            });
+            };
+            await recordTransaction(sql, upgradeLedgerRow);
           } else {
             // A downgrade raises no invoice — proration_behavior is 'none' and
             // nothing is charged today. It is still an event the customer needs
@@ -3107,6 +3327,26 @@ router.post('/change-plan', async (req: Request, res: Response) => {
     // Update database (only after Stripe succeeds)
     const { creditsGranted } = await changePlan(user_id, new_plan_id, isUpgrade);
 
+    // ── Settle the granted credits into the row written above ───────────────
+    // Account Activity showed "—" in the Credits column for every plan change,
+    // because the ledger row is written BEFORE the grant runs — deliberately,
+    // so a proration that was collected is recorded even if the database write
+    // that follows it fails — and nothing ever went back to say how many
+    // credits the change produced.
+    //
+    // The same input object is re-sent with the figure added, so the upsert
+    // matches on its key and fills the column in place. Re-sending the object
+    // rather than a fresh one keeps the settle from disagreeing with the row
+    // it settles: a second literal here would be a second chance to state the
+    // status or the amount differently.
+    if (upgradeLedgerRow && creditsGranted > 0) {
+      await recordTransaction(sql, {
+        ...upgradeLedgerRow,
+        creditType: ISEO_CREDIT_TYPE,
+        creditDelta: creditsGranted,
+      });
+    }
+
     // Read AFTER the grant, so the confirmation quotes the balance the user
     // will actually see when the page refreshes behind the dialog.
     let creditsTotal: number | null = null;
@@ -3158,6 +3398,41 @@ router.post('/change-plan', async (req: Request, res: Response) => {
             : null,
           cardBrand: pmForReceipt?.brand ?? null,
           cardLast4: pmForReceipt?.last4 ?? null,
+          billingUrl: CMS_BILLING_URL,
+          timezone: 'UTC',
+        }),
+      );
+    } else {
+      // Downgrade confirmation.
+      //
+      // This branch did not exist: the receipt was inside `if (isUpgrade)`, so
+      // the one plan change that REDUCES what someone gets was the only change
+      // we never confirmed in writing. It is also the change most likely to be
+      // queried later ("I thought I'd cancelled", "what happens to my
+      // credits?"), and the answer to both is in this email.
+      //
+      // Keyed on the subscription plus the target plan and the date it takes
+      // effect: downgrading twice to the same plan in one period is one email,
+      // while a later downgrade to a different plan sends its own.
+      const effectiveDate = currentSub.next_billing_date
+        ? new Date(currentSub.next_billing_date).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+        : 'your next billing date';
+
+      await queueBillingEmail(
+        user_id,
+        'billing.downgrade',
+        `plan_downgrade:${currentSub.stripe_subscription_id}:${new_plan_id}:${currentSub.next_billing_date ?? 'na'}`,
+        (firstName) => ({
+          firstName,
+          oldPlan: currentPlan?.name ?? 'your previous plan',
+          newPlan: newPlan.name,
+          effectiveDate,
+          nextAmount: formatCents(newPlan.price_cents, 'usd'),
+          // Answers the question support actually gets, rather than restating
+          // the plan change: nothing is taken away today.
+          creditsNote:
+            `The credits already on your account stay there — this change does not remove any. `
+            + `From ${effectiveDate} your monthly allowance becomes the ${newPlan.name} allowance.`,
           billingUrl: CMS_BILLING_URL,
           timezone: 'UTC',
         }),
@@ -3249,6 +3524,28 @@ router.post('/pause-subscription', async (req: Request, res: Response) => {
     // Pause in database
     await pauseSubscription(user_id, subscription.stripe_subscription_id);
 
+    // Confirm it. A pause stops money moving, so the absence of any
+    // confirmation leaves the customer unsure whether it took — and the
+    // expensive version of that doubt is them cancelling instead, to be sure.
+    //
+    // `pause_collection.behavior: 'void'` above is open-ended: Stripe is not
+    // given a `resumes_at`, so there is no automatic restart date and the
+    // template says so rather than inventing one.
+    await queueBillingEmail(
+      user_id,
+      'billing.paused',
+      `pause:${subscription.stripe_subscription_id ?? user_id}:${subscription.next_billing_date ?? 'na'}`,
+      (firstName) => ({
+        firstName,
+        planName: subscription.plan_name || 'your',
+        resumesOn: null,
+        creditsNote:
+          'The credits already on your account stay there and remain usable while the subscription is paused. '
+          + 'Your monthly allowance simply stops arriving until you resume.',
+        billingUrl: CMS_BILLING_URL,
+      }),
+    );
+
     res.json({
       success: true,
       message: 'Subscription paused successfully. Billing has been stopped.'
@@ -3281,15 +3578,43 @@ router.post('/resume-subscription', async (req: Request, res: Response) => {
       });
     }
 
-    // Resume in Stripe
+    // Resume in Stripe.
+    //
+    // The response is now kept rather than discarded: resuming starts a new
+    // collection period, so the `next_billing_date` on our row is stale by
+    // definition at this moment. The confirmation email has to quote the date
+    // Stripe just decided on, not the one from before the pause.
+    let resumedPeriodEnd: number | null = null;
     if (subscription.stripe_subscription_id) {
-      await stripe.subscriptions.update(subscription.stripe_subscription_id, {
+      const resumed = await stripe.subscriptions.update(subscription.stripe_subscription_id, {
         pause_collection: null as any
       });
+      resumedPeriodEnd = periodEndOrWarn(resumed, 'resume');
     }
 
     // Resume in database
     await resumeSubscription(user_id);
+
+    // Keyed on the period being resumed INTO, so resuming after a later pause
+    // sends its own email while a double-click sends one.
+    await queueBillingEmail(
+      user_id,
+      'billing.resumed',
+      `resume:${subscription.stripe_subscription_id ?? user_id}:${resumedPeriodEnd ?? 'na'}`,
+      (firstName) => ({
+        firstName,
+        planName: subscription.plan_name || 'your',
+        nextAmount: formatCents(Number(subscription.plan_price ?? 0), 'usd'),
+        // Falls back to a phrase rather than a fabricated date when Stripe gave
+        // us no period — a billing date is the last thing to guess at.
+        nextBillingDate: resumedPeriodEnd !== null
+          ? new Date(resumedPeriodEnd * 1000).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+          : 'your next billing date',
+        creditsNote: 'Your monthly credit allowance starts arriving again from your next billing date.',
+        billingUrl: CMS_BILLING_URL,
+        timezone: 'UTC',
+      }),
+    );
 
     res.json({
       success: true,

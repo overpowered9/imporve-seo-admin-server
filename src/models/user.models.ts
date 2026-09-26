@@ -603,8 +603,15 @@ export const getUserCreditBalances = async (user_id: number): Promise<CreditBala
  * stamp a new cycle. Purchased credits are intentionally left untouched.
  *
  * Called on subscription creation and on every successful monthly invoice. Idempotent.
+ *
+ * Returns how many credits were granted, for the same reason
+ * upgradeIncludedCredits does: the caller has to tell the customer the real
+ * figure — Account Activity's "Subscription started" row showed no credits at
+ * all, because the only way to fill that column was to re-derive the allotment
+ * beside the call and hope the two agreed.
  */
-export const refillPlanCredits = async (user_id: number, plan: any, reason = 'Plan credits refill'): Promise<void> => {
+export const refillPlanCredits = async (user_id: number, plan: any, reason = 'Plan credits refill'): Promise<number> => {
+  let granted = 0;
   await sql.begin(async sql => {
     for (const creditType of CREDIT_TYPES) {
       const allotment = planAllotment(plan, creditType);
@@ -615,12 +622,52 @@ export const refillPlanCredits = async (user_id: number, plan: any, reason = 'Pl
       // Under a two-month life they are still the customer's to spend, so the
       // new grant is an additional LOT and the old one lives out its term.
       // Whichever expires first is spent first; see burnFromLots.
-      await sql`
+      const granted_lot = (await sql`
         INSERT INTO credit_lots (user_id, source, granted, remaining, expires_at, plan_id, reason)
         VALUES (${user_id}, 'plan', ${allotment}, ${allotment},
                 NOW() + ${`${PLAN_CREDIT_LIFETIME_MONTHS} months`}::interval,
                 ${plan?.id ?? null}, ${reason})
-      `;
+        RETURNING expires_at
+      `) as unknown as Array<{ expires_at: Date }>;
+
+      // ── Buying a plan absorbs what the free trial left ────────────────────
+      // The trial's grant is a lot like any other, minted by the FREE plan. On
+      // subscribing, the customer holds two plan balances that differ in
+      // nothing they can see or act on — same source, same rules, both
+      // spendable — so the card showed "Plan credits 600" above "Plan credits
+      // 100" and invited the question of what the difference was. There is
+      // none: the answer is one balance.
+      //
+      // The trial lot is moved onto THIS plan and carried out to this cycle's
+      // expiry, which is the merge — the breakdown groups by (source, free or
+      // paid, day), so matching all three is what makes them one row.
+      //
+      // GREATEST, never a plain assignment: the new expiry is later than the
+      // trial's in every ordinary case, but a lot must never come out of this
+      // with LESS life than it had. If that ever happened the two would stay
+      // separate rows, which is the harmless half of the trade.
+      //
+      // Scoped to the FREE plan's own lots. A previous PAID cycle's lot is not
+      // swept up: those expire on their own cycle's schedule, which is the
+      // whole of "plan credits stay usable for two billing cycles".
+      //
+      // Only when this grant is itself a paid plan's — a free plan refilling
+      // its own grant would otherwise extend the trial indefinitely.
+      if (plan?.id && plan?.slug !== 'free' && granted_lot[0]?.expires_at) {
+        await sql`
+          UPDATE credit_lots cl
+          SET    plan_id    = ${plan.id},
+                 expires_at = GREATEST(cl.expires_at, ${granted_lot[0].expires_at}::timestamptz),
+                 updated_at = NOW()
+          FROM   subscription_plans sp
+          WHERE  sp.id = cl.plan_id
+            AND  sp.slug = 'free'
+            AND  cl.user_id = ${user_id}
+            AND  cl.source = 'plan'
+            AND  cl.remaining > 0
+            AND  cl.expires_at > NOW()
+        `;
+      }
 
       // included_allotment stays the plan's headline number (what a cycle
       // grants), which is what the usage bar and the upgrade bump compare
@@ -640,8 +687,11 @@ export const refillPlanCredits = async (user_id: number, plan: any, reason = 'Pl
         INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
         VALUES (${user_id}, ${creditType}, ${allotment}, ${reason})
       `;
+
+      granted += allotment;
     }
   });
+  return granted;
 };
 
 /**
@@ -1616,7 +1666,20 @@ export const getCreditLotSummary = async (user_id: number): Promise<CreditLotBuc
     FROM   credit_lots cl
     LEFT JOIN subscription_plans sp ON sp.id = cl.plan_id
     WHERE  cl.user_id = ${user_id} AND cl.remaining > 0 AND cl.expires_at > NOW()
-    GROUP  BY cl.source, sp.slug, (cl.expires_at AT TIME ZONE 'UTC')::date
+    -- Grouped by the free/paid BOOLEAN, not by sp.slug. Grouping on the slug
+    -- itself split batches that differ only in which plan minted them: a
+    -- mid-cycle upgrade leaves the original grant on the old plan's id and the
+    -- bump on the new one, and since upgradeIncludedCredits anchors the bump to
+    -- the cycle's own expiry (currentCyclePlanExpiry) both lapse on the SAME
+    -- day. A grow→optimize account therefore saw two "Plan credits" rows,
+    -- identical date, no visible reason for being apart — and, because the CMS
+    -- keys rows on (source, date), two rows with the same key.
+    --
+    -- The distinction worth keeping is the one is_free already names: a free
+    -- trial's grant is zeroed when the trial ends (suspendPlanCredits) whatever
+    -- its stored date says, so it genuinely does not lapse with a paid lot that
+    -- shares its day. Every paid slug behaves identically and belongs together.
+    GROUP  BY cl.source, COALESCE(sp.slug = 'free', false), (cl.expires_at AT TIME ZONE 'UTC')::date
     ORDER  BY (cl.expires_at AT TIME ZONE 'UTC')::date ASC, cl.source ASC
   `;
   return (rows as unknown as CreditLotBucket[]).map((r) => ({

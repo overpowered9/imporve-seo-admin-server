@@ -66,6 +66,14 @@ export interface EmailJob {
 export const MAX_ATTEMPTS = 6;
 
 /**
+ * How long a row may sit in 'sending' before another worker may reclaim it.
+ *
+ * A real send resolves in seconds, so anything still 'sending' after this long
+ * belongs to a worker that died or to a dry run that walked away from its claim.
+ */
+export const STALE_CLAIM_MINUTES = 15;
+
+/**
  * Backoff schedule, in seconds: ~1m, 5m, 25m, 2h, 10h, capped at 24h.
  *
  * Exponential with a cap rather than unbounded: a provider outage lasting a day
@@ -93,9 +101,21 @@ export async function enqueueEmail(
   }
 
   try {
+    // `::jsonb` is not decoration. The column IS jsonb — that was checked
+    // against production after the "Welcome to undefined" receipt — which rules
+    // out a TEXT column and leaves one way for a payload to come back as a
+    // string: being stored as a jsonb STRING SCALAR rather than an object.
+    //
+    // A bare `${JSON.stringify(payload)}` is a string parameter with no declared
+    // type, so whether Postgres parses it into an object or wraps it as a scalar
+    // depends on how the driver labels the parameter. The cast settles it here
+    // instead of leaving it to inference: text in, object stored, every time.
+    //
+    // normalizePayload() on the read side still stands. This stops new bad rows;
+    // that one rescues the rows already written.
     const rows = await sql`
       INSERT INTO email_sends (user_id, recipient, template, category, event_key, payload)
-      VALUES (${userId}, ${recipient}, ${template}, ${category}, ${eventKey}, ${JSON.stringify(payload)})
+      VALUES (${userId}, ${recipient}, ${template}, ${category}, ${eventKey}, ${JSON.stringify(payload)}::jsonb)
       ON CONFLICT (template, event_key) DO NOTHING
       RETURNING id
     `;
@@ -108,6 +128,42 @@ export async function enqueueEmail(
     console.error(`[email-outbox] could not queue ${template} for user ${userId}:`, err);
     return { enqueued: false, duplicate: false };
   }
+}
+
+/**
+ * Coerce a payload read back from the database into a plain object.
+ *
+ * WHY THIS EXISTS: a customer received a receipt reading "Welcome to undefined
+ * / Charged today undefined". Every value in that payload is produced by a
+ * helper that cannot return undefined — formatCents() always returns a string,
+ * firstNameOf() falls back to 'there' — so the keys were not missing when the
+ * job was queued. They went missing on the way back out of Postgres, where the
+ * payload arrived as a JSON *string* rather than an object, and every property
+ * access on a string is undefined.
+ *
+ * The two ways that happens are a `payload` column that is TEXT rather than
+ * JSONB (CREATE TABLE IF NOT EXISTS in migration 007 leaves a pre-existing
+ * table's column types alone), and a value stored as a jsonb string scalar
+ * instead of a jsonb object. Both look identical here, and both are fixed by
+ * the same three lines, so this normalises rather than assuming which.
+ *
+ * Deliberately total: anything that is not an object after parsing becomes {},
+ * so a corrupt row renders as a detectably-empty email that the worker's
+ * placeholder guard will refuse to send — instead of throwing inside the
+ * renderer and being retried six times for a fault no retry can fix.
+ */
+export function normalizePayload(raw: unknown): Record<string, unknown> {
+  let value = raw;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch (_) {
+      return {};
+    }
+  }
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }
 
 /**
@@ -126,8 +182,21 @@ export async function claimDueEmails(sql: SqlLike, limit = 25): Promise<EmailJob
     const rows = await tx`
       SELECT id, user_id, recipient, template, category, event_key, attempts, payload
       FROM   email_sends
-      WHERE  status IN ('pending', 'failed')
-        AND  next_attempt_at <= NOW()
+      WHERE  (
+               (status IN ('pending', 'failed') AND next_attempt_at <= NOW())
+               -- Rows a previous worker claimed and never finished. Without
+               -- this they are stranded: 'sending' was in no other branch of
+               -- this WHERE, so a worker that crashed — or a DRY RUN, which
+               -- claims and then writes nothing back — left its rows invisible
+               -- to every future pass. Not "retried later"; never sent, with no
+               -- error recorded and nothing to alert on.
+               --
+               -- The window is long enough that it cannot race a live worker
+               -- mid-send: a real attempt resolves in seconds, and attempts
+               -- still increments on reclaim, so a row that keeps dying reaches
+               -- the dead-letter cap instead of looping forever.
+               OR (status = 'sending' AND updated_at < NOW() - ${STALE_CLAIM_MINUTES} * interval '1 minute')
+             )
       ORDER  BY next_attempt_at, id
       LIMIT  ${limit}
       FOR UPDATE SKIP LOCKED
@@ -140,8 +209,33 @@ export async function claimDueEmails(sql: SqlLike, limit = 25): Promise<EmailJob
       SET    status = 'sending', attempts = attempts + 1, updated_at = NOW()
       WHERE  id = ANY(${ids})
     `;
-    return rows as EmailJob[];
+    // Normalised HERE rather than in the worker so that every consumer of a
+    // claimed job — the worker, the drain CLI, any future replay tool — gets an
+    // object, and none of them has to remember to parse.
+    return rows.map((r: any) => ({ ...r, payload: normalizePayload(r.payload) })) as EmailJob[];
   });
+}
+
+/**
+ * Hand a claimed job back, untouched.
+ *
+ * For the dry run, which has no business consuming an attempt or holding a row
+ * hostage for the staleness window. Without this, `npm run email:drain` — the
+ * command whose whole purpose is to inspect the queue SAFELY — was the fastest
+ * way to strand every email in it.
+ *
+ * `attempts` is decremented back because the claim spent one and no send was
+ * tried; otherwise inspecting a queue six times would dead-letter it.
+ */
+export async function releaseClaim(sql: SqlLike, jobId: number): Promise<void> {
+  await sql`
+    UPDATE email_sends
+    SET    status = 'pending',
+           attempts = GREATEST(attempts - 1, 0),
+           updated_at = NOW()
+    WHERE  id = ${jobId}
+      AND  status = 'sending'
+  `;
 }
 
 /** Record a successful send. */
