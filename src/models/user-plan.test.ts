@@ -106,7 +106,7 @@ describe('describeUserPlan — a trial is not the free plan', () => {
     assert.equal(plan.trial_expired, false);
   });
 
-  test('the same account once the trial has lapsed reads Free', () => {
+  test('the same account once the trial has lapsed reads Basic (free), not Free Trial', () => {
     const plan = describeUserPlan({
       plan_slug: 'free',
       plan_name: 'Free',
@@ -114,7 +114,7 @@ describe('describeUserPlan — a trial is not the free plan', () => {
       trial_ends_at: daysFromNow(-1),
       user_created_at: daysFromNow(-8),
     });
-    assert.equal(plan.plan_display_name, 'Free');
+    assert.equal(plan.plan_display_name, 'Basic (free)');
     assert.equal(plan.on_trial, false);
     assert.equal(plan.trial_expired, true);
   });
@@ -181,7 +181,7 @@ describe('describeUserPlan — a trial is not the free plan', () => {
 
   test('no plan row at all is free, and claims no trial it cannot date', () => {
     const plan = describeUserPlan({});
-    assert.equal(plan.plan_display_name, 'Free');
+    assert.equal(plan.plan_display_name, 'Basic (free)');
     assert.equal(plan.on_trial, false);
     assert.equal(plan.trial_expired, false);
     assert.equal(plan.trial_ends_at, null);
@@ -193,7 +193,19 @@ describe('describeUserPlan — a trial is not the free plan', () => {
       trial_ends_at: daysFromNow(-1),
       user_created_at: daysFromNow(-8),
     });
+    assert.equal(plan.plan_display_name, 'Basic (free)');
     assert.equal(plan.on_trial, false);
     assert.equal(plan.trial_expired, true);
+  });
+  test('a lapsed free account and a trial account never share a label', () => {
+    const trial = describeUserPlan({
+      plan_slug: 'free', plan_name: 'Free', plan_price_cents: 0,
+      trial_ends_at: daysFromNow(3), user_created_at: daysFromNow(-4),
+    });
+    const basic = describeUserPlan({
+      plan_slug: 'free', plan_name: 'Free', plan_price_cents: 0,
+      trial_ends_at: daysFromNow(-3), user_created_at: daysFromNow(-10),
+    });
+    assert.notEqual(trial.plan_display_name, basic.plan_display_name);
   });
 });
