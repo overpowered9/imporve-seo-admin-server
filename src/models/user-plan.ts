@@ -11,6 +11,9 @@
 import { planLabel } from '../services/billing/descriptions.js';
 import { effectiveTrialEnd } from './trial.js';
 
+/** What an agent sees for the $0 plan once no trial is running. */
+export const FREE_PLAN_LABEL = 'Basic (free)';
+
 /**
  * The plan an agent sees beside a ticket.
  *
@@ -21,7 +24,7 @@ export interface UserPlanSummary {
   plan_slug: string | null;
   /** Raw `subscription_plans.name` — outdated by design. Prefer plan_display_name. */
   plan_name: string | null;
-  /** The name the CUSTOMER knows the plan by, or 'Free Trial'. Always safe to print. */
+  /** The name the CUSTOMER knows the plan by, 'Free Trial', or 'Basic (free)'. Always safe to print. */
   plan_display_name: string;
   on_trial: boolean;
   trial_expired: boolean;
@@ -87,11 +90,14 @@ export const describeUserPlan = (row: UserPlanRow): UserPlanSummary => {
   return {
     plan_slug: slug,
     plan_name: name,
-    // Keyed on the slug first: it is stable, while the name is the column that
-    // drifted. planLabel falls back to the name's own text for a plan added
-    // since this mapping was written, and '' only when neither is known — which
-    // is the no-plan case, and no plan means free.
-    plan_display_name: onTrial ? 'Free Trial' : planLabel(slug ?? name) || 'Free',
+    // The $0 plan outside its trial is "Basic (free)": the CMS shows that
+    // customer "Basic" (user-cms planUtils.js), so an agent quoting the plain
+    // "Free" the ledger uses would name a plan the customer never saw — and
+    // "Free" next to "Free Trial" is exactly the confusion this field exists to
+    // remove. Paid plans are keyed on the slug first: it is stable, while the
+    // name is the column that drifted. planLabel falls back to the name's own
+    // text for a plan added since this mapping was written.
+    plan_display_name: onTrial ? 'Free Trial' : isFree ? FREE_PLAN_LABEL : planLabel(slug ?? name) || FREE_PLAN_LABEL,
     on_trial: onTrial,
     trial_expired: isFree && expired,
     trial_ends_at: isFree ? trialEnd : null,
