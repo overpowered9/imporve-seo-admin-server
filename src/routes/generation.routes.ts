@@ -1137,9 +1137,10 @@ router.post('/generateimage', validateApiAccess, validateCredits('iseo', priceOf
  * be checked, or false when the 429 has been sent and the caller must stop.
  *
  * FAILS OPEN: if the check cannot be made at all — most likely migration 019 not yet applied —
- * the run proceeds uncapped and the error is logged under [keyword-allowance]. The run is still
- * credit-charged, so nothing is given away, and a usage counter must never be the thing that
- * takes keyword generation down.
+ * the run proceeds uncapped and the error is logged under [keyword-allowance]. Keyword lists are
+ * free, so this allowance is now the ONLY cap on the route: an uncapped run costs one model call,
+ * and a usage counter must still never be the thing that takes keyword generation down. Watch the
+ * log rather than failing closed.
  */
 async function claimKeywordAllowance(userId: number, res: Response): Promise<KeywordReservation | null | false> {
   let plan: KeywordAllowancePlan;
@@ -1185,10 +1186,11 @@ async function releaseKeywordAllowance(userId: number, reservation: KeywordReser
  * Generate Keyword List
  * POST /api/v1/generate/generatekeyword
  *
- * Capped per UTC day by plan (claimKeywordAllowance) as well as credit-charged. A run that does
- * not deliver keywords gives its slot back, so only successful runs count toward the allowance.
+ * FREE: keyword lists cost no credits, so there is no credit check and no deduction — the run is
+ * capped only per UTC day by plan (claimKeywordAllowance). A run that does not deliver keywords
+ * gives its slot back, so only successful runs count toward the allowance.
  */
-router.post('/generatekeyword', validateApiAccess, validateCredits('iseo', priceOf('keywords')), async (req: AuthenticatedRequest, res: Response) => {
+router.post('/generatekeyword', validateApiAccess, async (req: AuthenticatedRequest, res: Response) => {
   let reservation: KeywordReservation | null = null;
   let delivered = false;
   try {
@@ -1238,7 +1240,7 @@ Output rules: one keyword per line, lowercase, no numbering, no bullets, no quot
     }
 
     if (keywords.length === 0) {
-      // No usable output — fail without deducting credits.
+      // No usable output — fail, and hand the day's slot back (finally, below).
       return res.status(500).json({
         success: false,
         error: 'Keyword generation returned no results. Please try again.'
@@ -1274,7 +1276,9 @@ Output rules: one keyword per line, lowercase, no numbering, no bullets, no quot
         })},
         ${JSON.stringify({
           provider: 'openai-chat',
-          generation_time: Date.now()
+          generation_time: Date.now(),
+          // Stamped like content-v2's, so /users/credit-usage reads this run as 0 credits.
+          billed: { action: 'keywords', cost: 0 }
         })}
       )
       RETURNING id
@@ -1282,19 +1286,7 @@ Output rules: one keyword per line, lowercase, no numbering, no bullets, no quot
 
     const generationId = generationRecord[0].id;
 
-    // 🔥 DEDUCT CREDITS AFTER SUCCESSFUL GENERATION (with website_id and generation_id)
-    const truncatedKeyword = seed.substring(0, 200);
-    await deductCredits(
-      userId,
-      ISEO_CREDIT_TYPE,
-      priceOf('keywords'),
-      `Keyword research: ${truncatedKeyword}`,
-      websiteId,
-      generationId
-    );
-
-    console.log(`✅ ${keywords.length} keywords generated and saved (ID: ${generationId})`);
-    console.log(`💳 1 keyword credit deducted for user ${userId}`);
+    console.log(`✅ ${keywords.length} keywords generated and saved (ID: ${generationId}) — free, no credits deducted`);
 
     // From here the run counts toward today's allowance.
     delivered = true;
@@ -1324,15 +1316,15 @@ Output rules: one keyword per line, lowercase, no numbering, no bullets, no quot
 });
 
 /**
- * Deduct Keyword Credits Only (for plugin-generated keywords)
+ * Record plugin-generated keywords
  * POST /api/v1/generate/generatekeywordded
  *
- * This endpoint only deducts keyword credits without generating anything.
- * LEGACY: current plugin versions generate keywords server-side via /generatekeyword
- * (which deducts atomically). Kept for older plugin installs that still scrape
- * Google Suggest in the browser and report usage here.
+ * LEGACY: current plugin versions generate keywords server-side via /generatekeyword. Kept for
+ * older plugin installs that still scrape Google Suggest in the browser and report usage here.
+ * It used to deduct keyword credits; keyword lists are free now, so it only records the run and
+ * answers success (credits_deducted: 0) so those installs carry on as before.
  */
-router.post('/generatekeywordded', validateApiAccess, validateCredits('iseo', priceOf('keywords')), async (req: AuthenticatedRequest, res: Response) => {
+router.post('/generatekeywordded', validateApiAccess, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const {
       seed_keyword,
@@ -1343,7 +1335,7 @@ router.post('/generatekeywordded', validateApiAccess, validateCredits('iseo', pr
     const userId = req.user.id;
     const websiteId = req.website?.id || null;
 
-    console.log(`💳 Deducting keyword credits for plugin generation: "${seed_keyword || 'N/A'}"`);
+    console.log(`📝 Recording plugin keyword generation (free): "${seed_keyword || 'N/A'}"`);
 
     // � SAVE MINIMAL GENERATION RECORD (to get generation_id)
     const generationRecord = await sql`
@@ -1366,12 +1358,14 @@ router.post('/generatekeywordded', validateApiAccess, validateCredits('iseo', pr
           source: 'wordpress-plugin'
         })},
         ${JSON.stringify({
-          message: 'Credits deducted for plugin-generated keywords',
-          count
+          message: 'Plugin-generated keywords recorded (keyword lists are free)',
+          count,
+          reason: reason ? String(reason).substring(0, 240) : undefined
         })},
         ${JSON.stringify({
           provider: 'wordpress-plugin',
-          generation_time: new Date().toISOString()
+          generation_time: new Date().toISOString(),
+          billed: { action: 'keywords', cost: 0 }
         })}
       )
       RETURNING id
@@ -1379,35 +1373,22 @@ router.post('/generatekeywordded', validateApiAccess, validateCredits('iseo', pr
 
     const generationId = generationRecord[0].id;
 
-    // 🔥 DEDUCT CREDITS (with website_id and generation_id)
-    // Truncate reason to avoid varchar(255) limit
-    const truncatedKeyword = (seed_keyword || 'N/A').substring(0, 200);
-    const truncatedReason = (reason || `Plugin keyword: ${truncatedKeyword}`).substring(0, 240);
-    await deductCredits(
-      userId,
-      ISEO_CREDIT_TYPE,
-      count * priceOf('keywords'),
-      truncatedReason,
-      websiteId,
-      generationId
-    );
-
-    console.log(`✅ ${count} keyword credit(s) deducted for user ${userId} (Generation ID: ${generationId})`);
+    console.log(`✅ Plugin keyword generation recorded for user ${userId} (Generation ID: ${generationId}) — no credits deducted`);
 
     res.json({
       success: true,
       data: {
         generation_id: generationId,
-        credits_deducted: count,
-        message: 'Keyword credits deducted successfully'
+        credits_deducted: 0,
+        message: 'Keyword lists are free — no credits were deducted'
       }
     });
 
   } catch (error) {
-    console.error('❌ Keyword credit deduction error:', error);
+    console.error('❌ Plugin keyword record error:', error);
     res.status(500).json({
       success: false,
-      error: error instanceof Error ? error.message : 'Failed to deduct keyword credits'
+      error: error instanceof Error ? error.message : 'Failed to record keyword generation'
     });
   }
 });

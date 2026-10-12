@@ -462,6 +462,12 @@ router.delete('/websites/:website_id', async (req, res) => {
  *   generations — how many were produced this cycle
  * plus `lifetime` on the same shape, so a freshly reset cycle does not imply the
  * user has never generated anything.
+ *
+ * KEYWORD LISTS ARE FREE. `keywords` stays in the payload (generation counts, and
+ * clients that still read the key), but `total_cycle_credits` adds up only the
+ * actions that cost credits. Runs from before keyword lists went free still carry
+ * a ledger cost under `keywords`; they are left out of the total so "Credits Used
+ * This Cycle" describes what is billed now.
  */
 router.get('/credit-usage/:user_id', async (req, res) => {
   try {
@@ -538,7 +544,7 @@ router.get('/credit-usage/:user_id', async (req, res) => {
       };
     }
 
-    const totalCycleCredits = Object.values(cycle).reduce((n, a) => n + a.credits, 0);
+    const totalCycleCredits = cycle.content.credits + cycle.images.credits;
 
     res.json({
       success: true,

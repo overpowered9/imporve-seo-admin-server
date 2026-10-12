@@ -95,8 +95,8 @@ plugin keeps working. Remove it once plugin and CMS both read `credits_total`.
 
 | Endpoint | Charge |
 |---|---|
-| `POST /api/v1/generate/generatekeyword` | `ISEO_COST_KEYWORDS` |
-| `POST /api/v1/generate/generatekeywordded` | `ISEO_COST_KEYWORDS × count` |
+| `POST /api/v1/generate/generatekeyword` | free — capped per UTC day by plan (`config/keyword-limits.config.ts`) |
+| `POST /api/v1/generate/generatekeywordded` | free (legacy; records the run, deducts nothing) |
 | `POST /api/v1/generate/generateimage` (legacy Flux) | `ISEO_COST_IMAGE` |
 | `POST /api/v1/generate/active`, `/conversational` | `ISEO_COST_CONTENT_MEDIUM` |
 | `POST /api/v1/generate/auxiliary` | free, rate-limited 120/min/user |

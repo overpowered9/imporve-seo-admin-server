@@ -72,7 +72,9 @@ export function publicPricing() {
     content_regen: { ...creditsConfig.costs.content_regen },
     image: creditsConfig.costs.image,
     image_regen: creditsConfig.costs.image_regen,
-    keywords: creditsConfig.costs.keywords,
+    // Keyword lists are free: no route charges for them. Still published, as 0, so a client
+    // reading `pricing.keywords` is told the truth instead of finding the key missing.
+    keywords: 0,
   };
 }
 
@@ -83,11 +85,11 @@ export function publicPricing() {
  * Credits" tells the user they are blocked and nothing else — not what they
  * hold, not how short they are, and not that the balance in front of them is
  * still enough to do something useful. Someone with 5 credits cannot start the
- * cheapest article (6) but can generate an AI image (5) or five keyword lists.
+ * cheapest article (6) but can still generate an AI image (5).
  *
  * Derived from the live price table, so it cannot drift from what is actually
- * charged, and ordered by usefulness rather than by price — an image is a more
- * meaningful suggestion than a keyword list.
+ * charged. Keyword lists are not offered: they are free, so they are never what a
+ * balance "can still buy".
  *
  * Returns null when the balance affords nothing at all; the caller then says so
  * plainly rather than appending an empty "you could also…".
@@ -96,7 +98,6 @@ export function affordableWith(balance: number): string | null {
   const held = Math.max(0, Number(balance) || 0);
   const options: Array<{ label: (n: number) => string; cost: number }> = [
     { cost: priceOf('image'), label: (n) => `${n} AI image${n === 1 ? '' : 's'}` },
-    { cost: priceOf('keywords'), label: (n) => `${n} keyword list${n === 1 ? '' : 's'}` },
   ];
 
   const affordable = options

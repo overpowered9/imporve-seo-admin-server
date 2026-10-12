@@ -14,9 +14,9 @@
  * they can be unit-tested without DATABASE_URL. Enforcement lives in models/keyword-usage.ts.
  *
  * ── WHY THIS DOES NOT FAIL CLOSED LIKE credits.config.ts ────────────────────
- * A missing or malformed value here cannot give work away — every run is still credit-charged —
- * so an override that does not parse falls back to the product default instead of refusing to
- * boot. The env keys are optional and exist for tuning without a code change.
+ * Keyword lists are free, so this allowance is the only cap on keyword generation. A missing or
+ * malformed override still cannot remove that cap — it falls back to the product default below
+ * rather than refusing to boot — so the env keys stay optional, for tuning without a code change.
  *
  * Day boundaries are UTC, matching the rest of the server (see notification-jobs.ts).
  */
