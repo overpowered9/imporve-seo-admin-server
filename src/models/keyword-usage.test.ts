@@ -97,8 +97,19 @@ describe('POST /generatekeyword', () => {
   assert.ok(claimStart >= 0, 'claimKeywordAllowance not found');
   const claim = codeOf(routes.slice(claimStart, routes.indexOf('\n}\n', claimStart)));
 
-  test('the credit check runs before the allowance', () => {
-    assert.match(handler, /validateApiAccess, validateCredits\('iseo', priceOf\('keywords'\)\), async/);
+  test('keyword lists are free: no credit check and no deduction', () => {
+    assert.match(handler, /'\/generatekeyword', validateApiAccess, async/);
+    assert.doesNotMatch(handler, /validateCredits|deductCredits|priceOf/);
+    assert.match(handler, /billed: \{ action: 'keywords', cost: 0 \}/);
+  });
+
+  test('the legacy /generatekeywordded reports usage without charging', () => {
+    const legacyStart = routes.indexOf("router.post('/generatekeywordded',");
+    assert.ok(legacyStart >= 0, '/generatekeywordded route not found');
+    const legacy = codeOf(routes.slice(legacyStart, routes.indexOf('\n});\n', legacyStart)));
+    assert.match(legacy, /'\/generatekeywordded', validateApiAccess, async/);
+    assert.doesNotMatch(legacy, /validateCredits|deductCredits|priceOf/);
+    assert.match(legacy, /credits_deducted: 0/);
   });
 
   test('the allowance is claimed after input validation and before generation', () => {
