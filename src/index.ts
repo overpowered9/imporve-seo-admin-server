@@ -8,6 +8,7 @@ import { connectToDatabase } from './config/database.js';
 import adminPromptRoutes from './routes/admin/prompts.routes.js';
 import { requireAdmin } from './middleware/adminAuth.middleware.js';
 import { logCreditsConfigFingerprint } from './config/credits.config.js';
+import { healthPayload } from './utils/deploy-info.js';
 import { startPlanCreditSync } from './services/billing/plan-credit-sync.js';
 import generationsRoutes from './routes/generations.routes.js';
 import { testConnection } from './data/db.js';
@@ -89,21 +90,9 @@ app.use('/api/v1/generations', generationsRoutes);
 // previously had no auth at all, and the router's own `requireAdmin` was a stub calling next().
 app.use('/api/admin', requireAdmin, adminPromptRoutes);
 
-// Root health check
+// Root health check — also says which branch/commit is live (see utils/deploy-info.ts).
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    service: 'improveseo-ai-server',
-    features: [
-      'AI Content Generation',
-      'User Management',
-      'Website Management',
-      'Credit System',
-      'MongoDB Prompt Management',
-      'Template Version Control'
-    ],
-    timestamp: new Date().toISOString()
-  });
+  res.json(healthPayload());
 });
 
 app.use(errorHandler);
