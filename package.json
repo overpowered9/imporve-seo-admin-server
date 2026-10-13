@@ -32,6 +32,7 @@
     "seed:expiring": "tsx src/scripts/seed-expiring-credits.ts",
     "migrations:print": "tsx src/scripts/print-migrations.ts",
     "monitor:ledger-gaps": "tsx src/scripts/check-ledger-gaps.ts",
+    "refund:keyword-charges": "tsx src/scripts/refund-keyword-charges.ts",
     "notify": "tsx src/scripts/run-notification-jobs.ts",
     "email:drain": "tsx src/scripts/drain-email-outbox.ts",
     "migrate:target-key": "tsx src/migrations/010-generation-target-key.ts",
