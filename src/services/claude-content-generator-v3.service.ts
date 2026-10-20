@@ -67,12 +67,20 @@ export const ARTICLE_TYPES: ArticleType[] = [
 
 /** Plain-English framing for the writer. The section machinery per type is a later round. */
 const ARTICLE_TYPE_LABELS: Record<ArticleType, string> = {
-  cost_guide: 'a cost guide — the reader wants to know what this costs and what moves the price',
+  cost_guide:
+    'a COST GUIDE. The reader wants to know what this costs and what moves the price. Give the real ' +
+    'ranges you were supplied, name what pushes a job to the top or the bottom of one, and say ' +
+    'plainly what cannot be quoted without seeing the work.',
   decision_guide:
-    'a decision guide — the reader is weighing options and wants help choosing, not a sales pitch',
+    'a DECISION GUIDE. The reader is weighing options and wants help choosing, not a sales pitch. ' +
+    'Lay out the honest tradeoff, say which option suits which situation, and give the cutoff you ' +
+    'would use yourself. Do not pretend one option always wins.',
   question_guide:
-    'a question guide — the reader has a specific worry and wants a direct, honest answer',
-  topic_guide: 'a topic guide — the reader wants to understand the subject and what to expect',
+    'a QUESTION GUIDE. The reader has one specific worry. Answer it directly and early, then ' +
+    'explain what causes it, how to judge how serious it is, and what to do about it.',
+  topic_guide:
+    'a TOPIC GUIDE. The reader wants to understand the subject and what to expect. Cover what ' +
+    'actually happens, in what order, and what usually surprises people.',
 };
 
 export interface GenerateV3Params {
@@ -205,6 +213,9 @@ export interface GenerateV3Result {
 
 const TRAILER_DELIM = '===META_JSON===';
 
+/** Separator for directive text assembled at runtime. */
+const EOL_DIRECTIVE = '\n';
+
 /**
  * Both classes, intentionally.
  *
@@ -245,6 +256,28 @@ NON-NEGOTIABLE VOICE RULES (these defeat AI-detection):
 
 BANNED words/phrases — never use any of these: ${BANNED}
 
+WRITE TO THE NICHE. The niche is not decoration. It decides the questions this reader actually
+asks, the words they use for things, how careful a claim has to be, and what a reasonable next step
+sounds like. An article for a dentist and one for a roofer should not read alike even on the same
+structure. In a regulated field (medical, dental, legal, financial), never promise an outcome,
+never give advice that needs a licence, and say when someone should talk to a professional about
+their own situation.
+
+EVERY FIGURE MUST HAVE BEEN GIVEN TO YOU. Prices, percentages, timeframes, measurements and counts
+may only come from the business details or the article-specific details supplied with this request.
+If a number would help and none was supplied, write it qualitatively ("a few hundred", "about a
+day") or say that it depends on the job. Never invent a statistic, a review count, a testimonial,
+an award, a certification, or a figure you were not handed.
+
+IF THE TITLE CONTAINS A NUMBER, deliver exactly that many. "7 signs your water heater is failing"
+owes the reader seven signs, not six and not nine.
+- This OVERRIDES the blueprint's section count. The items are the structure of the article.
+- Each item gets its own visible heading, as an <h3> inside a body section or as its own body
+  section. A reader must be able to count them without interpreting prose. Never bundle two items
+  under one heading ("Loud noises and a musty smell" is two items pretending to be one).
+- Each item has to earn its place: roughly 60 words for a tip or a reason, 40 for a step, 35 for a
+  short entry. Never pad to reach the number, and never quietly deliver fewer than the title promises.
+
 HEADINGS ARE WRITTEN FROM THIS ARTICLE'S OWN TOPIC — this is a hard rule.
 Every heading must be specific to this subject and could not be copy-pasted onto another article.
 NEVER use any of these as visible heading text: ${BANNED_HEADINGS}
@@ -265,7 +298,8 @@ formatting accent, closing style) — it never removes a section. Missing any se
 2. DIRECT ANSWER — '<h2 data-iseo="quick-answer">' with a topic-specific heading, then exactly ONE <p>
    of 40-60 words that directly answers the core question (written for Google featured snippets and
    voice search).
-3. MAIN BODY — the number of '<h2 data-iseo="body">' sections the blueprint specifies, with
+3. MAIN BODY — the number of '<h2 data-iseo="body">' sections the blueprint specifies (unless a
+   numbered title overrides it, see above), with
    deliberately UNEVEN lengths. Each heading is specific and benefit- or question-led. Use <h3>
    sub-points only where they genuinely help. Apply the blueprint's formatting accent. Weave in the
    business and niche details where they earn their place, and put the blueprint's local-proof angle
@@ -311,6 +345,9 @@ Apply every pass:
   pairs (each "<p><strong>Q: ...?</strong></p>" + answer), and the next-step section. Do NOT drop,
   merge, reorder, or rename sections, and do NOT replace a topic-specific heading with a generic label.
   Edit prose only.
+- Do NOT change any number, price, range, date, measurement or count, and do not introduce one
+  that is not already in the text. Those figures came from the business; you were not given the
+  source and cannot check them.
 - Keep all HTML tags intact. Do NOT add commentary.
 
 Return ONLY the revised HTML article — no explanation, no JSON.`;
@@ -399,6 +436,26 @@ async function getV3Prompt(def: V3PromptDef): Promise<ResolvedPrompt> {
   }
 }
 
+/**
+ * How many items a numbered title promises, if it is one.
+ *
+ * The spec is explicit that a numbered title is a format rather than a type, and that whichever
+ * type it is, the article must deliver the number in the title. Asking for that in the system
+ * prompt was not enough: the blueprint directive in the user message says "write N body sections"
+ * in plain numbers, and that won every time, so seven signs came back bundled into four headings.
+ * The conflict has to be resolved before the model sees it.
+ *
+ * Deliberately narrow: a leading count up to 30. A year or a model number in a title is not a
+ * promise of items, and reading it as one would wreck the structure of an ordinary article.
+ */
+export function titleItemCount(title?: string): number | null {
+  if (!title) return null;
+  const m = title.match(/^\s*(?:top\s+|the\s+)?(\d{1,2})\b/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return n >= 2 && n <= 30 ? n : null;
+}
+
 /** Vary the TOC heading so it is not a fifth identical heading across every article on a site. */
 const TOC_HEADINGS = ['Table of contents', "What's covered", 'In this guide', 'Jump to a section'];
 
@@ -468,7 +525,17 @@ export async function generateContentV3(params: GenerateV3Params): Promise<Gener
     variant,
     seed: params.seed,
   });
-  const directive = blueprintDirective(blueprint, directivesCfg);
+  let directive = blueprintDirective(blueprint, directivesCfg);
+  const promisedItems = titleItemCount(params.title);
+  if (promisedItems) {
+    // Appended rather than spliced into the directive: the wording above is DB-tunable, so
+    // rewriting it by string surgery would break the moment someone edits the template.
+    directive +=
+      `${EOL_DIRECTIVE}NUMBERED TITLE — THIS REPLACES THE BODY SECTION COUNT ABOVE. The title promises ` +
+      `${promisedItems} items, so the article owes the reader exactly ${promisedItems}. Give each one its own ` +
+      `<h3> heading inside the body sections, so they can be counted at a glance. Never put two items ` +
+      `under one heading, and never deliver more or fewer than ${promisedItems}.`;
+  }
 
   // ---- Phase 3: single-pass generation ----
   const t3 = Date.now();
