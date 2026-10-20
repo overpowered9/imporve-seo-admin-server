@@ -96,8 +96,9 @@ Set the real values in the dashboard (never in the repo): `ANTHROPIC_API_KEY`, `
 `FLUX_AI_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PUBLISHABLE_KEY`,
 plus `DATABASE_URL`, `MONGODB_URI` and the Supabase keys.
 
-`.env.sample` carries `replace_me` placeholders for all of these and is the reference for the full
-list. `.env` is gitignored and must stay that way.
+`src/config/config.ts` and the `envSchema` in `src/config/credits.config.ts` are the reference for
+the full list. The credit variables are schema-validated at boot, so a deploy missing one refuses
+to start rather than serving generations at zero cost. `.env` is gitignored and must stay that way.
 
 ## 4. Announce the credit reset, and back up the database
 

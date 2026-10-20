@@ -4,7 +4,10 @@ Express.js server for AI content generation used by the ImproveSEO plugin.
 
 ## Setup
 
-1. Copy `.env.sample` to `.env` and set values:
+1. Create a `.env` file in the repo root and set values. `src/config/config.ts` and the
+   `envSchema` in `src/config/credits.config.ts` are the authoritative list of what the server
+   reads; the credit variables are validated at boot, so a missing one aborts startup rather
+   than defaulting to zero.
 
 ```
 PORT=8080

@@ -41,7 +41,7 @@ const REQUIRED = [
   'ISEO_PACKAGE_MEDIUM_PRICE_CENTS_FREE',
 ] as const;
 
-/** The finalized .env.sample values, so the test exercises the real shipping configuration. */
+/** The finalized shipping values, so the test exercises the real production configuration. */
 const VALID: Record<string, string> = {
   ISEO_COST_CONTENT_SMALL: '6',
   ISEO_COST_CONTENT_MEDIUM: '10',

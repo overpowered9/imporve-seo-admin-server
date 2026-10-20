@@ -120,7 +120,8 @@ if (!parsed.success) {
   // price must never start and begin serving generations at 0 credits.
   throw new Error(
     `Invalid ISEO credit configuration — refusing to start.\n${issues}\n` +
-      `Set these in the environment (see .env.sample). Prices are env-only by design; there is no runtime override.`,
+      `Set these in the environment — the full list is the envSchema at the top of this file. ` +
+      `Prices are env-only by design; there is no runtime override.`,
   );
 }
 
