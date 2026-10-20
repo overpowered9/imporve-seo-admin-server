@@ -23,6 +23,45 @@ export type Accent = 'none' | 'short_list' | 'comparison_table' | 'pull_quote';
 export type FaqPlacement = 'end' | 'woven';
 export type CloseMove = 'forward_question' | 'soft_fade' | 'single_punch_line' | 'practical_next_step';
 
+export const OPENING_MOVES: OpeningMove[] = [
+  'lived_scenario',
+  'direct_question',
+  'contrarian_claim',
+  'micro_anecdote',
+  'myth_correction',
+];
+export const ACCENTS: Accent[] = ['none', 'short_list', 'comparison_table', 'pull_quote'];
+export const FAQ_PLACEMENTS: FaqPlacement[] = ['end', 'woven'];
+export const CLOSE_MOVES: CloseMove[] = [
+  'forward_question',
+  'soft_fade',
+  'single_punch_line',
+  'practical_next_step',
+];
+export const POV_OPTIONS: string[] = [
+  'first person plural (we, our, us)',
+  'first person singular (I, my, me)',
+  'third person',
+];
+
+/**
+ * Structure chosen by hand instead of drawn.
+ *
+ * The seeded random exists so two articles in a niche do not share a skeleton. That is right for
+ * production and wrong for a tuning session, where you need to hold the structure still and change
+ * one thing. Any field left undefined is still drawn from the seed, so a partial override pins only
+ * what it names.
+ */
+export interface BlueprintOverrides {
+  openingMove?: OpeningMove;
+  includeToc?: boolean;
+  sectionCount?: number;
+  accent?: Accent;
+  faqPlacement?: FaqPlacement;
+  closeMove?: CloseMove;
+  pov?: string;
+}
+
 export interface ContentBlueprint {
   seed: string;
   variant: WordCountVariant;
@@ -106,24 +145,35 @@ export function buildBlueprint(params: {
   niche: string;
   variant: WordCountVariant;
   seed?: string;
+  overrides?: BlueprintOverrides;
 }): ContentBlueprint {
+  const ov = params.overrides ?? {};
   const seed = params.seed ?? `${params.keyword}|${params.niche}|${Date.now()}`;
   const rng = mulberry32(hashSeed(seed));
   const budget = VARIANT_BUDGET[params.variant];
 
-  const sectionCount =
+  const drawnSectionCount =
     budget.minSections + Math.floor(rng() * (budget.maxSections - budget.minSections + 1));
 
-  const openingMove = pick<OpeningMove>(rng, [
+  const drawnOpening = pick<OpeningMove>(rng, [
     'lived_scenario', 'direct_question', 'contrarian_claim', 'micro_anecdote', 'myth_correction',
   ]);
   // TOC is rare on short pieces, occasional on large.
-  const includeToc = params.variant === 'large' ? rng() < 0.5 : rng() < 0.15;
-  const accent = pick<Accent>(rng, ['none', 'none', 'short_list', 'comparison_table', 'pull_quote']);
-  const faqPlacement = pick<FaqPlacement>(rng, ['end', 'end', 'woven']);
-  const closeMove = pick<CloseMove>(rng, [
+  const drawnToc = params.variant === 'large' ? rng() < 0.5 : rng() < 0.15;
+  const drawnAccent = pick<Accent>(rng, ['none', 'none', 'short_list', 'comparison_table', 'pull_quote']);
+  const drawnFaqPlacement = pick<FaqPlacement>(rng, ['end', 'end', 'woven']);
+  const drawnClose = pick<CloseMove>(rng, [
     'forward_question', 'soft_fade', 'single_punch_line', 'practical_next_step',
   ]);
+
+  // Clamp rather than reject: the picker offers only sane counts, but a hand-written request
+  // asking for 40 sections should produce a long article, not a broken one.
+  const sectionCount = Math.min(12, Math.max(1, Math.round(ov.sectionCount ?? drawnSectionCount)));
+  const openingMove = ov.openingMove ?? drawnOpening;
+  const includeToc = ov.includeToc ?? drawnToc;
+  const accent = ov.accent ?? drawnAccent;
+  const faqPlacement = ov.faqPlacement ?? drawnFaqPlacement;
+  const closeMove = ov.closeMove ?? drawnClose;
   const faqCount = 3;
 
   // reserve budget for intro (~120) + faq (~150) + cta (~80)
@@ -141,7 +191,7 @@ export function buildBlueprint(params: {
     faqPlacement,
     faqCount,
     closeMove,
-    pov: resolvePov(params.niche),
+    pov: ov.pov ?? resolvePov(params.niche),
     directive: '', // filled below
   };
 }

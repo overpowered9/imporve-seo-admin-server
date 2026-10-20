@@ -18,6 +18,13 @@ import {
   ARTICLE_TYPES,
 } from '../services/claude-content-generator-v3.service.js';
 import { parseBusinessProfile } from '../services/business-profile.v3.js';
+import {
+  ACCENTS,
+  CLOSE_MOVES,
+  FAQ_PLACEMENTS,
+  OPENING_MOVES,
+  type BlueprintOverrides,
+} from '../services/content-blueprint.js';
 import { seedV3Prompts } from '../services/prompt-seed.v3.js';
 import { requireAdmin } from '../middleware/adminAuth.middleware.js';
 import { sanitizeCustomInstruction } from '../services/generation-history.js';
@@ -25,6 +32,44 @@ import { sanitizeCustomInstruction } from '../services/generation-history.js';
 const router = Router();
 
 const VALID_WORDS = ['600 to 1200 words', '1200 to 2400 words', '2400 to 3600 words'];
+
+function parseBlueprintOverrides(raw: any): { error?: string; overrides?: BlueprintOverrides } {
+  if (!raw || typeof raw !== 'object') return {};
+  const ov: BlueprintOverrides = {};
+
+  const oneOf = <T extends string>(value: unknown, allowed: T[], field: string): string | undefined => {
+    if (value === undefined || value === null || value === '') return undefined;
+    if (typeof value !== 'string' || !allowed.includes(value as T)) {
+      return `blueprint_overrides.${field} must be one of: ${allowed.join(', ')}`;
+    }
+    return undefined;
+  };
+
+  for (const [field, allowed] of [
+    ['openingMove', OPENING_MOVES],
+    ['accent', ACCENTS],
+    ['faqPlacement', FAQ_PLACEMENTS],
+    ['closeMove', CLOSE_MOVES],
+  ] as const) {
+    const err = oneOf(raw[field], allowed as unknown as string[], field);
+    if (err) return { error: err };
+    if (raw[field]) (ov as Record<string, unknown>)[field] = raw[field];
+  }
+
+  if (typeof raw.includeToc === 'boolean') ov.includeToc = raw.includeToc;
+
+  if (raw.sectionCount !== undefined && raw.sectionCount !== null && raw.sectionCount !== '') {
+    const n = Number(raw.sectionCount);
+    if (!Number.isFinite(n) || n < 1 || n > 12) {
+      return { error: 'blueprint_overrides.sectionCount must be a number between 1 and 12' };
+    }
+    ov.sectionCount = Math.round(n);
+  }
+
+  if (typeof raw.pov === 'string' && raw.pov.trim()) ov.pov = raw.pov.trim();
+
+  return { overrides: Object.keys(ov).length ? ov : undefined };
+}
 
 interface ParseResult {
   error?: string;
@@ -60,6 +105,9 @@ function parseParamsV3(body: any): ParseResult {
   const parsed = parseBusinessProfile(body.business_profile, body.brand_profile);
   warnings.push(...parsed.warnings);
 
+  const bp = parseBlueprintOverrides(body.blueprint_overrides);
+  if (bp.error) return { error: bp.error };
+
   const schemaArticleType =
     body.schema_article_type === 'Article' ? 'Article' : ('BlogPosting' as const);
 
@@ -88,6 +136,7 @@ function parseParamsV3(body: any): ParseResult {
       cta_url: strOrUndefined(body.cta_url),
       humanize: body.humanize === false ? false : true,
       seed: strOrUndefined(body.seed),
+      blueprint_overrides: bp.overrides,
       custom_instruction: sanitizeCustomInstruction(body.custom_instruction) ?? undefined,
       site_url: strOrUndefined(body.site_url),
       post_url: strOrUndefined(body.post_url),

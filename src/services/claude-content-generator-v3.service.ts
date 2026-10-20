@@ -31,6 +31,7 @@ import {
   blueprintDirective,
   variantFromWords,
   ContentBlueprint,
+  BlueprintOverrides,
   BlueprintDirectives,
   DEFAULT_BLUEPRINT_DIRECTIVES,
   mergeDirectives,
@@ -100,6 +101,8 @@ export interface GenerateV3Params {
   cta_url?: string;
   humanize?: boolean;
   seed?: string;
+  /** Pin parts of the structure by hand instead of letting the seed draw them. */
+  blueprint_overrides?: BlueprintOverrides;
   /**
    * Optional free-text steer for THIS generation. UNTRUSTED — must already have passed
    * sanitizeCustomInstruction() in the route. Rendered into the USER message inside a delimited
@@ -524,6 +527,7 @@ export async function generateContentV3(params: GenerateV3Params): Promise<Gener
     niche: params.niche,
     variant,
     seed: params.seed,
+    overrides: params.blueprint_overrides,
   });
   let directive = blueprintDirective(blueprint, directivesCfg);
   const promisedItems = titleItemCount(params.title);
