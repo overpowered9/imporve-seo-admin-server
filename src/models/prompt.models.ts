@@ -6,7 +6,7 @@ export interface IPromptTemplate extends Document {
   name: string; // Fixed names: "audience_generation", "lsi_keywords", "facts_generation", etc.
   displayName: string; // Human readable: "LSI Keywords Generation", "Facts Generation"
   description: string;
-  templateType: 'audience_generation' | 'lsi_keywords' | 'facts_generation' | 'format_small' | 'format_medium' | 'format_large' | 'section_content' | 'conclusion' | 'faqs' | 'whats_next' | 'meta_title' | 'meta_description' | 'master_instruction_set_small' | 'master_instruction_set_medium' | 'master_instruction_set_large' | 'continuation_section_first' | 'continuation_section_second' | 'continuation_section_third' | 'continuation_section_fourth' | 'continuation_section_fifth' | 'continuation_section_sixth' | 'conclusion_small' | 'conclusion_medium' | 'conclusion_large' | 'faqs_small' | 'faqs_medium' | 'faqs_large' | 'whats_next_small' | 'whats_next_medium' | 'whats_next_large' | 'content_v2_intelligence' | 'content_v2_system' | 'content_v2_humanize' | 'content_v2_blueprint_directives' | 'content_v2_seo_rules';
+  templateType: 'audience_generation' | 'lsi_keywords' | 'facts_generation' | 'format_small' | 'format_medium' | 'format_large' | 'section_content' | 'conclusion' | 'faqs' | 'whats_next' | 'meta_title' | 'meta_description' | 'master_instruction_set_small' | 'master_instruction_set_medium' | 'master_instruction_set_large' | 'continuation_section_first' | 'continuation_section_second' | 'continuation_section_third' | 'continuation_section_fourth' | 'continuation_section_fifth' | 'continuation_section_sixth' | 'conclusion_small' | 'conclusion_medium' | 'conclusion_large' | 'faqs_small' | 'faqs_medium' | 'faqs_large' | 'whats_next_small' | 'whats_next_medium' | 'whats_next_large' | 'content_v2_intelligence' | 'content_v2_system' | 'content_v2_humanize' | 'content_v2_blueprint_directives' | 'content_v2_seo_rules' | 'content_v3_intelligence' | 'content_v3_system' | 'content_v3_humanize' | 'content_v3_blueprint_directives' | 'content_v3_seo_rules' | 'content_v3_business_context';
   category: 'content_generation' | 'meta_generation' | 'pre_generation' | 'master_context' | 'continuation' | 'finalization';
   variables: string[]; // Template variables this prompt uses: ['seed_keyword', 'audience_data', etc.]
   isSystem: boolean; // true for pre-seeded templates (cannot be deleted)
@@ -40,10 +40,14 @@ const promptTemplateSchema = new Schema<IPromptTemplate>({
   name: { type: String, required: true, unique: true },
   displayName: { type: String, required: true },
   description: { type: String, required: true },
-  templateType: { 
-    type: String, 
-    required: true, 
-    enum: ['audience_generation', 'lsi_keywords', 'facts_generation', 'format_small', 'format_medium', 'format_large', 'section_content', 'conclusion', 'faqs', 'whats_next', 'meta_title', 'meta_description', 'master_instruction_set_small', 'master_instruction_set_medium', 'master_instruction_set_large', 'continuation_section_first', 'continuation_section_second', 'continuation_section_third', 'continuation_section_fourth', 'continuation_section_fifth', 'continuation_section_sixth', 'conclusion_small', 'conclusion_medium', 'conclusion_large', 'faqs_small', 'faqs_medium', 'faqs_large', 'whats_next_small', 'whats_next_medium', 'whats_next_large', 'content_v2_intelligence', 'content_v2_system', 'content_v2_humanize', 'content_v2_blueprint_directives', 'content_v2_seo_rules']
+  // NOTE: this enum and the templateType union on IPromptTemplate above are the same list written
+  // twice and must be edited together. The union is what makes createPromptTemplate compile; this
+  // enum is what makes save() pass validation. Edit only one and seeding fails silently into the
+  // in-code fallback, with no error anywhere — the prompt panel simply appears to do nothing.
+  templateType: {
+    type: String,
+    required: true,
+    enum: ['audience_generation', 'lsi_keywords', 'facts_generation', 'format_small', 'format_medium', 'format_large', 'section_content', 'conclusion', 'faqs', 'whats_next', 'meta_title', 'meta_description', 'master_instruction_set_small', 'master_instruction_set_medium', 'master_instruction_set_large', 'continuation_section_first', 'continuation_section_second', 'continuation_section_third', 'continuation_section_fourth', 'continuation_section_fifth', 'continuation_section_sixth', 'conclusion_small', 'conclusion_medium', 'conclusion_large', 'faqs_small', 'faqs_medium', 'faqs_large', 'whats_next_small', 'whats_next_medium', 'whats_next_large', 'content_v2_intelligence', 'content_v2_system', 'content_v2_humanize', 'content_v2_blueprint_directives', 'content_v2_seo_rules', 'content_v3_intelligence', 'content_v3_system', 'content_v3_humanize', 'content_v3_blueprint_directives', 'content_v3_seo_rules', 'content_v3_business_context']
   },
   category: { 
     type: String, 

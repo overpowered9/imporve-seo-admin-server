@@ -66,13 +66,30 @@ const REDACTED_KEYS = new Set([
   'refresh_token',
   'api_key',
   'apiKey',
+  // Business contact details. The v3 content route carries a full business profile, so without
+  // these a customer's phone number, street address and geo coordinates would be printed to the
+  // application log on every generation.
+  'phone',
+  'telephone',
+  'address',
+  'latitude',
+  'longitude',
 ]);
 
-function redactBody(body: unknown): unknown {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+/**
+ * Redact sensitive keys at any depth.
+ *
+ * This used to be top-level only, which was enough when bodies were flat. A nested profile object
+ * walked straight past it, so the redaction has to follow the nesting. Depth is capped so a
+ * pathological body cannot turn logging into a traversal.
+ */
+function redactBody(body: unknown, depth = 0): unknown {
+  if (depth > 4) return '[deep]';
+  if (Array.isArray(body)) return body.map((v) => redactBody(v, depth + 1));
+  if (!body || typeof body !== 'object') return body;
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
-    out[key] = REDACTED_KEYS.has(key) ? '[redacted]' : value;
+    out[key] = REDACTED_KEYS.has(key) ? '[redacted]' : redactBody(value, depth + 1);
   }
   return out;
 }

@@ -63,11 +63,10 @@ function cleanupWhitespace(html: string): string {
 }
 
 /**
- * Build a linked Table of Contents from the article's <h2> headings and ensure every heading has a
- * matching id. Reliable and always present — no dependence on the model writing correct anchors.
- * Inserted right after the intro (before the first <h2>). Skipped for very short articles.
+ * Give every <h2> a unique id and collect the heading list, without deciding what to do with it.
+ * Never trusts an anchor the model wrote; ids already present are kept.
  */
-export function injectTableOfContents(html: string): string {
+function assignHeadingIds(html: string): { html: string; headings: { id: string; text: string }[] } {
   const used = new Set<string>();
   const headings: { id: string; text: string }[] = [];
 
@@ -90,10 +89,28 @@ export function injectTableOfContents(html: string): string {
     return `<h2${attrsWithId}>${inner}</h2>`;
   });
 
+  return { html, headings };
+}
+
+/** Give every <h2> a stable id without building a table of contents. */
+export function ensureHeadingIds(html: string): string {
+  return assignHeadingIds(html).html;
+}
+
+/**
+ * Build a linked table of contents from the article's <h2> headings, with matching ids.
+ * Inserted right after the intro (before the first <h2>). Skipped when there are fewer than two
+ * headings. The heading text is a parameter so it does not become a fingerprint of its own.
+ */
+export function injectTableOfContents(html: string, heading = 'Table of Contents'): string {
+  const assigned = assignHeadingIds(html);
+  html = assigned.html;
+  const headings = assigned.headings;
+
   if (headings.length < 2) return html;
 
   const items = headings.map((h) => `<li><a href="#${h.id}">${h.text}</a></li>`).join('');
-  const toc = `<h2 id="table-of-contents">Table of Contents</h2><ol class="improveseo-toc">${items}</ol>`;
+  const toc = `<h2 id="table-of-contents">${heading}</h2><ol class="improveseo-toc">${items}</ol>`;
   const firstH2 = html.search(/<h2[\s>]/i);
   return firstH2 === -1 ? html : html.slice(0, firstH2) + toc + html.slice(firstH2);
 }
@@ -134,14 +151,43 @@ function normalizeSectionHeadings(html: string): string {
   );
 }
 
+/**
+ * Options for callers whose article contract differs from v2's.
+ *
+ * Every default reproduces v2's behaviour exactly, so the existing single-argument call is
+ * unchanged. v3 turns the heading normalizer off (it force-casts a heading to the literal
+ * "Key Takeaways", which is the fingerprint v3 exists to remove) and passes the blueprint's own
+ * table-of-contents decision, which v2 computes and then ignores.
+ */
+export interface PostProcessOptions {
+  /** Force known section headings to canonical casing. Default true. */
+  normalizeHeadings?: boolean;
+  /** Build and insert a table of contents. Default true. */
+  includeToc?: boolean;
+  /** Heading text for that table of contents. Default 'Table of Contents'. */
+  tocHeading?: string;
+}
+
 /** Full post-processing pipeline. Order matters — see comments. */
-export function postProcessArticle(html: string): string {
+export function postProcessArticle(html: string, opts: PostProcessOptions = {}): string {
+  const {
+    normalizeHeadings = true,
+    includeToc = true,
+    tocHeading = 'Table of Contents',
+  } = opts;
+
   html = convertMarkdownToHtml(html); // stray markdown → HTML (before TOC, so headings are <h2>)
   html = fixMalformedAnchors(html);
   html = html.replace(/\s*—\s*/g, ', '); // em-dash guard (keeps en-dashes in "$180–$350")
   html = cleanupWhitespace(html); // remove the now-empty "<p>, </p>" etc.
-  html = normalizeSectionHeadings(html); // canonical heading casing (before TOC, so it inherits it)
-  html = injectTableOfContents(html); // build TOC + heading ids
+  if (normalizeHeadings) {
+    html = normalizeSectionHeadings(html); // canonical heading casing (before TOC, so it inherits it)
+  }
+  if (includeToc) {
+    html = injectTableOfContents(html, tocHeading); // build TOC + heading ids
+  } else {
+    html = ensureHeadingIds(html); // ids still needed for anchors, even with no TOC
+  }
   html = linkifyContacts(html); // emails + URLs → anchors
   html = stripParensAroundLinks(html);
   return html.trim();

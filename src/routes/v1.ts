@@ -6,6 +6,7 @@ import { EnhancedAIContentGenerator } from '../services/enhanced-ai-generator.se
 import { PromptManagementService } from '../services/prompt-management.service.js';
 import generationRoutes from './generation.routes.js';
 import contentV2Routes from './content-v2.routes.js';
+import contentV3Routes from './content-v3.routes.js';
 import authRoutes from './auth.routes.js';
 import websitesRoutes from './websites.routes.js';
 import usersRoutes from './users.routes.js';
@@ -139,6 +140,9 @@ router.post('/generate', async (req: Request, res: Response, next: NextFunction)
 // Mount generation routes
 router.use('/generate', generationRoutes);
 router.use('/content-v2', contentV2Routes);
+// v3 is the prompt-experimentation route. Every endpoint on it is requireAdmin and charges no
+// credits; the plugin keeps calling /content-v2 above.
+router.use('/content-v3', contentV3Routes);
 router.use('/auth', authRoutes);
 router.use('/websites', websitesRoutes);
 router.use('/users', usersRoutes);
