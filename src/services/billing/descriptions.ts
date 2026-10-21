@@ -158,6 +158,14 @@ export const describeSubscriptionReactivated = (plan: string | null | undefined)
   withPlan('Subscription reactivated', plan);
 
 /**
+ * The subscription has actually stopped — a different event from cancelling it,
+ * which only schedules this. Names where the account went, like the trial-ended
+ * line, because that is what the customer is now on.
+ */
+export const describeSubscriptionEnded = (): string =>
+  'Subscription ended — moved to Basic plan';
+
+/**
  * An upgrade that has been billed.
  *
  * "(prorated)" and nothing about invoices: the charge happens at the moment of

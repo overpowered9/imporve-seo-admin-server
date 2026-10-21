@@ -2170,6 +2170,48 @@ export const startUserTrial = async (user_id: number): Promise<void> => {
     }
   }
 };
+
+/**
+ * Make sure Account Activity has its "Free trial started" line.
+ *
+ * startUserTrial() writes it only when IT starts the trial. A CMS signup never
+ * gets that far: supabase.auth.signUp() creates the users row through the
+ * handle_new_user trigger (migration 016), which sets trial_started_at itself,
+ * so startUserTrial's UPDATE matches nothing and no row was ever written —
+ * reported as "Free trial started does not show, as of October 15".
+ *
+ * Called on every CMS session (POST /users/by-email). It is one indexed
+ * existence check when the row is already there, and it heals accounts created
+ * before this fix on their next visit. Dated to the real trial start, not to
+ * today, so it sorts where it belongs. Same event id as startUserTrial's row,
+ * so the two can never both appear.
+ */
+export const ensureTrialStartedActivity = async (
+  user: { id: number; trial_started_at?: Date | string | null },
+): Promise<void> => {
+  if (!user.trial_started_at) return;
+  try {
+    const providerEventId = `trial_started:${user.id}`;
+    const existing = await sql`
+      SELECT 1 FROM billing_transactions
+      WHERE provider = 'stripe' AND provider_event_id = ${providerEventId}
+      LIMIT 1
+    `;
+    if (existing.length > 0) return;
+
+    await recordTransaction(sql, {
+      userId: user.id,
+      type: 'plan_grant',
+      description: describeTrialStarted(TRIAL_DAYS),
+      amountCents: null,
+      status: 'succeeded',
+      providerEventId,
+      occurredAt: user.trial_started_at,
+    });
+  } catch (err) {
+    console.warn(`Could not ensure the trial-started activity row for user ${user.id} (non-fatal):`, err);
+  }
+};
 export const findUserByAuthId = async (auth_user_id: string): Promise<User | null> => {
   const result = await sql`
     SELECT * FROM users WHERE auth_user_id = ${auth_user_id} LIMIT 1

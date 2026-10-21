@@ -31,6 +31,7 @@ import {
   getCreditLotSummary,
   clearWebsiteConnection,
   ensureSignupGrant,
+  ensureTrialStartedActivity,
   hasPasswordCredential
 } from '../models/user.models.js';
 
@@ -218,6 +219,12 @@ router.post('/by-email', async (req, res) => {
     // balance and every generation was refused. No-op for everyone else: one
     // existence check and nothing more. See ensureSignupGrant.
     await ensureSignupGrant(user);
+
+    // ── Account Activity's "Free trial started" line ──────────────────────
+    // Same seam, same reason: a CMS signup's trial is started by the database
+    // trigger, so startUserTrial never wrote this row. See
+    // ensureTrialStartedActivity. Never throws.
+    await ensureTrialStartedActivity(user);
 
     // ── Send the signup emails, if they never went ────────────────────────
     // Same seam, same reasoning. These were poller-only on a 15-minute

@@ -137,6 +137,8 @@ import {
   describeSubscriptionStarted,
   describeSubscriptionCancelled,
   describeSubscriptionReactivated,
+  describeSubscriptionEnded,
+  describePlanDowngraded,
   describeRefund,
   planUpgradeConfirmationParts,
   planDowngradeConfirmationParts,
@@ -1468,6 +1470,22 @@ router.post('/webhook', async (req: Request, res: Response) => {
             WHERE user_id = ${userId}
           `;
 
+          // Account Activity: "Subscription canceled" is written when the
+          // customer asks; this is the day it actually stops. Keyed on the
+          // Stripe subscription, so a redelivered webhook upserts. Dated to
+          // Stripe's own end time when it has one. recordTransaction never throws.
+          await recordTransaction(sql, {
+            userId,
+            type: 'plan_downgrade',
+            description: describeSubscriptionEnded(),
+            amountCents: null,
+            status: 'succeeded',
+            providerEventId: `subscription_ended:${subscription.id}`,
+            providerObjectId: subscription.id,
+            planId: freePlanId,
+            occurredAt: subscription.ended_at ? new Date(subscription.ended_at * 1000) : null,
+          });
+
           console.log(`⚠️ Subscription cancelled for user ${userId}, downgraded to free plan (purchased credits preserved)`);
         }
         break;
@@ -1484,12 +1502,57 @@ router.post('/webhook', async (req: Request, res: Response) => {
         if (paidSubscriptionId) {
           // Find user by subscription ID
           const subResult = await sql`
-            SELECT user_id, plan_id, billing_interval, next_billing_date FROM subscriptions
+            SELECT user_id, plan_id, pending_plan_id, billing_interval, next_billing_date FROM subscriptions
             WHERE stripe_subscription_id = ${paidSubscriptionId}
           `;
 
           if (subResult.length > 0) {
-            const { user_id, plan_id } = subResult[0];
+            const { user_id } = subResult[0];
+            let plan_id = subResult[0].plan_id;
+
+            // ── A scheduled downgrade lands on this renewal ─────────────────
+            // change-plan moves the Stripe price at once with no proration, and
+            // records only pending_plan_id here — so this renewal is the first
+            // one billed at the lower plan, and the day the downgrade happens.
+            // Nothing applied it before: the row kept the old plan for good, the
+            // refill below granted the OLD plan's credits, and "Plan downgraded"
+            // never reached Account Activity. Applied BEFORE the refill so the
+            // allotment and the renewal line both name the plan now in force.
+            //
+            // Guarded on pending_plan_id IS NOT NULL in the UPDATE itself, so a
+            // redelivered webhook finds nothing to apply and writes no second row.
+            if (isRenewalInvoice(invoice) && subResult[0].pending_plan_id != null) {
+              const applied = await sql`
+                UPDATE subscriptions
+                SET previous_plan_id = plan_id,
+                    plan_id = pending_plan_id,
+                    pending_plan_id = NULL,
+                    pending_plan_effective_date = NULL,
+                    status = 'active'
+                WHERE stripe_subscription_id = ${paidSubscriptionId}
+                  AND pending_plan_id IS NOT NULL
+                RETURNING previous_plan_id, plan_id
+              `;
+              if (applied.length > 0) {
+                const fromId = applied[0].previous_plan_id;
+                plan_id = applied[0].plan_id;
+                await sql`UPDATE users SET plan_id = ${plan_id}, updated_at = NOW() WHERE id = ${user_id}`;
+
+                const names = await sql`SELECT id, name FROM subscription_plans WHERE id IN (${fromId}, ${plan_id})`;
+                const nameOf = (id: number) => (names as any[]).find((p) => p.id === id)?.name ?? null;
+                await recordTransaction(sql, {
+                  userId: user_id,
+                  type: 'plan_downgrade',
+                  description: describePlanDowngraded(nameOf(fromId), nameOf(plan_id)),
+                  amountCents: null,
+                  status: 'succeeded',
+                  providerEventId: `plan_downgraded:${invoice.id}`,
+                  providerObjectId: paidSubscriptionId,
+                  planId: plan_id,
+                });
+                console.log(`⬇️ Scheduled downgrade applied for user ${user_id}: plan ${fromId} → ${plan_id}`);
+              }
+            }
 
             // ── Refill ONLY on a genuine renewal ────────────────────────────
             // Every invoice attached to a subscription lands here, including
