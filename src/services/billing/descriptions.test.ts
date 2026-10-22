@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import {
   describeTrialStarted, describeTrialEnded,
   describeSubscriptionStarted, describeSubscriptionRenewed,
-  describeSubscriptionCancelled, describeSubscriptionReactivated,
+  describeSubscriptionCancelled, describeSubscriptionReactivated, describeSubscriptionEnded,
   describePlanUpgraded, describePlanDowngradeScheduled, describePlanDowngraded,
   describeCreditPurchase, describeRefund, describeCreditAdjustment,
   describePaymentFailed, describeCreditsExpired,
@@ -31,6 +31,7 @@ describe('the requested catalogue, line for line', () => {
     assert.equal(describeSubscriptionRenewed('Grow'), 'Subscription renewed — Grow plan');
     assert.equal(describeSubscriptionCancelled('Grow'), 'Subscription canceled — Grow plan');
     assert.equal(describeSubscriptionReactivated('Grow'), 'Subscription reactivated — Grow plan');
+    assert.equal(describeSubscriptionEnded(), 'Subscription ended — moved to Basic plan');
     assert.equal(
       describePlanUpgraded('Grow', 'Optimize'),
       'Plan upgraded — Grow → Optimize (prorated)',

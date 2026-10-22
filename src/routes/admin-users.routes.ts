@@ -6,6 +6,8 @@ import sql from '../data/db.js';
 import { syncBalanceCache } from '../models/user.models.js';
 import { PURCHASED_CREDIT_LIFETIME_MONTHS } from '../config/credits.config.js';
 import { describeUserPlan, type UserPlanRow } from '../models/user-plan.js';
+import { recordTransaction } from '../services/billing/transactions.js';
+import { describeCreditAdjustment } from '../services/billing/descriptions.js';
 
 const router = express.Router();
 
@@ -540,7 +542,7 @@ router.post('/:userId/gift-credits', async (req, res) => {
     // Admin grants go to the PURCHASED bucket on a full lifetime: they are a
     // goodwill gesture or a correction, and expiring them with the current plan
     // cycle would quietly take them back.
-    await sql.begin(async (tx) => {
+    const appliedDelta = await sql.begin(async (tx) => {
       const live = (await tx`
         SELECT id, source, remaining FROM credit_lots
         WHERE user_id = ${userId} AND remaining > 0 AND expires_at > NOW()
@@ -593,7 +595,28 @@ router.post('/:userId/gift-credits', async (req, res) => {
         INSERT INTO credit_transactions (user_id, credit_type, delta, reason)
         VALUES (${userId}, ${credit_type}, ${delta}, ${logReason})
       `;
+      return delta;
     });
+
+    // ── Account Activity: "Credit adjustment — N credits added/removed by support"
+    // credit_transactions above is the internal audit log; the customer reads
+    // billing_transactions. Written AFTER the transaction commits rather than
+    // inside it: a failed ledger insert inside would abort the adjustment
+    // itself, and the credits must move whether or not the line is written.
+    // A "set" that changed nothing is not an adjustment, so no row.
+    if (appliedDelta !== 0) {
+      await recordTransaction(sql, {
+        userId,
+        type: 'plan_grant',
+        description: describeCreditAdjustment(appliedDelta),
+        amountCents: null,
+        status: 'succeeded',
+        providerEventId: `admin_adjustment:${userId}:${Date.now()}`,
+        creditType: 'iseo',
+        creditDelta: appliedDelta,
+        metadata: { operation, reason },
+      });
+    }
 
     // Get updated balances
     const updatedCredits = await sql`
