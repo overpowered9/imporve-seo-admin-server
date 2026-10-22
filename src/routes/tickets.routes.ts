@@ -21,8 +21,31 @@ import {
   getTicketAttachments
 } from '../models/ticket.models.js';
 import { sendEmail, emailTemplates } from '../services/email.service.js';
+import { requireAdmin } from '../middleware/adminAuth.middleware.js';
 
 const router = express.Router();
+
+/**
+ * The admin side of this router — the queue, a ticket as an agent sees it, and changing
+ * status, priority or tags — needs the admin session, like every other admin route
+ * (v1.ts mounts /admin/users behind requireAdmin). These were open: GET /tickets/admin/all
+ * returned every customer's tickets, email and name to anyone who asked, and anyone could
+ * close a ticket or post a reply that the customer is emailed as coming from Support.
+ *
+ * The admin panel already sends its token on every call (its axios interceptor), and the
+ * CMS never calls these routes, so neither changes. The customer routes — open a ticket,
+ * list one's own, reply, upload — are left exactly as they were.
+ */
+const requireAdminForAgentMessages = (
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+) =>
+  // A reply as Support, or an internal note, is an agent's message. A customer's own reply
+  // ('user') carries no admin token and is checked for ownership in the handler.
+  req.body?.sender_type === 'admin' || req.body?.is_internal_note === true
+    ? requireAdmin(req, res, next)
+    : next();
 
 // ==================== FILE UPLOAD CONFIG ====================
 const UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'tickets');
@@ -242,7 +265,7 @@ router.get('/:ticket_id', async (req, res) => {
  * POST /tickets/:ticket_id/messages
  * Add a message to a ticket
  */
-router.post('/:ticket_id/messages', async (req, res) => {
+router.post('/:ticket_id/messages', requireAdminForAgentMessages, async (req, res) => {
   try {
     const ticket_id = parseInt(req.params.ticket_id);
     if (isNaN(ticket_id)) {
@@ -330,7 +353,7 @@ router.post('/:ticket_id/messages', async (req, res) => {
  * GET /tickets/admin/stats
  * Get ticket statistics for admin dashboard
  */
-router.get('/admin/stats', async (req, res) => {
+router.get('/admin/stats', requireAdmin, async (req, res) => {
   try {
     const stats = await getTicketStats();
     res.json({
@@ -350,7 +373,7 @@ router.get('/admin/stats', async (req, res) => {
  * GET /tickets/admin/recent
  * Get recent active tickets for admin dashboard
  */
-router.get('/admin/recent', async (req, res) => {
+router.get('/admin/recent', requireAdmin, async (req, res) => {
   try {
     const limit = req.query.limit ? parseInt(req.query.limit as string) : 10;
     const tickets = await getRecentTickets(limit);
@@ -371,7 +394,7 @@ router.get('/admin/recent', async (req, res) => {
  * GET /tickets/admin/all
  * Get all tickets with filtering (admin view)
  */
-router.get('/admin/all', async (req, res) => {
+router.get('/admin/all', requireAdmin, async (req, res) => {
   try {
     const { status, priority, category, search, tag, limit, offset } = req.query;
     
@@ -410,7 +433,7 @@ router.get('/admin/all', async (req, res) => {
  * PATCH /tickets/:ticket_id/status
  * Update ticket status (admin only)
  */
-router.patch('/:ticket_id/status', async (req, res) => {
+router.patch('/:ticket_id/status', requireAdmin, async (req, res) => {
   try {
     const ticket_id = parseInt(req.params.ticket_id);
     if (isNaN(ticket_id)) {
@@ -473,7 +496,7 @@ router.patch('/:ticket_id/status', async (req, res) => {
  * PATCH /tickets/:ticket_id/priority
  * Update ticket priority (admin only)
  */
-router.patch('/:ticket_id/priority', async (req, res) => {
+router.patch('/:ticket_id/priority', requireAdmin, async (req, res) => {
   try {
     const ticket_id = parseInt(req.params.ticket_id);
     if (isNaN(ticket_id)) {
@@ -518,7 +541,7 @@ router.patch('/:ticket_id/priority', async (req, res) => {
  * GET /tickets/admin/:ticket_id
  * Get single ticket with all messages including internal notes (admin view)
  */
-router.get('/admin/:ticket_id', async (req, res) => {
+router.get('/admin/:ticket_id', requireAdmin, async (req, res) => {
   try {
     const ticket_id = parseInt(req.params.ticket_id);
     if (isNaN(ticket_id)) {
@@ -541,7 +564,7 @@ router.get('/admin/:ticket_id', async (req, res) => {
  * PATCH /tickets/:ticket_id/tags
  * Update ticket tags (admin only)
  */
-router.patch('/:ticket_id/tags', async (req, res) => {
+router.patch('/:ticket_id/tags', requireAdmin, async (req, res) => {
   try {
     const ticket_id = parseInt(req.params.ticket_id);
     if (isNaN(ticket_id)) {
