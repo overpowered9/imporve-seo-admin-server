@@ -5,7 +5,7 @@ import sql from '../data/db.js';
 // one writer. Both imports exist so this route cannot reinvent either.
 import { syncBalanceCache } from '../models/user.models.js';
 import { PURCHASED_CREDIT_LIFETIME_MONTHS } from '../config/credits.config.js';
-import { describeUserPlan, type UserPlanRow } from '../models/user-plan.js';
+import { describeUserPlan, planOptionLabel, type UserPlanRow } from '../models/user-plan.js';
 import { recordTransaction } from '../services/billing/transactions.js';
 import { describeCreditAdjustment } from '../services/billing/descriptions.js';
 
@@ -424,10 +424,10 @@ router.get('/stats', async (_req, res) => {
     `;
 
     const plans = await sql`
-      SELECT sp.id, sp.name, sp.slug, COUNT(u.id) as user_count
+      SELECT sp.id, sp.name, sp.slug, sp.price_cents, COUNT(u.id) as user_count
       FROM subscription_plans sp
       LEFT JOIN users u ON u.plan_id = sp.id
-      GROUP BY sp.id, sp.name, sp.slug
+      GROUP BY sp.id, sp.name, sp.slug, sp.price_cents
       ORDER BY sp.price_cents ASC
     `;
 
@@ -435,7 +435,9 @@ router.get('/stats', async (_req, res) => {
       success: true,
       data: {
         ...stats[0],
-        plans
+        // `name` is the column that drifted ("Starter Plan" is sold as Optimize); the
+        // panel's plan filter prints display_name, so it agrees with the user list.
+        plans: plans.map((p) => ({ ...p, display_name: planOptionLabel(p) }))
       }
     });
   } catch (error) {

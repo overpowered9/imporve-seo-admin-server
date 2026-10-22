@@ -15,6 +15,18 @@ import { effectiveTrialEnd } from './trial.js';
 export const FREE_PLAN_LABEL = 'Basic (free)';
 
 /**
+ * A plan as the panel's plan FILTER names it, from a `subscription_plans` row.
+ *
+ * The filter selects by plan_id, and the $0 plan holds trial and lapsed accounts
+ * alike, so its option names both: "Basic (free)" alone would hide that picking
+ * it also lists every Free Trial. Paid plans read as describeUserPlan names them.
+ */
+export const planOptionLabel = (plan: { slug?: string | null; name?: string | null; price_cents?: number | string | null }): string =>
+  plan.price_cents == null || Number(plan.price_cents) === 0
+    ? `Free Trial & ${FREE_PLAN_LABEL}`
+    : planLabel(plan.slug ?? plan.name) || String(plan.name ?? '');
+
+/**
  * The plan an agent sees beside a ticket.
  *
  * `plan_name` is the RAW `subscription_plans.name` and is kept only so the panel

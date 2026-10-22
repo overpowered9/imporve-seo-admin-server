@@ -23,7 +23,7 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { describeUserPlan } from './user-plan.js';
+import { describeUserPlan, planOptionLabel } from './user-plan.js';
 
 /** Days from now, as the timestamp the users table would hold. */
 const daysFromNow = (n: number): Date => {
@@ -207,5 +207,16 @@ describe('describeUserPlan — a trial is not the free plan', () => {
       trial_ends_at: daysFromNow(-3), user_created_at: daysFromNow(-10),
     });
     assert.notEqual(trial.plan_display_name, basic.plan_display_name);
+  });
+});
+
+describe('planOptionLabel — the plan filter names plans the same way', () => {
+  test('the paid plans read Grow, Optimize, Scale, not their raw names', () => {
+    assert.equal(planOptionLabel({ slug: 'basic', name: 'Grow', price_cents: 950 }), 'Grow');
+    assert.equal(planOptionLabel({ slug: 'starter', name: 'Starter Plan', price_cents: 2500 }), 'Optimize');
+    assert.equal(planOptionLabel({ slug: 'pro', name: 'Pro Plan', price_cents: 4900 }), 'Scale');
+  });
+  test('the $0 plan names both accounts it holds', () => {
+    assert.equal(planOptionLabel({ slug: 'free', name: 'Free', price_cents: 0 }), 'Free Trial & Basic (free)');
   });
 });
