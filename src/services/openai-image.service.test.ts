@@ -18,7 +18,7 @@ import assert from 'node:assert/strict';
 process.env.SUPABASE_URL ||= 'http://localhost';
 process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-key';
 
-const { buildImagePrompt } = await import('./openai-image.service.js');
+const { buildImagePrompt, resolveImageModel, normalizeError, DEFAULT_IMAGE_MODEL } = await import('./openai-image.service.js');
 
 const PENALTY = 'a boy playing football in a ground and shooting a penalty';
 
@@ -104,5 +104,62 @@ describe('buildImagePrompt without a custom instruction (unchanged behaviour)', 
     const a = buildImagePrompt({ title: 'X', custom_instruction: '   ' });
     const b = buildImagePrompt({ title: 'X' });
     assert.equal(a, b);
+  });
+});
+
+/**
+ * The image model — written after gpt-image-1 was shut down (2026-10-23) and every cover image
+ * failed. A retired id, whether the old default or a stale Render env value, must never reach OpenAI.
+ */
+describe('resolveImageModel', () => {
+  test('defaults to gpt-image-2.5-flare when the env var is unset or blank', () => {
+    assert.equal(DEFAULT_IMAGE_MODEL, 'gpt-image-2.5-flare');
+    assert.equal(resolveImageModel(undefined), DEFAULT_IMAGE_MODEL);
+    assert.equal(resolveImageModel('   '), DEFAULT_IMAGE_MODEL);
+  });
+
+  test('replaces shut-down and shutting-down models, including dated snapshots', () => {
+    for (const retired of [
+      'gpt-image-1', 'gpt-image-1-mini', 'gpt-image-1.5', 'gpt-image-1.5-2025-12-16',
+      'chatgpt-image-latest', 'dall-e-2', 'dall-e-3', ' gpt-image-1 ',
+    ]) {
+      assert.equal(resolveImageModel(retired), DEFAULT_IMAGE_MODEL, retired);
+    }
+  });
+
+  test('keeps any current model chosen from env', () => {
+    assert.equal(resolveImageModel('gpt-image-2.5-sunburst'), 'gpt-image-2.5-sunburst');
+    assert.equal(resolveImageModel('gpt-image-2.5-flare-2026-09-08'), 'gpt-image-2.5-flare-2026-09-08');
+  });
+});
+
+describe('normalizeError for an unusable model', () => {
+  const axiosError = (status: number, error: Record<string, string>) => ({ response: { status, data: { error } }, request: {} });
+
+  test('a 404 / model_not_found is a server-side model problem, not an anonymous 500', () => {
+    const e = normalizeError(axiosError(404, { code: 'model_not_found', message: 'The model `gpt-image-1` does not exist.' }), 'gpt-image-1');
+    assert.equal(e.code, 'model_unavailable');
+    assert.equal(e.status, 502);
+  });
+
+  test('the 400 OpenAI actually returns for gpt-image-1 since its shutdown is the same problem', () => {
+    // Verbatim response body from POST /v1/images/generations with model gpt-image-1, 2026-11-03.
+    const e = normalizeError(axiosError(400, {
+      message: "The model 'gpt-image-1' does not exist.",
+      type: 'image_generation_user_error',
+      code: 'invalid_value',
+    }), 'gpt-image-1');
+    assert.equal(e.code, 'model_unavailable');
+    assert.equal(e.status, 502);
+  });
+
+  test('a 403 for the model is reported as forbidden', () => {
+    const e = normalizeError(axiosError(403, { message: 'Your organization must be verified to use this model.' }), 'x');
+    assert.equal(e.code, 'forbidden');
+  });
+
+  test('moderation and ordinary bad requests are unchanged', () => {
+    assert.equal(normalizeError(axiosError(400, { code: 'moderation_blocked', message: 'blocked by safety system' })).code, 'moderation');
+    assert.equal(normalizeError(axiosError(400, { message: 'Invalid size.' })).code, 'bad_request');
   });
 });

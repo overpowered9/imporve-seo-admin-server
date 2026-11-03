@@ -580,7 +580,55 @@ export const findWebsiteByCode = async (site_code: string, user_id: number): Pro
   return (result[0] as Website) || null;
 };
 
+/**
+ * Bring credit_balances back in line with the live lots before it is read.
+ *
+ * ── WHY A READ HAS TO DO THIS ──────────────────────────────────────────────
+ * credit_balances is a cache of the live lots (see syncBalanceCache), but it is
+ * only re-derived when a lot is WRITTEN. A lot that simply reaches its
+ * expires_at changes nothing in the database, so the cache kept counting it:
+ * the only thing that zeroes lapsed lots is the expiry sweep, and that runs
+ * inside the lifecycle-email scheduler, which is off in production.
+ *
+ * Reported by QA as a Scale account whose Settings card read "Total credits
+ * remaining 1,251" above a breakdown of a single 120-credit row: a lapsed
+ * 1,131-credit plan lot was still in the cache (the total, the "≈ N pieces"
+ * line, the plugin's pre-checks) but not in the lots (the breakdown, and
+ * burnFromLots — so 120 was all the account could actually spend).
+ *
+ * Same live-lot filter as syncBalanceCache / getLiveBalance / burnFromLots, so
+ * every reader agrees with what can be spent. It writes only when the cache is
+ * actually stale (an ordinary read is one UPDATE matching no row), never
+ * creates a row (provisioning stays with the grant paths), and never touches
+ * included_allotment / cycle_started_at. A failure here is logged and the
+ * caller reads the cache as before — a read must not start failing because
+ * the refresh did.
+ */
+export const refreshBalanceCache = async (user_id: number): Promise<void> => {
+  try {
+    await sql`
+      UPDATE credit_balances cb
+      SET    included_remaining  = live.plan,
+             purchased_remaining = live.purchased,
+             updated_at          = NOW()
+      FROM (
+        SELECT COALESCE(SUM(remaining) FILTER (WHERE source = 'plan'), 0)::int      AS plan,
+               COALESCE(SUM(remaining) FILTER (WHERE source = 'purchased'), 0)::int AS purchased
+        FROM   credit_lots
+        WHERE  user_id = ${user_id} AND remaining > 0 AND expires_at > NOW()
+      ) live
+      WHERE  cb.user_id = ${user_id}
+        AND  cb.credit_type = ${ISEO_CREDIT_TYPE}
+        AND  (cb.included_remaining IS DISTINCT FROM live.plan
+              OR cb.purchased_remaining IS DISTINCT FROM live.purchased)
+    `;
+  } catch (err) {
+    console.error(`⚠️ Could not refresh the credit balance cache for user ${user_id} (reading the cached value):`, err);
+  }
+};
+
 export const getUserCreditBalance = async (user_id: number, credit_type: string): Promise<number> => {
+  await refreshBalanceCache(user_id);
   const result = await sql`
     SELECT amount FROM credit_balances 
     WHERE user_id = ${user_id} AND credit_type = ${credit_type}
@@ -590,6 +638,7 @@ export const getUserCreditBalance = async (user_id: number, credit_type: string)
 };
 
 export const getUserCreditBalances = async (user_id: number): Promise<CreditBalance[]> => {
+  await refreshBalanceCache(user_id);
   const result = await sql`
     SELECT * FROM credit_balances
     WHERE user_id = ${user_id}

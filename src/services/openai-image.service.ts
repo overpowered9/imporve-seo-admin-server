@@ -13,7 +13,48 @@ import { supabaseAdmin } from './supabase.service.js';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const IMAGES_URL = 'https://api.openai.com/v1/images/generations';
-const IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1';
+/**
+ * The image model, and why it is resolved rather than read.
+ *
+ * This used to be `process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1'`. OpenAI shut gpt-image-1 down on
+ * 2026-10-23, and from that day every cover and bulk image failed: OpenAI rejected the model, the
+ * route answered 500, and the plugin could only show "Image Generation Failed". The same happens again
+ * on 2026-12-01 to gpt-image-1-mini, gpt-image-1.5 and chatgpt-image-latest.
+ *
+ * So a retired id — whether it is the old code default or a value still set in Render's environment —
+ * is replaced by the current default instead of being sent to OpenAI to fail. Any other id is used as
+ * given, so a newer model can still be chosen from env without a code change.
+ *
+ * gpt-image-2.5-flare is OpenAI's "fastest model for high-quality, everyday image generation": a blog
+ * cover at medium quality is everyday work, and both the plugin and this server give the call 120 s.
+ * Accepts the same request this file sends (1536x1024, quality medium, jpeg + output_compression,
+ * b64_json in data[0]).
+ */
+export const DEFAULT_IMAGE_MODEL = 'gpt-image-2.5-flare';
+
+// Shut down (gpt-image-1, dall-e-*) or shutting down 2026-12-01 (the rest), per
+// developers.openai.com/api/docs/deprecations. Dated snapshots of these are matched too.
+const RETIRED_IMAGE_MODELS = ['gpt-image-1', 'gpt-image-1-mini', 'gpt-image-1.5', 'chatgpt-image-latest', 'dall-e-2', 'dall-e-3'];
+
+export function resolveImageModel(envValue: string | undefined): string {
+  const requested = (envValue || '').trim();
+  if (!requested) return DEFAULT_IMAGE_MODEL;
+  // "gpt-image-1.5-2025-12-16" is a snapshot of gpt-image-1.5; "gpt-image-1.5" itself must not count as
+  // a snapshot of "gpt-image-1", so a snapshot is the retired id followed by a dated suffix only.
+  const retired = RETIRED_IMAGE_MODELS.some(
+    (id) => requested === id || new RegExp(`^${id.replace(/\./g, '\\.')}-\\d{4}-\\d{2}-\\d{2}$`).test(requested),
+  );
+  if (retired) {
+    console.warn(
+      `⚠️ [v2 image] OPENAI_IMAGE_MODEL="${requested}" is retired by OpenAI — using ${DEFAULT_IMAGE_MODEL} instead. `
+        + 'Update the environment variable.',
+    );
+    return DEFAULT_IMAGE_MODEL;
+  }
+  return requested;
+}
+
+const IMAGE_MODEL = resolveImageModel(process.env.OPENAI_IMAGE_MODEL);
 const IMAGE_BUCKET = process.env.SUPABASE_IMAGE_BUCKET || 'generated-images';
 
 export type ImageSize = '1024x1024' | '1536x1024' | '1024x1536' | 'auto';
@@ -161,8 +202,8 @@ export function buildImagePrompt(p: GenerateImageParams): string {
   return parts.join(' ');
 }
 
-/** Map an axios/OpenAI failure to a clean ImageGenError. */
-function normalizeError(err: any): ImageGenError {
+/** Map an axios/OpenAI failure to a clean ImageGenError. Exported for tests. */
+export function normalizeError(err: any, model: string = IMAGE_MODEL): ImageGenError {
   if (err instanceof ImageGenError) return err;
   if (err?.code === 'ECONNABORTED' || err?.code === 'ETIMEDOUT') {
     return new ImageGenError('Image generation timed out. Please try again.', 504, 'timeout');
@@ -171,6 +212,23 @@ function normalizeError(err: any): ImageGenError {
   const apiErr = err?.response?.data?.error;
   const apiMsg: string = apiErr?.message || '';
   const apiCode: string = apiErr?.code || apiErr?.type || '';
+
+  // The model itself is unusable — retired, renamed, or not enabled for this OpenAI project. This is
+  // what a shut-down model looks like, and it used to fall through to an anonymous 500 'unknown',
+  // so nothing in the logs said WHICH model or why. It is a server configuration problem, not the
+  // customer's: they get a neutral message, the log gets the detail.
+  if (
+    status === 404
+    || apiCode === 'model_not_found'
+    || (status === 400 && /\bmodel\b.*(does not exist|not found|deprecated|shut down|no longer available|not supported)/i.test(apiMsg))
+  ) {
+    console.error(`❌ [v2 image] OpenAI image model "${model}" is unavailable (${status} ${apiCode}): ${apiMsg}`);
+    return new ImageGenError('Image generation is temporarily unavailable. Please try again later.', 502, 'model_unavailable');
+  }
+  if (status === 403) {
+    console.error(`❌ [v2 image] OpenAI refused model "${model}" for this project (403 ${apiCode}): ${apiMsg}`);
+    return new ImageGenError('Image generation is temporarily unavailable. Please try again later.', 502, 'forbidden');
+  }
 
   if (status === 400 && /moderation|content_policy|safety|blocked/i.test(`${apiCode} ${apiMsg}`)) {
     return new ImageGenError('The prompt was blocked by content moderation. Try a different description.', 400, 'moderation');
