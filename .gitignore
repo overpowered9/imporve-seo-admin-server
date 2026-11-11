@@ -112,3 +112,12 @@ add_stripe_price_id.sql
 !/src/scripts/seed-expiring-credits.ts
 /claude reference
 email-previews/
+
+# ── Keyword data / Content v3 steps (feature/keyword-data-v3) ────────────────
+# The example env file for the DataForSEO work. Keys only, no values. Listed AFTER the
+# `.env.example` ignore above so this negation wins (git applies the last matching rule).
+!.env.example
+# The feature report ships, like the billing runbook: it is how to run, toggle and test this.
+!/docs/KEYWORD_DATA_V3.md
+# A/B harness output (JSON + CSV per run). Local artefacts, never committed.
+data/ab-tests/
