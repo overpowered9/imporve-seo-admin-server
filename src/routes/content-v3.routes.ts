@@ -3,6 +3,11 @@
  *
  *   POST /api/v1/content-v3/article/test   — requireAdmin, no credits. The prompt-tuning endpoint.
  *   POST /api/v1/content-v3/prompts/seed   — requireAdmin. Registers the v3 templates (writer chain + steps).
+ *   POST /api/v1/content-v3/title          — requireAdmin, no credits. PROMPT 1 (Title step).
+ *   POST /api/v1/content-v3/planner        — requireAdmin, no credits. PROMPT 3 (Planner step).
+ *                                            Both in content-v3-steps.handler.ts; keyword data
+ *                                            (Option B) applies when ISEO_V3_KEYWORD_DATA=true and
+ *                                            the request sends use_keyword_data: true.
  *   POST /api/v1/content-v3/keyword-data/prefetch — validateApiAccess (plugin). Warms the keyword
  *                                            data cache; see content-v3-keyword-data.handler.ts.
  *                                            The one plugin-facing route on this router (decided
@@ -33,12 +38,17 @@ import { seedV3Prompts } from '../services/prompt-seed.v3.js';
 import { requireAdmin } from '../middleware/adminAuth.middleware.js';
 import { sanitizeCustomInstruction } from '../services/generation-history.js';
 import keywordDataRoutes from './content-v3-keyword-data.routes.js';
+import stepsRoutes from './content-v3-steps.routes.js';
 
 const router = Router();
 
 // Keyword data (Option A/B plumbing). Auth is applied INSIDE the sub-router: prefetch is
 // plugin-authenticated, everything else on it is requireAdmin.
 router.use('/keyword-data', keywordDataRoutes);
+
+// The Title and Planner steps (admin-only, like /article/test). Mounted at the root so the paths
+// are /content-v3/title and /content-v3/planner; auth is applied inside the sub-router.
+router.use('/', stepsRoutes);
 
 const VALID_WORDS = ['600 to 1200 words', '1200 to 2400 words', '2400 to 3600 words'];
 

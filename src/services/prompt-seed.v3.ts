@@ -13,6 +13,7 @@
 
 import { PromptManagementService } from './prompt-management.service.js';
 import { V3_PROMPT_DEFS } from './claude-content-generator-v3.service.js';
+import { V3_STEP_PROMPT_DEFS } from './content-v3-steps/prompts.js';
 
 export interface SeedReportEntry {
   templateType: string;
@@ -27,7 +28,10 @@ export async function seedV3Prompts(
 ): Promise<SeedReportEntry[]> {
   const report: SeedReportEntry[] = [];
 
-  for (const def of Object.values(V3_PROMPT_DEFS)) {
+  // The Writer-chain prompts (claude-content-generator-v3.service.ts) plus the Title/Planner step
+  // prompts (content-v3-steps/prompts.ts), all with the same idempotent, skip-only treatment.
+  const defs = [...Object.values(V3_PROMPT_DEFS), ...Object.values(V3_STEP_PROMPT_DEFS)];
+  for (const def of defs) {
     const entry: SeedReportEntry = {
       templateType: def.templateType,
       displayName: def.displayName,
