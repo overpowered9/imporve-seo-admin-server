@@ -36,6 +36,7 @@ const migrations = [
   ['018 — websites.domain index (cross-account supersede lookup)', '../migrations/018-websites-domain-index.js'],
   ['019 — keyword_daily_usage (daily Keyword Generator allowance)', '../migrations/019-keyword-daily-usage.js'],
   ['020 — website_limit for Grow (3) and Optimize (5)', '../migrations/020-plan-website-limits-v2.js'],
+  ['022 — keyword data cache (DataForSEO Labs metrics + related keywords)', '../migrations/022-keyword-data-cache.js'],
 ] as const;
 // NOTE: 009–013 are absent from this list and were before 014 was added. Left
 // alone deliberately rather than fixed in passing — whoever added them either
