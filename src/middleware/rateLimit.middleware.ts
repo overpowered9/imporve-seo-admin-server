@@ -47,6 +47,13 @@ export interface RateLimitOptions {
   windowMs: number;
   /** Shown to the caller when the limit trips. */
   message?: string;
+  /**
+   * Namespace for this limiter's buckets. The map below is shared by every limiter instance and
+   * keyed by user id alone, so two per-user limiters without a prefix would COUNT EACH OTHER'S
+   * calls. Routes added after /auxiliary pass a prefix (e.g. 'keyword-metrics') so each route has
+   * its own ceiling. Omitted → the original behaviour, which /auxiliary still relies on.
+   */
+  keyPrefix?: string;
 }
 
 /**
@@ -56,12 +63,12 @@ export interface RateLimitOptions {
  * request is passed through untouched rather than bucketed under a shared key — sharing one bucket
  * across all anonymous callers would let one of them deny service to the rest.
  */
-export function rateLimitPerUser({ limit, windowMs, message }: RateLimitOptions) {
+export function rateLimitPerUser({ limit, windowMs, message, keyPrefix }: RateLimitOptions) {
   return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     const userId = req.user?.id;
     if (!userId) return next();
 
-    const key = String(userId);
+    const key = keyPrefix ? `${keyPrefix}:${userId}` : String(userId);
     const now = Date.now();
     const bucket = buckets.get(key);
 

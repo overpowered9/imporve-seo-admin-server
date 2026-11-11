@@ -28,8 +28,18 @@ import {
   releaseKeywordGeneration,
   type KeywordReservation,
 } from '../models/keyword-usage.js';
+import keywordMetricsRoutes from './keyword-metrics.routes.js';
 
 const router = Router();
+
+/**
+ * Keyword metrics (DataForSEO Labs): POST /api/v1/generate/keywords/metrics.
+ *
+ * Mounted beside /generatekeyword so the plugin's keyword tool finds both under one base. The
+ * sub-router carries its own validateApiAccess + per-account rate limit (keyword-metrics.routes.ts);
+ * nothing about /generatekeyword or /generatekeywordded changes.
+ */
+router.use('/keywords', keywordMetricsRoutes);
 
 /** See the /auxiliary route below for why this endpoint is rate-limited rather than credit-charged. */
 const auxiliaryRateLimit = rateLimitPerUser({

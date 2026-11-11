@@ -2,7 +2,11 @@
  * Content Generation v3 — Claude route (additive; v2 is untouched).
  *
  *   POST /api/v1/content-v3/article/test   — requireAdmin, no credits. The prompt-tuning endpoint.
- *   POST /api/v1/content-v3/prompts/seed   — requireAdmin. Registers the six v3 templates.
+ *   POST /api/v1/content-v3/prompts/seed   — requireAdmin. Registers the v3 templates (writer chain + steps).
+ *   POST /api/v1/content-v3/keyword-data/prefetch — validateApiAccess (plugin). Warms the keyword
+ *                                            data cache; see content-v3-keyword-data.handler.ts.
+ *                                            The one plugin-facing route on this router (decided
+ *                                            2026-11-11): it only reads a cache and costs no credits.
  *
  * There is deliberately no credit-gated endpoint yet. Nothing writes a `user_generations` row with
  * a `content_v3` type, so the live table's constraint on that column (which no tracked migration
@@ -28,8 +32,13 @@ import {
 import { seedV3Prompts } from '../services/prompt-seed.v3.js';
 import { requireAdmin } from '../middleware/adminAuth.middleware.js';
 import { sanitizeCustomInstruction } from '../services/generation-history.js';
+import keywordDataRoutes from './content-v3-keyword-data.routes.js';
 
 const router = Router();
+
+// Keyword data (Option A/B plumbing). Auth is applied INSIDE the sub-router: prefetch is
+// plugin-authenticated, everything else on it is requireAdmin.
+router.use('/keyword-data', keywordDataRoutes);
 
 const VALID_WORDS = ['600 to 1200 words', '1200 to 2400 words', '2400 to 3600 words'];
 
