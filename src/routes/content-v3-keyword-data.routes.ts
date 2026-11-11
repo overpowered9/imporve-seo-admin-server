@@ -3,8 +3,10 @@
  * '/keyword-data':
  *
  *   POST /api/v1/content-v3/keyword-data/prefetch   plugin auth (x-api-key + x-site-code)
+ *   POST /api/v1/content-v3/keyword-data/ab-test    requireAdmin (A/B harness, spends money)
  *
- * See content-v3-keyword-data.handler.ts for the contract and why prefetch is plugin-facing.
+ * See content-v3-keyword-data.handler.ts for the prefetch contract and why it is plugin-facing,
+ * and content-v3-ab.handler.ts for the harness.
  */
 import { Router } from 'express';
 import { validateApiAccess } from '../middleware/apiAuth.middleware.js';
@@ -12,6 +14,9 @@ import { rateLimitPerUser } from '../middleware/rateLimit.middleware.js';
 import { KEYWORD_DATA_DEFAULTS } from '../config/keyword-data.config.js';
 import { getKeywordDataService } from '../services/keyword-data/keyword-data.default.js';
 import { createKeywordDataPrefetchRouter } from './content-v3-keyword-data.handler.js';
+import { requireAdmin } from '../middleware/adminAuth.middleware.js';
+import { runLiveKeywordDataAbTest } from '../services/ab-harness/keyword-data-ab.default.js';
+import { createKeywordDataAbRouter } from './content-v3-ab.handler.js';
 
 export const keywordDataPrefetchRateLimit = rateLimitPerUser({
   limit: KEYWORD_DATA_DEFAULTS.prefetchRateLimitPerMinute,
@@ -28,6 +33,14 @@ router.use(
     service: getKeywordDataService,
     auth: validateApiAccess,
     rateLimit: keywordDataPrefetchRateLimit,
+  }),
+);
+
+router.use(
+  '/',
+  createKeywordDataAbRouter({
+    auth: requireAdmin,
+    run: (input, options) => runLiveKeywordDataAbTest(input, options),
   }),
 );
 
