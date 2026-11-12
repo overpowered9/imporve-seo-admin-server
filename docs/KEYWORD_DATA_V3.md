@@ -273,3 +273,14 @@ npm run lint        # BROKEN ON MAIN BEFORE THIS BRANCH: ESLint 8 has no TypeScr
 | `recent_posts` overlap threshold | Jaccard ≥ `0.2`, top `5`, over at most `20` posts | `src/services/content-v3-steps/recent-posts.ts` |
 | Prefetch auth | plugin (`validateApiAccess`); Title/Planner/A-B admin-only | `content-v3-keyword-data.routes.ts`, `content-v3-steps.routes.ts` |
 | Related-keyword depth and ordering | depth 2, `search_volume desc`, 30 fetched per seed | `dataforseo.client.ts`, `keyword-data.service.ts` |
+
+## QA fixes after the real-data run (2026-11-13)
+
+Found while testing the merged branch locally with real DataForSEO credentials and the real site key:
+
+1. **Flaky test, real logging bug** (`8ddb04f`). `getSeedWithRelated()` decided whether a fetch was "late" by comparing elapsed wall-clock time with `budgetMs`; Node timers can fire a millisecond early by `Date.now()`, so a fetch that really finished after the caller gave up was sometimes not logged, and `a late answer still fills the cache` failed about half the time (5 of 10 isolated runs). The cache itself was always filled. Now a `callerGaveUp` flag set in the budget's catch path decides it, and the test waits for the log line. 25/25 isolated runs and repeated full suites pass.
+2. **Planner / Title step `max_tokens`** (`3e04d18`). `claudeText({ thinking: false })` omits the `thinking` field; on models that think by default (`claude-sonnet-5`, which `ANTHROPIC_MODEL` is set to locally and which the Planner runs on) adaptive thinking is then on and counts against `max_tokens`. The Planner's JSON is ~250-450 tokens, but calls used 1,119-3,765 output tokens; with the old 2,000 cap one call failed all three attempts (empty output, then JSON cut mid-string). Caps are now Planner 8,000 and Title 2,000. After the change, 6 of 6 Planner runs succeeded on the first attempt, 4 of which used more than 2,000 tokens.
+
+Also confirmed on the merged code: `/keywords/metrics` validates (101 keywords → 400) and requires plugin auth (no key → 401); the Title/Planner routes reject a site key (401); `use_keyword_data` off → V1 prompt with no `<keyword_data>` block; `/generate/auxiliary` unchanged.
+
+Not changed, flagged for the team: the v2 intelligence step also calls `claudeJSON` on `ANTHROPIC_MODEL` with `max_tokens` 1,800. If production's `ANTHROPIC_MODEL` is a model that thinks by default, that step can come back empty too; v2 already treats a failed intelligence step as "continue without it", so articles still generate, just without the audience data.
