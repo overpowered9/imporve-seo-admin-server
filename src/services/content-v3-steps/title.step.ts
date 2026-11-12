@@ -55,7 +55,10 @@ export interface TitleStepResult extends StepResultBase {
 
 /** The doc: over 70 characters counts as a failed attempt; models cannot count characters reliably. */
 export const TITLE_MAX_CHARS = 70;
-export const TITLE_MAX_TOKENS = 600;
+// Headroom for thinking on models that think by default (see PLANNER_MAX_TOKENS in
+// planner.step.ts). The title JSON itself is under 150 tokens; 600 left no room if the writing
+// model in production is one of those models.
+export const TITLE_MAX_TOKENS = 2000;
 
 export function buildTitleUserMessage(input: TitleStepInput, keywordDataBlock: string | null): string {
   const data = joinBlocks([

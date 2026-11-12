@@ -90,7 +90,13 @@ export interface PlannerStepResult extends StepResultBase {
   };
 }
 
-export const PLANNER_MAX_TOKENS = 2000;
+// Headroom for thinking, not for a longer answer. claudeText({ thinking: false }) omits the
+// `thinking` field, and on models that think by default (Claude Sonnet 5, Opus 5.x, Sonnet/Haiku
+// 5.5) that means adaptive thinking is ON and its tokens count against max_tokens. Measured on
+// claude-sonnet-5 (2026-11-13): the Planner's JSON is ~250-450 tokens but calls used 1,119-1,843
+// output tokens, and with a 2,000 cap some attempts came back empty or cut mid-JSON. Billing is
+// per token used, so a higher cap costs nothing extra when it is not needed.
+export const PLANNER_MAX_TOKENS = 8000;
 export const BODY_QUESTIONS_MAX = 9;
 export const FAQ_QUESTIONS_MAX = 5;
 export const OWNER_QUESTIONS_MAX = 2;
