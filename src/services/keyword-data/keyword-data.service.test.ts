@@ -221,6 +221,10 @@ describe('getSeedWithRelated', () => {
     const second = await service.getSeedWithRelated('a', 2840, 'en', { budgetMs: 150 });
     assert.equal(second.status, 'ready');
     assert.equal(second.source, 'cache');
+    // The log line is written after both cache writes settle; wait for it the same way.
+    while (!/late fetch cached seed="a"/.test(logs.join('\n')) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
     assert.match(logs.join('\n'), /late fetch cached seed="a"/);
   });
 

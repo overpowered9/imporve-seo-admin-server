@@ -217,6 +217,10 @@ export function createKeywordDataService(deps: KeywordDataServiceDeps): KeywordD
 
     const fetchedAt = now();
     const startedAt = fetchedAt.getTime();
+    // Set when the caller stops waiting (budget exceeded or the fetch failed fast). "Late" is
+    // decided by this flag, not by comparing elapsed time with budgetMs: Node timers can fire
+    // a millisecond early by Date.now(), so a clock comparison sometimes missed a late answer.
+    let callerGaveUp = false;
     // The fetch continues past the budget on purpose: a late answer still fills the cache.
     const work = (async (): Promise<SeedWithRelated> => {
       const [ov, rel] = await Promise.all([
@@ -238,7 +242,7 @@ export function createKeywordDataService(deps: KeywordDataServiceDeps): KeywordD
         toCache.length ? cache.putMetrics(toCache, loc, lang) : Promise.resolve(),
         relatedHit ? Promise.resolve() : cache.putRelated(key, loc, lang, related, fetchedAt.toISOString()),
       ]);
-      if (now().getTime() - startedAt > budgetMs) {
+      if (callerGaveUp) {
         log(`[keyword-data] late fetch cached seed="${key}" after_ms=${now().getTime() - startedAt}`);
       }
       return { status: 'ready', seed: seedItem, related, cost_usd: cost, source: 'dataforseo' };
@@ -247,6 +251,7 @@ export function createKeywordDataService(deps: KeywordDataServiceDeps): KeywordD
     try {
       return await withBudget(work, Math.max(0, budgetMs - (now().getTime() - startedAt)));
     } catch (err) {
+      callerGaveUp = true;
       const reason = reasonOf(err);
       log(`[keyword-data] fallback step=fetch seed="${key}" reason=${reason}`);
       return partial(reason);
