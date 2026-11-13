@@ -13,6 +13,7 @@
  *                                            "pre-v3" first (OPS2, WR3).
  *   POST /api/v1/content-v3/prompts/backup-pre-v3 — requireAdmin. Only the backup, nothing activated.
  *   GET  /api/v1/content-v3/prompts/check  — requireAdmin. Active DB text vs the doc text, per prompt.
+ *   POST /api/v1/content-v3/search-data    — requireAdmin. The search data lookup alone (S1–S12).
  *   GET  /api/v1/content-v3/status         — validateApiAccess (plugin). Is CONTENT_V3_ENABLED on?
  *   POST /api/v1/content-v3/session/clear  — validateApiAccess (plugin). The wizard's Leave (W10).
  *   POST /api/v1/content-v3/keyword-data/prefetch — validateApiAccess (plugin). Warms the keyword
@@ -51,8 +52,14 @@ import { validateApiAccessWithoutStamp } from '../middleware/apiAuth.middleware.
 import { getContentV3Store } from '../services/content-v3/store.default.js';
 import { checkV3Prompts, v3DocPromptDefs } from '../services/prompt-seed.v3.js';
 import { PromptManagementService } from '../services/prompt-management.service.js';
+import { createSearchDataRouter } from './content-v3-search-data.handler.js';
+import { lookupSearchData } from '../services/search-data/search-data.service.js';
+import { liveSearchDataDeps } from '../services/search-data/search-data.default.js';
 
 const router = Router();
+
+// Search data lookup on its own (admin: tester panel, 10-keyword run). Spends DataForSEO money.
+router.use('/', createSearchDataRouter({ auth: requireAdmin, lookup: (req) => lookupSearchData(req, liveSearchDataDeps()) }));
 
 // Plugin-facing status and session housekeeping (content-v3-plugin.handler.ts). The status check
 // does not stamp the website's last connection: it is a capability probe, not a generation.

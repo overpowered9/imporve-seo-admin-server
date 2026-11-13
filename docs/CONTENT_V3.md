@@ -13,10 +13,24 @@ The design is `docs/content-v3-prompt-drafts.md` (a byte-identical copy of the p
 | `MODEL_PRICES_JSON` | Optional price table override for the cost log. |
 | `ISEO_V3_KEYWORD_DATA` | Unchanged meaning (docs/KEYWORD_DATA_V3.md). |
 
+## Search data lookup (phase 2)
+
+DataForSEO Google organic, Live mode, advanced, depth 10, People Also Ask click depth 1, language from the wizard (decided 30 Oct). `services/search-data/`.
+
+- Nationwide business, or a post marked "Not about a specific location": one call at the country.
+- Local post: one call at the Target town (resolved on DataForSEO's free locations list, accent-insensitive, "Town, ST" understood). Thin (fewer than `SEARCH_DATA_THIN_THRESHOLD` questions or related searches) → a second call at the country with the town taken out of the keyword. No state-level call.
+- Merge: local first, duplicates removed, caps 10 titles / 8 questions / 8 related, every item scoped. Only LOCAL ranking domains are kept for the Research competitor filter.
+- A town DataForSEO does not list: `SEARCH_DATA_TOWN_ALIASES_JSON` (nearest listed city), else coordinates when the caller has them, else one country call with the keyword as typed (logged `town=unresolved`). Open question for Zaid; the alias map is the working value.
+- Failures never block the title: a failed town call still runs the country call; if nothing returns, the Title prompt works from the keyword. A task-level error (inside a 200) is retried once.
+- Results are stored in the wizard session and reused on Regenerate title.
+- Log: `[search-data] seed="…" mode=local location="Española, NM" national_call=yes local=t9/q6/r2 national=t8/q6/r3 merged=t10/q8/r5 town=listed cost_usd=0.0043 ms=5298`
+- Real run, 14 Nov: "water heater repair Española" at Española, NM → town call thin (2 related) → country call → merged block as above, $0.0043, 5.3 s. Field names confirmed: organic `title`/`domain`/`url`; `people_also_ask.items[].title`; `related_searches.items` strings.
+
 ## Routes
 
 | Route | Auth | Purpose |
 |---|---|---|
+| `POST /api/v1/content-v3/search-data` | admin | The search data lookup alone: block, exact XML, per-call meta. Spends ~$0.002 per call. |
 | `GET /api/v1/content-v3/status` | plugin | `{ enabled, keyword_data }`. The plugin caches it 5 minutes. |
 | `POST /api/v1/content-v3/session/clear` | plugin | Wizard Leave: deletes the session row. Works with v3 off. |
 | `POST /api/v1/content-v3/prompts/seed` | admin | Registers templates; `?mode=replace` makes every doc-sourced prompt active, backing the old value up as "pre-v3" first. Nothing is deleted. |

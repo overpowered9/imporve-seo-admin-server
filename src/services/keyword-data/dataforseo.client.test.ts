@@ -19,6 +19,8 @@ import {
   createDataForSeoClient,
   DataForSeoError,
   LABS_ENDPOINTS,
+  SERP_ENDPOINTS,
+  assertAllowedPath,
   assertLabsPath,
   kindForStatusCode,
   kindForHttpStatus,
@@ -285,7 +287,20 @@ describe('Labs-only guarantee', () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const src = fs.readFileSync(path.join(here, 'dataforseo.client.ts'), 'utf8');
     const code = src.split('\n').filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*')).join('\n');
-    assert.doesNotMatch(code, /keywords_data|google_ads|serp\/google\/organic/);
+    // Content v3 (search data lookup, approved 14 Nov) deliberately adds the Google SERP organic
+    // live/advanced and locations endpoints; the Google Ads / Keywords Data family stays banned.
+    // Was: assert.doesNotMatch(code, /keywords_data|google_ads|serp\/google\/organic/);
+    assert.doesNotMatch(code, /keywords_data|google_ads/);
+  });
+
+  test('SERP access is exactly the two Content v3 paths', () => {
+    assert.deepEqual(Object.values(SERP_ENDPOINTS), ['/serp/google/organic/live/advanced', '/serp/google/locations']);
+    assertAllowedPath('/serp/google/organic/live/advanced');
+    assertAllowedPath('/serp/google/locations/us');
+    assertAllowedPath(LABS_ENDPOINTS.keyword_overview);
+    for (const bad of ['/keywords_data/google_ads/search_volume/live', '/serp/google/organic/task_post', '/serp/bing/organic/live/advanced', '/serp/google/locations/usa', '/serp/google/locations/us/extra', '/backlinks/summary/live']) {
+      assert.throws(() => assertAllowedPath(bad), /not allowed/, bad);
+    }
   });
 
   test('refuses to build without credentials', () => {

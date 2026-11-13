@@ -6,6 +6,11 @@
  * refuses any path outside `/dataforseo_labs/` so that rule cannot be bent by a later edit. National
  * data only: a call carries one `location_code` (a country) and one `language_code`.
  *
+ * CONTENT V3 ADDITION (search data lookup, decided 30 Oct): two Google SERP endpoints, listed by
+ * exact path in SERP_ENDPOINTS — organic live/advanced (POST, with People Also Ask and related
+ * searches) and the free locations list (GET, per country). `assertAllowedPath` admits Labs paths
+ * and exactly those; the Google Ads / Keywords Data family is still refused.
+ *
  * CREDENTIALS come from the caller (the config module reads DATAFORSEO_LOGIN / DATAFORSEO_PASSWORD
  * from env). They are sent as HTTP Basic auth and never logged: the per-call log line carries the
  * endpoint, the HTTP status, DataForSEO's status code, the latency and the `cost` field only.
@@ -202,6 +207,59 @@ export interface DataForSeoClient {
   searchIntent(params: SearchIntentParams): Promise<DataForSeoCallResult<DfsSearchIntentResult>>;
 }
 
+// ---------- Google SERP (Content v3 search data lookup) ----------
+
+/** One SERP item. Only the fields the search data lookup reads; DataForSEO sends many more. */
+export interface DfsSerpItem {
+  type: string;
+  rank_group?: number | null;
+  rank_absolute?: number | null;
+  /** organic */
+  title?: string | null;
+  url?: string | null;
+  domain?: string | null;
+  /** people_also_ask → people_also_ask_element[] (each has `title`, the question); related_searches → string[] */
+  items?: Array<DfsSerpItem | string> | null;
+}
+
+/** serp/google/organic/live/advanced → tasks[].result[] */
+export interface DfsSerpResult {
+  keyword?: string;
+  location_code?: number | null;
+  language_code?: string | null;
+  items_count?: number;
+  items: DfsSerpItem[] | null;
+}
+
+/** serp/google/locations/{country} → tasks[].result[] (free). */
+export interface DfsLocation {
+  location_code: number;
+  location_name: string;
+  location_code_parent?: number | null;
+  country_iso_code?: string | null;
+  location_type?: string | null;
+}
+
+export interface SerpOrganicParams {
+  keyword: string;
+  language_code: string;
+  /** Exactly one of location_code / location_coordinate ("lat,lng,radius_mm"). */
+  location_code?: number;
+  location_coordinate?: string;
+  /** Default 10 (decided 30 Oct). */
+  depth?: number;
+  /** Default 1 (decided 30 Oct). */
+  people_also_ask_click_depth?: number;
+  /** Per-call timeout; the Labs default of 8 s is too short for a SERP call with a PAA click. */
+  timeoutMs?: number;
+}
+
+export interface DataForSeoSerpClient {
+  serpOrganicAdvanced(params: SerpOrganicParams): Promise<DataForSeoCallResult<DfsSerpResult>>;
+  /** ISO 3166-1 alpha-2, e.g. "us". */
+  serpGoogleLocations(countryIso: string, opts?: { timeoutMs?: number }): Promise<DataForSeoCallResult<DfsLocation>>;
+}
+
 export interface DataForSeoClientOptions {
   login: string;
   password: string;
@@ -233,6 +291,15 @@ export const LABS_ENDPOINTS = Object.freeze({
 
 export type LabsEndpointKey = keyof typeof LABS_ENDPOINTS;
 
+/** The Google SERP paths Content v3's search data lookup may call. Exact paths, nothing else. */
+export const SERP_ENDPOINTS = Object.freeze({
+  serp_organic_advanced: '/serp/google/organic/live/advanced',
+  serp_google_locations: '/serp/google/locations',
+});
+
+export type SerpEndpointKey = keyof typeof SERP_ENDPOINTS;
+type EndpointKey = LabsEndpointKey | SerpEndpointKey;
+
 const LABS_PREFIX = '/dataforseo_labs/';
 
 /** Refuse any path outside DataForSEO Labs. The Google Ads / Keywords Data family must never be called. */
@@ -240,6 +307,17 @@ export function assertLabsPath(path: string): void {
   if (!path.startsWith(LABS_PREFIX)) {
     throw new Error(`DataForSEO path "${path}" is outside ${LABS_PREFIX}; only Labs endpoints are allowed`);
   }
+}
+
+/**
+ * Labs paths, or exactly the SERP organic live/advanced path, or the locations list for one
+ * two-letter country. Everything else — above all /keywords_data/ (Google Ads) — is refused.
+ */
+export function assertAllowedPath(path: string): void {
+  if (path.startsWith(LABS_PREFIX)) return;
+  if (path === SERP_ENDPOINTS.serp_organic_advanced) return;
+  if (/^\/serp\/google\/locations\/[a-z]{2}$/.test(path)) return;
+  throw new Error(`DataForSEO path "${path}" is not allowed; only Labs and the Content v3 SERP endpoints are`);
 }
 
 /** DataForSEO-reported volumes of related keywords are capped per depth; depth 2 covers the Planner's 30. */
@@ -288,7 +366,7 @@ function describe(err: unknown): string {
   return String(err);
 }
 
-export function createDataForSeoClient(options: DataForSeoClientOptions): DataForSeoClient {
+export function createDataForSeoClient(options: DataForSeoClientOptions): DataForSeoClient & DataForSeoSerpClient {
   const {
     login,
     password,
@@ -309,18 +387,18 @@ export function createDataForSeoClient(options: DataForSeoClientOptions): DataFo
   // Built once; never logged, never included in an error message.
   const authorization = `Basic ${Buffer.from(`${login}:${password}`, 'utf8').toString('base64')}`;
 
-  async function fetchWithTimeout(url: string, body: string): Promise<Response> {
+  async function fetchWithTimeout(url: string, body: string | null, callTimeoutMs: number): Promise<Response> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), callTimeoutMs);
     try {
       return await fetchImpl(url, {
-        method: 'POST',
+        method: body === null ? 'GET' : 'POST',
         headers: {
           Authorization: authorization,
-          'Content-Type': 'application/json',
+          ...(body === null ? {} : { 'Content-Type': 'application/json' }),
           Accept: 'application/json',
         },
-        body,
+        ...(body === null ? {} : { body }),
         signal: controller.signal,
       });
     } finally {
@@ -329,20 +407,21 @@ export function createDataForSeoClient(options: DataForSeoClientOptions): DataFo
   }
 
   async function attemptOnce<R>(
-    key: LabsEndpointKey,
+    key: EndpointKey,
     url: string,
-    body: string,
+    body: string | null,
+    callTimeoutMs: number,
   ): Promise<{ result: R[]; cost: number; taskId: string | null; httpStatus: number; statusCode: number }> {
     let response: Response;
     try {
-      response = await fetchWithTimeout(url, body);
+      response = await fetchWithTimeout(url, body, callTimeoutMs);
     } catch (err) {
       if (isAbortError(err)) {
         throw new DataForSeoError({
           kind: 'timeout',
           level: 'transport',
           endpoint: key,
-          message: `timed out after ${timeoutMs} ms`,
+          message: `timed out after ${callTimeoutMs} ms`,
           retryable: false,
         });
       }
@@ -433,16 +512,21 @@ export function createDataForSeoClient(options: DataForSeoClientOptions): DataFo
   async function call<R>(key: LabsEndpointKey, taskPayload: Record<string, unknown>): Promise<DataForSeoCallResult<R>> {
     const path = LABS_ENDPOINTS[key];
     assertLabsPath(path);
-    const url = `${baseUrl}${path}`;
     // DataForSEO takes an ARRAY of tasks; live endpoints accept one.
-    const body = JSON.stringify([taskPayload]);
+    return request<R>(key, path, JSON.stringify([taskPayload]), timeoutMs);
+  }
+
+  /** The shared retry/log loop. `body` null = GET. */
+  async function request<R>(key: EndpointKey, path: string, body: string | null, callTimeoutMs: number): Promise<DataForSeoCallResult<R>> {
+    assertAllowedPath(path);
+    const url = `${baseUrl}${path}`;
 
     let attempt = 0;
     for (;;) {
       attempt += 1;
       const started = now();
       try {
-        const r = await attemptOnce<R>(key, url, body);
+        const r = await attemptOnce<R>(key, url, body, callTimeoutMs);
         const latencyMs = now() - started;
         log(
           `[dataforseo] endpoint=${key} http=${r.httpStatus} status=${r.statusCode} ` +
@@ -501,6 +585,21 @@ export function createDataForSeoClient(options: DataForSeoClientOptions): DataFo
         keywords: params.keywords,
         language_code: params.language_code,
       });
+    },
+    serpOrganicAdvanced(params) {
+      const task: Record<string, unknown> = {
+        keyword: params.keyword,
+        language_code: params.language_code,
+        depth: params.depth ?? 10,
+        people_also_ask_click_depth: params.people_also_ask_click_depth ?? 1,
+      };
+      if (params.location_coordinate) task.location_coordinate = params.location_coordinate;
+      else task.location_code = params.location_code;
+      return request<DfsSerpResult>('serp_organic_advanced', SERP_ENDPOINTS.serp_organic_advanced, JSON.stringify([task]), params.timeoutMs ?? timeoutMs);
+    },
+    serpGoogleLocations(countryIso, opts) {
+      const iso = String(countryIso || '').trim().toLowerCase();
+      return request<DfsLocation>('serp_google_locations', `${SERP_ENDPOINTS.serp_google_locations}/${iso}`, null, opts?.timeoutMs ?? Math.max(timeoutMs, 20_000));
     },
   };
 }
