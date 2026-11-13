@@ -24,6 +24,7 @@ import type { IPromptTemplate } from '../models/prompt.models.js';
 import { V3_PROMPT_DEFS } from './claude-content-generator-v3.service.js';
 import { V3_STEP_PROMPT_DEFS } from './content-v3-steps/prompts.js';
 import { RESEARCH_PROMPT_DEF } from './research/prompt.js';
+import { REGULATED_TOPICS_DEF } from './content-v3/regulated-topics.js';
 
 export interface SeedReportEntry {
   templateType: string;
@@ -51,6 +52,11 @@ export function v3DocPromptDefs(): PromptDef[] {
 
 export const DOC_VERSION_LABEL = 'content-v3 doc';
 
+/** Editable settings kept in the registry (seeded once, never replaced: they are meant to be tuned). */
+export function v3SettingDefs(): PromptDef[] {
+  return [REGULATED_TOPICS_DEF];
+}
+
 export async function seedV3Prompts(
   svc: PromptManagementService = new PromptManagementService(),
   opts: { mode?: 'skip' | 'replace' } = {}
@@ -62,7 +68,7 @@ export async function seedV3Prompts(
   // The Writer-chain prompts (claude-content-generator-v3.service.ts) plus the Title/Planner step
   // prompts (content-v3-steps/prompts.ts), all with the same idempotent, skip-only treatment.
   const seen = new Set<string>();
-  const defs: PromptDef[] = [...Object.values(V3_PROMPT_DEFS), ...v3DocPromptDefs()].filter((d) => {
+  const defs: PromptDef[] = [...Object.values(V3_PROMPT_DEFS), ...v3DocPromptDefs(), ...v3SettingDefs()].filter((d) => {
     if (seen.has(d.templateType)) return false;
     seen.add(d.templateType);
     return true;

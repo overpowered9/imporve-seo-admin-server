@@ -3,7 +3,8 @@
  *
  * Runs on "Approve title" with the low-cost model. Code builds the data tags, the model answers
  * JSON, and code checks it per the doc: valid JSON, post_size not below <minimum_size>, FAQ
- * questions 0–5 and none repeating a body question, at most 2 owner questions; up to 3 attempts.
+ * questions 1–5 when there is evidence (0–5 without, conflict C2) and none repeating a body
+ * question, at most 2 owner questions; up to 3 attempts.
  *
  * Option B adds, only when keyword data is in effect AND available (V2 prompt):
  *   <keyword_data>   30 related keywords, in the USER message
@@ -179,6 +180,24 @@ export interface PlannerValidationContext {
   keywordDataInEffect: boolean;
   /** post_ids of the recent posts actually sent; overlap must name one of them. */
   sentPostIds: ReadonlySet<number>;
+  /**
+   * Conflict C2 (approved 14 Nov): the doc asks for "1 to 5 FAQ questions" but also lets the
+   * Planner "return fewer" when evidence is thin. So at least 1 FAQ question is required only when
+   * there IS evidence (search data questions/related searches, or research); with none, 0 is valid.
+   */
+  evidencePresent?: boolean;
+}
+
+/** True when the Planner had questions to draw on: People Also Ask, related searches or research. */
+export function plannerEvidencePresent(input: Pick<PlannerStepInput, 'search_data' | 'research'>): boolean {
+  const sd = input.search_data;
+  const r = input.research;
+  return (
+    (sd?.people_also_ask?.length ?? 0) > 0 ||
+    (sd?.related_searches?.length ?? 0) > 0 ||
+    (r?.facts?.length ?? 0) > 0 ||
+    (r?.follow_up_questions?.length ?? 0) > 0
+  );
 }
 
 export function validatePlannerOutput(o: PlannerStepOutput, ctx: PlannerValidationContext): string | null {
@@ -187,6 +206,7 @@ export function validatePlannerOutput(o: PlannerStepOutput, ctx: PlannerValidati
   if (sizeRank(o.post_size) < sizeRank(ctx.minimumSize)) return `post_size_below_minimum: ${o.post_size} < ${ctx.minimumSize}`;
   if (o.body_questions.length > BODY_QUESTIONS_MAX) return `too_many_body_questions: ${o.body_questions.length}`;
   if (o.faq_questions.length > FAQ_QUESTIONS_MAX) return `too_many_faq_questions: ${o.faq_questions.length}`;
+  if (ctx.evidencePresent && o.faq_questions.length < 1) return 'too_few_faq_questions: 0 with search data or research present';
   const body = new Set(o.body_questions.map(normalizeQuestion));
   const dup = o.faq_questions.find((q) => body.has(normalizeQuestion(q)));
   if (dup) return `faq_repeats_body_question: ${dup.slice(0, 80)}`;
@@ -239,7 +259,7 @@ export async function runPlannerStep(input: PlannerStepInput, deps: StepDeps): P
     maxAttempts: deps.maxAttempts,
     call: (o) => deps.model(o),
     parse: (text) => normalizePlannerOutput(parseJsonLoose(text)),
-    validate: (o) => validatePlannerOutput(o, { minimumSize, keywordDataInEffect: v2, sentPostIds }),
+    validate: (o) => validatePlannerOutput(o, { minimumSize, keywordDataInEffect: v2, sentPostIds, evidencePresent: plannerEvidencePresent(input) }),
     runId: deps.runId,
     log,
     now,

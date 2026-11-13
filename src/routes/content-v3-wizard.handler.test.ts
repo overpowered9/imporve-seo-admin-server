@@ -163,3 +163,139 @@ describe('POST /wizard/town-check', () => {
 test('addCost accumulates per step', () => {
   assert.deepEqual(addCost(addCost(undefined, 'title', 0.001), 'title', 0.0015), { title: 0.0025 });
 });
+
+// ---------------------------------------------------------------- Approve title (phase 5)
+import type { PlannerStepInput, PlannerStepResult, PlannerStepOutput } from '../services/content-v3-steps/planner.step.js';
+import type { SessionResearch } from '../services/research/research.default.js';
+
+const PLAN: PlannerStepOutput = {
+  article_type: 'cost', type_reason: 'title promises a cost', post_size: 'medium', size_reason: 'Several cost factors to cover',
+  body_questions: ['What drives the price?'], faq_questions: ['Is it worth repairing?', 'How long does a repair take?'],
+  searcher_profile: { situation: 'Heater leaking', main_concern: 'price', desired_outcome: 'fixed', readiness: 'comparing', their_words: ['leaking'], reassurance: 'common fix' },
+  ideal_client_gap: '', owner_questions: ['What does a typical repair cost you?'], regulated_topic: false, regulated_reason: '', demand_notes: null, overlap: null,
+};
+
+function plannerResult(output: PlannerStepOutput): PlannerStepResult {
+  return {
+    output,
+    attempts: [{ attempt: 1, ok: true, reason: null, ms: 1, raw_length: 1 }],
+    usage: [], cost_usd: 0.004, model: 'm',
+    keyword_data: { requested: false, effective: false, used: false, ms: 0 },
+    recent_posts: { received: 0, sent: [] },
+    prompt: { templateType: 'content_v3_planner', source: 'fallback', version: 'v1', label: 'content_v3_planner@code#85e5204b' },
+    timings: { total_ms: 1, keyword_data_ms: 0, model_ms: 1 },
+    messages: { system: 'S', user: 'U' },
+  };
+}
+
+const RESEARCH_OK: SessionResearch = {
+  cached: false,
+  research: {
+    facts: [{ token: 'S1', claim: 'Tanks last 8 to 12 years.', scope: 'national', conflict: false, source: { url: 'https://energy.gov', title: 't', date: null } }],
+    follow_up_questions: [], local_conditions: [], notes: '', sources: { S1: { url: 'https://energy.gov', title: 't', date: null } }, dropped: { facts: 0, questions: 0, conditions: 0 },
+  },
+  status: 'ok', attempts: 1, cost_usd: 0.03, ms: 1, prompt_version: 'r', request_meta: { domain_filter: [], user_location: null, effort: 'low', model: null },
+};
+
+async function startApprove(opts: { planner?: Array<PlannerStepOutput | Error>; research?: SessionResearch; session?: Record<string, unknown> } = {}) {
+  const store = createMemoryContentV3Store();
+  if (opts.session) await store.mergeSession(5, 9, KEY, opts.session);
+  const plannerInputs: PlannerStepInput[] = [];
+  const researchReqs: any[] = [];
+  const sdReqs: any[] = [];
+  const logs: string[] = [];
+  const router = createContentV3WizardRouter({
+    auth: fakePluginAuth({ id: 5 }, { id: 9 }),
+    rateLimit: (_req, _res, next) => next(),
+    store: async () => store,
+    searchData: async (_s, _i, req) => {
+      sdReqs.push(req);
+      return { ...SD, block: { ...SD.block!, people_also_ask: [{ text: 'How much is it?', scope: 'local' }] } };
+    },
+    runTitle: async () => titleResult('x'),
+    research: async (_s, _i, req) => {
+      researchReqs.push(req);
+      return opts.research ?? RESEARCH_OK;
+    },
+    runPlanner: async (input) => {
+      plannerInputs.push(input);
+      const p = (opts.planner ?? [PLAN])[0];
+      if (p instanceof Error) throw p;
+      return plannerResult(p);
+    },
+    locations: staticLocationIndexProvider(INDEX),
+    env: ON,
+    log: (l) => logs.push(l),
+  });
+  app = await startTestApp([['/api/v1/content-v3', router]]);
+  return { app, store, plannerInputs, researchReqs, sdReqs, logs };
+}
+
+const APPROVE = { session_key: KEY, title: 'Water heater repair cost in Española', seed_keyword: 'water heater repair cost', reach: 'local', target_town: 'Española, NM', language: 'US English' };
+
+describe('POST /wizard/approve (W3, P1–P5, G2)', () => {
+  test('search data → research → planner; step 2 gets only what it shows; the rest goes to the session', async () => {
+    const { app, store, plannerInputs, researchReqs, logs } = await startApprove();
+    const r = await app.post('/api/v1/content-v3/wizard/approve', APPROVE, PLUGIN_HEADERS);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.data.plan, { article_type: 'cost', post_size: 'medium', size_reason: 'Several cost factors to cover', minimum_size: 'small', owner_questions: ['What does a typical repair cost you?'] });
+    assert.equal(r.body.data.plan.body_questions, undefined);
+    assert.equal(r.body.data.regulated.suggested, false);
+    assert.equal(r.body.data.research.status, 'ok');
+    assert.equal(researchReqs[0].target_town, 'Española');
+    assert.deepEqual(researchReqs[0].local_domains, ['a.com']);
+    assert.equal(researchReqs[0].people_also_ask.length, 1);
+    assert.match(plannerInputs[0].research!.facts![0].claim, /Tanks last/);
+    assert.equal(plannerInputs[0].minimum_size, 'small');
+    assert.deepEqual(plannerInputs[0].size_options, { small: '600 to 1200 words', medium: '1200 to 2400 words', large: '2400 to 3600 words' });
+    const s = await store.getSession(5, 9, KEY);
+    assert.deepEqual((s!.plan as any).body_questions, ['What drives the price?']);
+    assert.equal((s!.approved as any).title, 'Water heater repair cost in Española');
+    assert.deepEqual(s!.cost, { search_data: 0.002, research: 0.03, planner: 0.004 });
+    assert.match(logs.join('\n'), /\[content-v3\] approve run=\w+ type=cost size=medium min=small body=1 faq=2 owner=1 regulated=no research=ok fallback=no/);
+  });
+
+  test('P4: three Planner failures → the fallback plan, still 200', async () => {
+    const failed = new StepFailedError('planner', [1, 2, 3].map((a) => ({ attempt: a, ok: false, reason: 'unreadable_json', ms: 1, raw_length: 0 })));
+    const { app, store } = await startApprove({ planner: [failed] });
+    const r = await app.post('/api/v1/content-v3/wizard/approve', APPROVE, PLUGIN_HEADERS);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.data.fallback, true);
+    assert.equal(r.body.data.plan.article_type, 'cost');
+    assert.equal(r.body.data.plan.post_size, 'small');
+    assert.deepEqual(r.body.data.plan.owner_questions, []);
+    assert.deepEqual(((await store.getSession(5, 9, KEY))!.plan as any).faq_questions, ['How much is it?']);
+  });
+
+  test('R7: research failed → the Planner runs without it', async () => {
+    const { app, plannerInputs } = await startApprove({ research: { ...RESEARCH_OK, research: null, status: 'failed', cost_usd: null } });
+    const r = await app.post('/api/v1/content-v3/wizard/approve', APPROVE, PLUGIN_HEADERS);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.data.research.status, 'failed');
+    assert.equal(plannerInputs[0].research, undefined);
+  });
+
+  test('G2: list match on a Standard business; business Regulated needs no check', async () => {
+    const { app } = await startApprove();
+    const a = await app.post('/api/v1/content-v3/wizard/approve', { ...APPROVE, title: 'Botox aftercare: what to avoid', seed_keyword: 'botox aftercare' }, PLUGIN_HEADERS);
+    assert.deepEqual(a.body.data.regulated, { suggested: true, by: 'list', phrase: 'medical treatment', reason: '' });
+    const b = await app.post('/api/v1/content-v3/wizard/approve', { ...APPROVE, proof_level: 'regulated' }, PLUGIN_HEADERS);
+    assert.equal(b.body.data.regulated.by, 'business');
+  });
+
+  test('minimum size from a numbered title; a typed title runs the lookup here (W2)', async () => {
+    const { app, plannerInputs, sdReqs } = await startApprove();
+    await app.post('/api/v1/content-v3/wizard/approve', { ...APPROVE, title: '12 signs your water heater is failing' }, PLUGIN_HEADERS);
+    assert.equal(plannerInputs[0].minimum_size, 'medium');
+    assert.equal(sdReqs.length, 1);
+  });
+
+  test('title check blocks an empty title with a plain message; notes pass through', async () => {
+    const { app } = await startApprove();
+    const bad = await app.post('/api/v1/content-v3/wizard/approve', { ...APPROVE, title: '  ' }, PLUGIN_HEADERS);
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.message, 'Please write or generate a title first.');
+    const ok = await app.post('/api/v1/content-v3/wizard/approve', { ...APPROVE, title: 'Roof care tips for spring' }, PLUGIN_HEADERS);
+    assert.match(ok.body.data.title_notes[0], /does not use any words/);
+  });
+});

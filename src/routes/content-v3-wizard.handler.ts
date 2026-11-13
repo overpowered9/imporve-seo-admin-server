@@ -9,6 +9,11 @@
  *     so the title box is left empty for the user to type (T6).
  *   POST /api/v1/content-v3/wizard/town-check   W6: does the keyword name another town than the
  *     chosen Target town? Free (DataForSEO's locations list costs nothing).
+ *   POST /api/v1/content-v3/wizard/approve      Approve title (W3): title check (code) → search
+ *     data (session-cached; it runs here for a typed title, W2) → Research (PROMPT 2) → Planner
+ *     (PROMPT 3; the fallback plan after 3 failures, P4) → regulated suggestion (G2). Answers only
+ *     what step 2 shows (P5): article type, size with size_reason and minimum, owner questions,
+ *     the regulated line. Everything else stays in the session for the Writer.
  *
  * Both answer 409 v3_disabled while CONTENT_V3_ENABLED is off, so a plugin that thinks v3 is on
  * (stale status cache) falls back to v2. Title generation is free (billing decision, 14 Nov) and
@@ -30,6 +35,13 @@ import type { CachedSearchData } from '../services/search-data/search-data.defau
 import type { LocationIndexProvider } from '../services/search-data/locations.js';
 import { detectTownInKeyword, parseTown } from '../services/search-data/towns.js';
 import { isLocalPost } from '../services/search-data/search-data.service.js';
+import type { PlannerStepInput, PlannerStepOutput, PlannerStepResult } from '../services/content-v3-steps/planner.step.js';
+import type { ResearchRequest } from '../services/research/research.service.js';
+import { toResearchInput } from '../services/research/research.service.js';
+import type { SessionResearch } from '../services/research/research.default.js';
+import { checkApprovedTitle, fallbackPlan, minimumSizeFor } from '../services/content-v3/planner-fallback.js';
+import { regulatedSuggestion, DEFAULT_REGULATED_TOPICS, type RegulatedTopicsList } from '../services/content-v3/regulated-topics.js';
+import { DEFAULT_SIZE_OPTIONS } from '../services/content-v3-steps/types.js';
 
 /** The doc: <max_list_items> is what the largest size can hold, never more than 15. */
 export const MAX_LIST_ITEMS = 15;
@@ -61,12 +73,39 @@ export const townCheckSchema = z.object({
   target_town: z.string().trim().max(120).nullable().optional(),
 });
 
+export const approveSchema = z.object({
+  session_key: sessionKeySchema,
+  title: z.string({ required_error: 'Please write or generate a title first.' }).max(300),
+  seed_keyword: z.string().trim().min(1, 'Please enter a seed keyword.').max(200),
+  language: optText(40),
+  niche: optText(120),
+  reach: z.enum(['local', 'nationwide']).optional(),
+  proof_level: z.enum(['standard', 'regulated']).optional(),
+  ideal_client: optText(300),
+  featured_service: optText(200),
+  business_description: optText(1000),
+  target_town: z.string().trim().max(120).nullable().optional(),
+  not_about_location: z.boolean().optional(),
+  state_hint: z.string().trim().max(40).nullable().optional(),
+  use_keyword_data: z.boolean().optional(),
+  recent_posts: z
+    .array(z.object({ post_id: z.number().int().positive(), title: z.string().max(300), seed_keyword: z.string().max(200).optional() }))
+    .max(50)
+    .optional(),
+});
+
+type Ids = { userId: number; websiteId: number; sessionKey: string | null };
+
 export interface ContentV3WizardDeps {
   auth: RequestHandler;
   rateLimit: RequestHandler;
   store: () => Promise<ContentV3Store>;
-  searchData: (store: ContentV3Store, ids: { userId: number; websiteId: number; sessionKey: string | null }, req: SearchDataRequest) => Promise<CachedSearchData>;
+  searchData: (store: ContentV3Store, ids: Ids, req: SearchDataRequest) => Promise<CachedSearchData>;
   runTitle: (input: TitleStepInput, opts: { runId: string }) => Promise<TitleStepResult>;
+  research?: (store: ContentV3Store, ids: Ids, req: ResearchRequest) => Promise<SessionResearch>;
+  runPlanner?: (input: PlannerStepInput, opts: { runId: string }) => Promise<PlannerStepResult>;
+  /** The editable regulated topics list (registry template), default when unset or invalid. */
+  regulatedList?: () => Promise<RegulatedTopicsList>;
   locations: LocationIndexProvider;
   countryIso?: string;
   env?: NodeJS.ProcessEnv;
@@ -184,6 +223,161 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
       });
     } catch (err) {
       log(`[content-v3] wizard/title error run=${b.session_key}: ${err instanceof Error ? err.message : String(err)}`);
+      const e = toV3UserError(err);
+      return res.status(e.status).json(v3ErrorBody(e));
+    }
+  });
+
+  router.post('/wizard/approve', deps.auth, requireV3, deps.rateLimit, async (req: AuthenticatedRequest, res: Response) => {
+    const parsed = approveSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json(v3ErrorBody(v3Error('invalid_request', parsed.error.issues[0]?.message ?? 'The request was not valid.')));
+    }
+    if (!deps.research || !deps.runPlanner) return res.status(503).json(v3ErrorBody(v3Error('not_configured')));
+    const b = parsed.data;
+    const check = checkApprovedTitle(b.title, b.seed_keyword);
+    if (!check.ok) return res.status(400).json(v3ErrorBody(v3Error('invalid_request', check.error)));
+
+    const userId = Number(req.user?.id);
+    const websiteId = Number(req.website?.id);
+    const ids = { userId, websiteId, sessionKey: b.session_key };
+    const local = isLocalPost({ seed_keyword: b.seed_keyword, reach: b.reach, target_town: b.target_town, not_about_location: b.not_about_location });
+    const town = local ? parseTown(b.target_town ?? '').town || undefined : undefined;
+
+    try {
+      const store = await deps.store();
+      const session = (await store.getSession(userId, websiteId, b.session_key)) ?? {};
+      let cost = session.cost;
+
+      // W2: a typed title had no lookup yet; a generated one finds it in the session.
+      const sd = await deps.searchData(store, ids, {
+        seed_keyword: b.seed_keyword,
+        language: b.language,
+        reach: b.reach,
+        target_town: b.target_town,
+        not_about_location: b.not_about_location,
+        state_hint: b.state_hint,
+      });
+      cost = addCost(cost, 'search_data', sd.cached ? 0 : sd.meta.cost_usd);
+
+      const research = await deps.research(store, ids, {
+        title: check.title,
+        seed_keyword: b.seed_keyword,
+        language: b.language,
+        niche: b.niche,
+        featured_service: b.featured_service,
+        reach: b.reach,
+        target_town: town,
+        people_also_ask: sd.block?.people_also_ask ?? [],
+        local_domains: sd.meta.local_domains,
+        state_hint: b.state_hint,
+      });
+      cost = addCost(cost, 'research', research.cached ? 0 : research.cost_usd);
+      const researchInput = research.research ? toResearchInput(research.research) : undefined;
+
+      // <minimum_size>: from the title's own item count (the Title step's form/items when this is
+      // the generated title, else a leading number in a typed title).
+      const ts = session.title_step as { title?: string; form?: string; items?: number | null } | undefined;
+      const lead = /^\s*(\d{1,2})\s+\S/.exec(check.title);
+      const form = ts?.title === check.title ? ts.form : lead ? 'numbered' : undefined;
+      const items = ts?.title === check.title ? ts.items ?? null : lead ? Number(lead[1]) : null;
+      const minimum_size = minimumSizeFor(form, items);
+
+      const plannerInput: PlannerStepInput = {
+        title: check.title,
+        seed_keyword: b.seed_keyword,
+        language: b.language,
+        niche: b.niche,
+        reach: b.reach,
+        proof_level: b.proof_level,
+        ideal_client: b.ideal_client,
+        target_town: town,
+        featured_service: b.featured_service,
+        business_description: b.business_description,
+        search_data: sd.block ?? undefined,
+        research: researchInput,
+        size_options: DEFAULT_SIZE_OPTIONS,
+        minimum_size,
+        use_keyword_data: b.use_keyword_data,
+        recent_posts: b.recent_posts,
+      };
+
+      let plan: PlannerStepOutput;
+      let fallback = false;
+      let plannerPrompt = '';
+      try {
+        const r = await deps.runPlanner(plannerInput, { runId: b.session_key });
+        plan = r.output;
+        plannerPrompt = r.prompt.label;
+        cost = addCost(cost, 'planner', r.cost_usd);
+      } catch (err) {
+        if (!(err instanceof StepFailedError)) throw err;
+        // P4: the article can still be generated.
+        fallback = true;
+        plan = fallbackPlan({ seedKeyword: b.seed_keyword, title: check.title, minimumSize: minimum_size, searchData: sd.block });
+        log(`[content-v3] planner fallback run=${b.session_key} attempts=${err.attempts.length} type=${plan.article_type} size=${plan.post_size}`);
+      }
+
+      const list = deps.regulatedList ? await deps.regulatedList().catch(() => DEFAULT_REGULATED_TOPICS) : DEFAULT_REGULATED_TOPICS;
+      const regulated = regulatedSuggestion({
+        businessProofLevel: b.proof_level,
+        title: check.title,
+        seedKeyword: b.seed_keyword,
+        plannerRegulated: plan.regulated_topic,
+        plannerReason: plan.regulated_reason,
+        list,
+      });
+
+      await store.mergeSession(userId, websiteId, b.session_key, {
+        approved: {
+          title: check.title,
+          seed_keyword: b.seed_keyword,
+          language: b.language ?? null,
+          niche: b.niche ?? null,
+          reach: b.reach ?? null,
+          target_town: town ?? null,
+          not_about_location: !!b.not_about_location,
+          proof_level: b.proof_level ?? null,
+          featured_service: b.featured_service ?? null,
+          business_description: b.business_description ?? null,
+          ideal_client: b.ideal_client ?? null,
+        },
+        plan,
+        plan_meta: { fallback, minimum_size, prompt: plannerPrompt, research_status: research.status },
+        regulated,
+        cost,
+      });
+
+      log(
+        `[content-v3] approve run=${b.session_key} type=${plan.article_type} size=${plan.post_size} min=${minimum_size} ` +
+          `body=${plan.body_questions.length} faq=${plan.faq_questions.length} owner=${plan.owner_questions.length} ` +
+          `regulated=${regulated.suggested ? regulated.by : 'no'} research=${research.status}${research.cached ? '(session)' : ''} fallback=${fallback ? 'yes' : 'no'}`,
+      );
+
+      return res.json({
+        success: true,
+        data: {
+          title: check.title,
+          title_notes: check.notes,
+          plan: {
+            article_type: plan.article_type,
+            post_size: plan.post_size,
+            size_reason: plan.size_reason,
+            minimum_size,
+            owner_questions: plan.owner_questions,
+          },
+          regulated: { suggested: regulated.suggested, by: regulated.by, phrase: regulated.phrase, reason: regulated.reason },
+          research: {
+            status: research.status,
+            facts: research.research?.facts.length ?? 0,
+            local_conditions: research.research?.local_conditions.length ?? 0,
+          },
+          fallback,
+          town_check: sd.meta.town_mismatch,
+        },
+      });
+    } catch (err) {
+      log(`[content-v3] wizard/approve error run=${b.session_key}: ${err instanceof Error ? err.message : String(err)}`);
       const e = toV3UserError(err);
       return res.status(e.status).json(v3ErrorBody(e));
     }
