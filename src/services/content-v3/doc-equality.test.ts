@@ -7,20 +7,9 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { docBlock, parseDocBlocks, repoDocBlocks } from './doc-blocks.js';
+import { docBlock, parseDocBlocks, repoDocBlocks, assertSameText } from './doc-blocks.js';
 import { TITLE_SYSTEM_V1, PLANNER_SYSTEM_V1 } from '../content-v3-steps/prompts.js';
 import { RESEARCH_INSTRUCTIONS_V1 } from '../research/prompt.js';
-
-export function assertSameText(actual: string, expected: string, what: string): void {
-  if (actual === expected) return;
-  let i = 0;
-  while (i < actual.length && i < expected.length && actual[i] === expected[i]) i++;
-  assert.fail(
-    `${what} differs from the doc at character ${i} (stored ${actual.length} chars, doc ${expected.length}):\n` +
-      `  stored: ${JSON.stringify(actual.slice(Math.max(0, i - 30), i + 50))}\n` +
-      `  doc:    ${JSON.stringify(expected.slice(Math.max(0, i - 30), i + 50))}`,
-  );
-}
 
 describe('doc-blocks extractor', () => {
   test('finds blocks by h2/h3 prefix and keeps their exact lines', () => {

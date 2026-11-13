@@ -252,7 +252,7 @@ describe('POST /wizard/approve (W3, P1–P5, G2)', () => {
     assert.deepEqual((s!.plan as any).body_questions, ['What drives the price?']);
     assert.equal((s!.approved as any).title, 'Water heater repair cost in Española');
     assert.deepEqual(s!.cost, { search_data: 0.002, research: 0.03, planner: 0.004 });
-    assert.match(logs.join('\n'), /\[content-v3\] approve run=\w+ type=cost size=medium min=small body=1 faq=2 owner=1 regulated=no research=ok fallback=no/);
+    assert.match(logs.join('\n'), /\[content-v3\] approve run=\w+ niche=unknown proof=- type=cost size=medium min=small body=1 faq=2 owner=1 regulated=no research=ok fallback=no/);
   });
 
   test('P4: three Planner failures → the fallback plan, still 200', async () => {
@@ -297,5 +297,17 @@ describe('POST /wizard/approve (W3, P1–P5, G2)', () => {
     assert.equal(bad.body.message, 'Please write or generate a title first.');
     const ok = await app.post('/api/v1/content-v3/wizard/approve', { ...APPROVE, title: 'Roof care tips for spring' }, PLUGIN_HEADERS);
     assert.match(ok.body.data.title_notes[0], /does not use any words/);
+  });
+});
+
+describe('GET /niches', () => {
+  test('the niche list for the Business details picker, with default proof levels', async () => {
+    const { app } = await start();
+    const r = await app.get('/api/v1/content-v3/niches', PLUGIN_HEADERS);
+    assert.equal(r.status, 200);
+    const dental = r.body.data.niches.find((n: any) => n.key === 'dental');
+    assert.equal(dental.proof_level, 'regulated');
+    assert.equal(dental.profile_name, 'Health and care');
+    assert.equal(r.body.data.profiles.length, 8);
   });
 });

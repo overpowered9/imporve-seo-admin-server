@@ -42,6 +42,7 @@ import type { SessionResearch } from '../services/research/research.default.js';
 import { checkApprovedTitle, fallbackPlan, minimumSizeFor } from '../services/content-v3/planner-fallback.js';
 import { regulatedSuggestion, DEFAULT_REGULATED_TOPICS, type RegulatedTopicsList } from '../services/content-v3/regulated-topics.js';
 import { DEFAULT_SIZE_OPTIONS } from '../services/content-v3-steps/types.js';
+import { DEFAULT_NICHE_SETTINGS, nicheList, resolveNiche, type NicheSettings } from '../services/niche-profile/niche-profile.js';
 
 /** The doc: <max_list_items> is what the largest size can hold, never more than 15. */
 export const MAX_LIST_ITEMS = 15;
@@ -79,6 +80,8 @@ export const approveSchema = z.object({
   seed_keyword: z.string().trim().min(1, 'Please enter a seed keyword.').max(200),
   language: optText(40),
   niche: optText(120),
+  /** "Other …" niches: the profile the user picked in Business details. */
+  niche_profile: optText(40),
   reach: z.enum(['local', 'nationwide']).optional(),
   proof_level: z.enum(['standard', 'regulated']).optional(),
   ideal_client: optText(300),
@@ -106,6 +109,8 @@ export interface ContentV3WizardDeps {
   runPlanner?: (input: PlannerStepInput, opts: { runId: string }) => Promise<PlannerStepResult>;
   /** The editable regulated topics list (registry template), default when unset or invalid. */
   regulatedList?: () => Promise<RegulatedTopicsList>;
+  /** The niche settings (registry JSON); for the niche's watch terms in the regulated check. */
+  nicheSettings?: () => Promise<NicheSettings>;
   locations: LocationIndexProvider;
   countryIso?: string;
   env?: NodeJS.ProcessEnv;
@@ -158,10 +163,11 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
       const shown = titlesState?.keyword === kw && Array.isArray(titlesState.list) ? titlesState.list : [];
       const previous_titles = b.regenerate ? shown.slice(-MAX_PREVIOUS_TITLES) : [];
 
+      const titleNiche = deps.nicheSettings ? resolveNiche(b.niche, await deps.nicheSettings().catch(() => DEFAULT_NICHE_SETTINGS)) : resolveNiche(b.niche);
       const input: TitleStepInput = {
         seed_keyword: b.seed_keyword,
         language: b.language,
-        niche: b.niche,
+        niche: titleNiche?.label ?? b.niche,
         reach: b.reach,
         proof_level: b.proof_level,
         ideal_client: b.ideal_client,
@@ -283,11 +289,12 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
       const items = ts?.title === check.title ? ts.items ?? null : lead ? Number(lead[1]) : null;
       const minimum_size = minimumSizeFor(form, items);
 
+      const plannerNiche = deps.nicheSettings ? resolveNiche(b.niche, await deps.nicheSettings().catch(() => DEFAULT_NICHE_SETTINGS)) : resolveNiche(b.niche);
       const plannerInput: PlannerStepInput = {
         title: check.title,
         seed_keyword: b.seed_keyword,
         language: b.language,
-        niche: b.niche,
+        niche: plannerNiche?.label ?? b.niche,
         reach: b.reach,
         proof_level: b.proof_level,
         ideal_client: b.ideal_client,
@@ -319,6 +326,8 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
       }
 
       const list = deps.regulatedList ? await deps.regulatedList().catch(() => DEFAULT_REGULATED_TOPICS) : DEFAULT_REGULATED_TOPICS;
+      const nicheSettings = deps.nicheSettings ? await deps.nicheSettings().catch(() => DEFAULT_NICHE_SETTINGS) : DEFAULT_NICHE_SETTINGS;
+      const nicheRow = resolveNiche(b.niche, nicheSettings);
       const regulated = regulatedSuggestion({
         businessProofLevel: b.proof_level,
         title: check.title,
@@ -326,6 +335,7 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
         plannerRegulated: plan.regulated_topic,
         plannerReason: plan.regulated_reason,
         list,
+        watchlist: nicheRow?.watch_terms ?? [],
       });
 
       await store.mergeSession(userId, websiteId, b.session_key, {
@@ -334,6 +344,8 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
           seed_keyword: b.seed_keyword,
           language: b.language ?? null,
           niche: b.niche ?? null,
+          niche_key: nicheRow?.key ?? null,
+          niche_profile: b.niche_profile ?? null,
           reach: b.reach ?? null,
           target_town: town ?? null,
           not_about_location: !!b.not_about_location,
@@ -349,7 +361,7 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
       });
 
       log(
-        `[content-v3] approve run=${b.session_key} type=${plan.article_type} size=${plan.post_size} min=${minimum_size} ` +
+        `[content-v3] approve run=${b.session_key} niche=${nicheRow?.key ?? 'unknown'} proof=${b.proof_level ?? '-'} type=${plan.article_type} size=${plan.post_size} min=${minimum_size} ` +
           `body=${plan.body_questions.length} faq=${plan.faq_questions.length} owner=${plan.owner_questions.length} ` +
           `regulated=${regulated.suggested ? regulated.by : 'no'} research=${research.status}${research.cached ? '(session)' : ''} fallback=${fallback ? 'yes' : 'no'}`,
       );
@@ -381,6 +393,12 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
       const e = toV3UserError(err);
       return res.status(e.status).json(v3ErrorBody(e));
     }
+  });
+
+  /** The niche list for the plugin's Business details picker (N1: the server's settings are the source). */
+  router.get('/niches', deps.auth, async (_req: AuthenticatedRequest, res: Response) => {
+    const settings = deps.nicheSettings ? await deps.nicheSettings().catch(() => DEFAULT_NICHE_SETTINGS) : DEFAULT_NICHE_SETTINGS;
+    res.json({ success: true, data: { niches: nicheList(settings), profiles: settings.profiles.map((p) => ({ key: p.key, name: p.name })) } });
   });
 
   router.post('/wizard/town-check', deps.auth, requireV3, deps.rateLimit, async (req: AuthenticatedRequest, res: Response) => {

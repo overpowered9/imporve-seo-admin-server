@@ -18,6 +18,7 @@
  *                                            after a search data lookup.
  *   POST /api/v1/content-v3/wizard/title   — validateApiAccess (plugin). Search data → Title (W2, W12, W15).
  *   POST /api/v1/content-v3/wizard/town-check — validateApiAccess (plugin). W6 town line.
+ *   GET  /api/v1/content-v3/niches         — validateApiAccess (plugin). The niche list (N1 settings).
  *   POST /api/v1/content-v3/wizard/approve — validateApiAccess (plugin). Title check → Research →
  *                                            Planner (W3, P1–P6, G2).
  *   GET  /api/v1/content-v3/status         — validateApiAccess (plugin). Is CONTENT_V3_ENABLED on?
@@ -73,6 +74,7 @@ import { liveResearchInstructions, sessionResearch } from '../services/research/
 import { runPlannerStep } from '../services/content-v3-steps/planner.step.js';
 import { livePlannerDeps } from '../services/content-v3-steps/steps.default.js';
 import { liveRegulatedTopics, REGULATED_TOPICS_DEF } from '../services/content-v3/regulated-topics.js';
+import { liveNicheSettings } from '../services/niche-profile/niche-profile.default.js';
 import { researchBlock } from '../services/content-v3-steps/xml.js';
 
 const researchRequestSchema = z.object({
@@ -126,6 +128,7 @@ router.use(
     research: (store, ids, req) => sessionResearch(store, ids, req),
     runPlanner: (input, { runId }) => runPlannerStep(input, { ...livePlannerDeps(), runId }),
     regulatedList: () => liveRegulatedTopics(() => new PromptManagementService().getPrompt(REGULATED_TOPICS_DEF.templateType)),
+    nicheSettings: async () => (await liveNicheSettings()).settings,
     get locations() {
       return liveSearchDataDeps().locations;
     },

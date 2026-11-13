@@ -25,6 +25,9 @@ import { V3_PROMPT_DEFS } from './claude-content-generator-v3.service.js';
 import { V3_STEP_PROMPT_DEFS } from './content-v3-steps/prompts.js';
 import { RESEARCH_PROMPT_DEF } from './research/prompt.js';
 import { REGULATED_TOPICS_DEF } from './content-v3/regulated-topics.js';
+import { NICHE_SETTINGS_DEF } from './niche-profile/niche-profile.js';
+import { NICHE_REGULATED_PIECE_DEF, NICHE_STANDARD_PIECE_DEF } from './niche-profile/pieces.js';
+import { DISCLAIMERS_DEF } from './niche-profile/niche-profile.default.js';
 
 export interface SeedReportEntry {
   templateType: string;
@@ -47,14 +50,14 @@ interface PromptDef {
  * the Writer draft 2 core and the rules blocks here.
  */
 export function v3DocPromptDefs(): PromptDef[] {
-  return [...Object.values(V3_STEP_PROMPT_DEFS), RESEARCH_PROMPT_DEF];
+  return [...Object.values(V3_STEP_PROMPT_DEFS), RESEARCH_PROMPT_DEF, NICHE_STANDARD_PIECE_DEF, NICHE_REGULATED_PIECE_DEF];
 }
 
 export const DOC_VERSION_LABEL = 'content-v3 doc';
 
 /** Editable settings kept in the registry (seeded once, never replaced: they are meant to be tuned). */
 export function v3SettingDefs(): PromptDef[] {
-  return [REGULATED_TOPICS_DEF];
+  return [REGULATED_TOPICS_DEF, NICHE_SETTINGS_DEF, DISCLAIMERS_DEF];
 }
 
 export async function seedV3Prompts(
