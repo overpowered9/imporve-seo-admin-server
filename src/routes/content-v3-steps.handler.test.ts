@@ -25,8 +25,10 @@ const AUTH = { Authorization: `Bearer ${issueAdminToken().token}` };
 const base = {
   attempts: [{ attempt: 1, ok: true, reason: null, ms: 5, raw_length: 100 }],
   usage: [{ input_tokens: 1, output_tokens: 1 }],
+  cost_usd: 0.00001,
+  model: 'test-model',
   keyword_data: { requested: false, effective: false, used: false, ms: 0 },
-  prompt: { templateType: 'content_v3_title', source: 'fallback' as const, version: 'v1' as const },
+  prompt: { templateType: 'content_v3_title', source: 'fallback' as const, version: 'v1' as const, label: 'content_v3_title@code#00000000' },
   timings: { total_ms: 5, keyword_data_ms: 0, model_ms: 5 },
   messages: { system: 'SYS', user: 'USER' },
 };
@@ -49,7 +51,7 @@ async function start(opts: { titleError?: Error; plannerError?: Error } = {}) {
       if (opts.plannerError) throw opts.plannerError;
       return {
         ...base,
-        prompt: { templateType: 'content_v3_planner', source: 'fallback', version: 'v1' },
+        prompt: { templateType: 'content_v3_planner', source: 'fallback', version: 'v1', label: 'content_v3_planner@code#00000000' },
         recent_posts: { received: input.recent_posts?.length ?? 0, sent: [] },
         output: {
           article_type: 'cost', type_reason: '', post_size: 'medium', size_reason: '', body_questions: ['q'], faq_questions: [],

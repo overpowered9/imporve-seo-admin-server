@@ -12,6 +12,16 @@ export interface TestApp {
   baseUrl: string;
   close(): Promise<void>;
   post(path: string, body?: unknown, headers?: Record<string, string>): Promise<{ status: number; headers: Headers; body: any }>;
+  get(path: string, headers?: Record<string, string>): Promise<{ status: number; headers: Headers; body: any }>;
+}
+
+async function readBody(res: Response): Promise<any> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
 }
 
 export async function startTestApp(mounts: Array<[path: string, router: Router]>): Promise<TestApp> {
@@ -39,6 +49,10 @@ export async function startTestApp(mounts: Array<[path: string, router: Router]>
         /* non-JSON body */
       }
       return { status: res.status, headers: res.headers, body: parsed };
+    },
+    async get(path, headers = {}) {
+      const res = await fetch(`${baseUrl}${path}`, { method: 'GET', headers });
+      return { status: res.status, headers: res.headers, body: await readBody(res) };
     },
   };
 }

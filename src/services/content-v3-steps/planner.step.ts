@@ -18,7 +18,7 @@
  */
 import { parseJsonLoose } from '../claude.service.js';
 import { KEYWORD_DATA_DEFAULTS } from '../../config/keyword-data.config.js';
-import { runWithAttempts } from './attempts.js';
+import { promptVersionLabel, runModelCall } from '../model-call.js';
 import { V3_STEP_PROMPT_DEFS } from './prompts.js';
 import { selectRecentPosts, type ScoredPost } from './recent-posts.js';
 import { normalizeQuestion, resolveStepKeywordData, str, strList, type StepDeps, type StepResultBase } from './step-common.js';
@@ -225,15 +225,25 @@ export async function runPlannerStep(input: PlannerStepInput, deps: StepDeps): P
   const prompt = await deps.resolvePrompt(def);
   const user = buildPlannerUserMessage(input, kd.data ? kd.data.block : null, sentPosts);
 
+  const modelName = deps.modelName ?? 'unknown-model';
+  const label = promptVersionLabel({ templateType: prompt.templateType, source: prompt.source, dbVersion: prompt.dbVersion, text: prompt.text });
   const modelStarted = now();
-  const r = await runWithAttempts<PlannerStepOutput>({
+  const r = await runModelCall<PlannerStepOutput>({
     step: 'planner',
+    model: modelName,
+    promptVersion: label,
+    system: prompt.text,
+    user,
+    maxTokens: PLANNER_MAX_TOKENS,
+    timeoutMs: deps.timeoutMs ?? 90_000,
     maxAttempts: deps.maxAttempts,
-    log,
-    now,
-    call: () => deps.model({ system: prompt.text, user, model: deps.modelName, maxTokens: PLANNER_MAX_TOKENS }),
+    call: (o) => deps.model(o),
     parse: (text) => normalizePlannerOutput(parseJsonLoose(text)),
     validate: (o) => validatePlannerOutput(o, { minimumSize, keywordDataInEffect: v2, sentPostIds }),
+    runId: deps.runId,
+    log,
+    now,
+    env: deps.env,
   });
 
   const output = v2 ? r.value : { ...r.value, demand_notes: null, overlap: null };
@@ -242,9 +252,11 @@ export async function runPlannerStep(input: PlannerStepInput, deps: StepDeps): P
     output,
     attempts: r.attempts,
     usage: r.usage,
+    cost_usd: r.cost_usd,
+    model: modelName,
     keyword_data: kd.info,
     recent_posts: { received: input.recent_posts?.length ?? 0, sent: selected.map((s) => ({ post_id: s.post.post_id, score: Number(s.score.toFixed(3)) })) },
-    prompt: { templateType: prompt.templateType, source: prompt.source, version: v2 ? 'v2_keyword_data' : 'v1' },
+    prompt: { templateType: prompt.templateType, source: prompt.source, version: v2 ? 'v2_keyword_data' : 'v1', label },
     timings: { total_ms: now() - startedAt, keyword_data_ms: kd.info.ms, model_ms: now() - modelStarted },
     messages: { system: prompt.text, user },
   };

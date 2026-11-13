@@ -282,6 +282,8 @@ export interface ResolvedStepPrompt {
   source: 'db' | 'fallback';
   templateType: string;
   displayName: string;
+  /** The active DB version number when source is 'db'. */
+  dbVersion?: number | null;
 }
 
 /** How a step gets its system prompt. The live resolver reads the DB's active version; tests inject one. */

@@ -15,7 +15,7 @@
  */
 import { parseJsonLoose } from '../claude.service.js';
 import { KEYWORD_DATA_DEFAULTS } from '../../config/keyword-data.config.js';
-import { runWithAttempts } from './attempts.js';
+import { promptVersionLabel, runModelCall } from '../model-call.js';
 import { V3_STEP_PROMPT_DEFS } from './prompts.js';
 import { resolveStepKeywordData, str, type StepDeps, type StepResultBase } from './step-common.js';
 import type { SearchDataInput } from './types.js';
@@ -119,23 +119,35 @@ export async function runTitleStep(input: TitleStepInput, deps: StepDeps): Promi
   const prompt = await deps.resolvePrompt(def);
   const user = buildTitleUserMessage(input, kd.data ? kd.data.block : null);
 
+  const modelName = deps.modelName ?? 'unknown-model';
+  const label = promptVersionLabel({ templateType: prompt.templateType, source: prompt.source, dbVersion: prompt.dbVersion, text: prompt.text });
   const modelStarted = now();
-  const r = await runWithAttempts<TitleStepOutput>({
+  const r = await runModelCall<TitleStepOutput>({
     step: 'title',
+    model: modelName,
+    promptVersion: label,
+    system: prompt.text,
+    user,
+    maxTokens: TITLE_MAX_TOKENS,
+    timeoutMs: deps.timeoutMs ?? 60_000,
     maxAttempts: deps.maxAttempts,
-    log,
-    now,
-    call: () => deps.model({ system: prompt.text, user, model: deps.modelName, maxTokens: TITLE_MAX_TOKENS }),
+    call: (o) => deps.model(o),
     parse: (text) => normalizeTitleOutput(parseJsonLoose(text)),
     validate: (o) => validateTitleOutput(o, input),
+    runId: deps.runId,
+    log,
+    now,
+    env: deps.env,
   });
 
   return {
     output: r.value,
     attempts: r.attempts,
     usage: r.usage,
+    cost_usd: r.cost_usd,
+    model: modelName,
     keyword_data: kd.info,
-    prompt: { templateType: prompt.templateType, source: prompt.source, version: kd.data ? 'v2_keyword_data' : 'v1' },
+    prompt: { templateType: prompt.templateType, source: prompt.source, version: kd.data ? 'v2_keyword_data' : 'v1', label },
     timings: { total_ms: now() - startedAt, keyword_data_ms: kd.info.ms, model_ms: now() - modelStarted },
     messages: { system: prompt.text, user },
   };

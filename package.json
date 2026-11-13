@@ -48,6 +48,7 @@
     "migrate:website-limits-v2": "tsx src/migrations/020-plan-website-limits-v2.ts",
     "migrate:plan-stripe-products": "tsx src/migrations/021-plan-stripe-products.ts",
     "migrate:keyword-data-cache": "tsx src/migrations/022-keyword-data-cache.ts",
+    "migrate:content-v3-store": "tsx src/migrations/023-content-v3-store.ts",
     "email:preview": "tsx src/scripts/preview-emails.ts",
     "email:requeue": "tsx src/scripts/requeue-blocked-emails.ts",
     "email:test": "tsx src/scripts/send-test-email.ts"

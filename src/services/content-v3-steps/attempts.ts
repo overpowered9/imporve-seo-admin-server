@@ -38,6 +38,11 @@ export interface AttemptsOptions<T> {
   validate: (value: T) => string | null;
   log?: (line: string) => void;
   now?: () => number;
+  /**
+   * Called once per attempt, after it is recorded, with that attempt's usage (null when the call
+   * itself failed). model-call.ts uses it for the structured per-attempt log line and cost.
+   */
+  onAttempt?: (info: { record: AttemptRecord; usage: ClaudeUsage | null }) => void;
 }
 
 export interface AttemptsResult<T> {
@@ -54,17 +59,29 @@ export async function runWithAttempts<T>(opts: AttemptsOptions<T>): Promise<Atte
   const { step, maxAttempts = DEFAULT_MAX_ATTEMPTS, log = (line) => console.log(line), now = () => Date.now() } = opts;
   const attempts: AttemptRecord[] = [];
   const usage: ClaudeUsage[] = [];
+  const record = (rec: AttemptRecord, u: ClaudeUsage | null) => {
+    attempts.push(rec);
+    try {
+      opts.onAttempt?.({ record: rec, usage: u });
+    } catch {
+      // Logging must never change the outcome of a call.
+    }
+  };
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const started = now();
     let text = '';
+    let callUsage: ClaudeUsage | null = null;
     try {
       const r = await opts.call(attempt);
       text = r.text ?? '';
-      if (r.usage) usage.push(r.usage);
+      if (r.usage) {
+        usage.push(r.usage);
+        callUsage = r.usage;
+      }
     } catch (err) {
       const reason = `call_failed: ${err instanceof Error ? err.message : String(err)}`;
-      attempts.push({ attempt, ok: false, reason, ms: now() - started, raw_length: 0 });
+      record({ attempt, ok: false, reason, ms: now() - started, raw_length: 0 }, null);
       log(`[v3-step] ${step} attempt ${attempt}/${maxAttempts} failed: ${reason}`);
       continue;
     }
@@ -74,19 +91,19 @@ export async function runWithAttempts<T>(opts: AttemptsOptions<T>): Promise<Atte
       value = opts.parse(text);
     } catch (err) {
       const reason = `unreadable_json: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`;
-      attempts.push({ attempt, ok: false, reason, ms: now() - started, raw_length: text.length });
+      record({ attempt, ok: false, reason, ms: now() - started, raw_length: text.length }, callUsage);
       log(`[v3-step] ${step} attempt ${attempt}/${maxAttempts} rejected: ${reason}`);
       continue;
     }
 
     const problem = opts.validate(value);
     if (problem) {
-      attempts.push({ attempt, ok: false, reason: problem, ms: now() - started, raw_length: text.length });
+      record({ attempt, ok: false, reason: problem, ms: now() - started, raw_length: text.length }, callUsage);
       log(`[v3-step] ${step} attempt ${attempt}/${maxAttempts} rejected: ${problem}`);
       continue;
     }
 
-    attempts.push({ attempt, ok: true, reason: null, ms: now() - started, raw_length: text.length });
+    record({ attempt, ok: true, reason: null, ms: now() - started, raw_length: text.length }, callUsage);
     return { value, attempts, usage, raw: text };
   }
 

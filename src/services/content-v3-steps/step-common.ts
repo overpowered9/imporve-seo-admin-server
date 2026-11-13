@@ -23,10 +23,16 @@ export interface ModelCallOptions {
   user: string;
   model?: string;
   maxTokens?: number;
+  /** Set by model-call.ts: aborted when the attempt's timeout fires. */
+  signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
-/** One model call. The live one is claudeText with thinking off; tests script it. */
-export type ModelCall = (opts: ModelCallOptions) => Promise<{ text: string; usage: ClaudeUsage }>;
+/**
+ * One model call. The live one is model-call.ts's anthropicProviderCall (system block cached,
+ * thinking omitted, the same request claudeText sends with thinking: false); tests script it.
+ */
+export type ModelCall = (opts: ModelCallOptions) => Promise<{ text: string; usage: ClaudeUsage; stop_reason?: string | null }>;
 
 export interface StepDeps {
   model: ModelCall;
@@ -38,6 +44,10 @@ export interface StepDeps {
   now?: () => number;
   maxAttempts?: number;
   modelName?: string;
+  /** Per-attempt timeout (config/content-v3.config.ts). Default 60 s. */
+  timeoutMs?: number;
+  /** Correlates the [model-call] lines of one wizard session (the plugin's target_key). */
+  runId?: string;
 }
 
 export interface StepKeywordDataInfo {
@@ -55,6 +65,8 @@ export interface StepPromptInfo {
   templateType: string;
   source: 'db' | 'fallback';
   version: 'v1' | 'v2_keyword_data';
+  /** promptVersionLabel(): template, DB version (or "code") and a hash of the exact text sent. */
+  label: string;
 }
 
 export interface StepTimings {
@@ -67,6 +79,9 @@ export interface StepResultBase {
   attempts: AttemptRecord[];
   /** Every attempt's usage, so cost is never under-reported. */
   usage: ClaudeUsage[];
+  /** USD over every attempt (model-pricing.ts); null when the model has no known price. */
+  cost_usd: number | null;
+  model: string;
   keyword_data: StepKeywordDataInfo;
   prompt: StepPromptInfo;
   timings: StepTimings;

@@ -292,7 +292,9 @@ router.get('/templates/:templateId/versions', requireAdmin, async (req: Request,
           prompt: activeVersion.prompt,
           isActive: activeVersion.isActive,
           createdBy: activeVersion.createdBy,
-          createdAt: activeVersion.createdAt
+          createdAt: activeVersion.createdAt,
+          label: activeVersion.label ?? null,
+          metadata: activeVersion.metadata
         } : null,
         versions: versions.map(v => ({
           _id: v._id,
@@ -301,6 +303,7 @@ router.get('/templates/:templateId/versions', requireAdmin, async (req: Request,
           isActive: v.isActive,
           createdBy: v.createdBy,
           createdAt: v.createdAt,
+          label: v.label ?? null,
           metadata: v.metadata
         }))
       }
@@ -322,7 +325,16 @@ router.get('/templates/:templateId/versions', requireAdmin, async (req: Request,
 router.post('/templates/:templateId/versions', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { templateId } = req.params;
-    const { prompt, createdBy = 'admin', metadata } = req.body;
+    const { prompt, createdBy = 'admin' } = req.body;
+    // The admin panel's "Version Name" used to arrive as a top-level `notes` field, which this
+    // route ignored (it only read `metadata`), so every version name typed in the panel was lost.
+    // Accept both shapes; `label` is the short name shown in the version list (OPS2).
+    const rawMeta = req.body?.metadata && typeof req.body.metadata === 'object' ? req.body.metadata : {};
+    const notes = typeof rawMeta.notes === 'string' ? rawMeta.notes : typeof req.body?.notes === 'string' ? req.body.notes : undefined;
+    const expectedOutput = typeof rawMeta.expectedOutput === 'string' ? rawMeta.expectedOutput : undefined;
+    const metadata = notes !== undefined || expectedOutput !== undefined ? { notes, expectedOutput } : undefined;
+    const labelRaw = typeof req.body?.label === 'string' ? req.body.label : typeof rawMeta.label === 'string' ? rawMeta.label : '';
+    const label = labelRaw.trim().slice(0, 120) || undefined;
 
     if (!prompt) {
       return res.status(400).json({
@@ -337,6 +349,7 @@ router.post('/templates/:templateId/versions', requireAdmin, async (req: Request
     const version = await promptMgmt.createTemplateVersion(templateId, {
       prompt,
       createdBy,
+      label,
       metadata
     });
     
@@ -349,6 +362,7 @@ router.post('/templates/:templateId/versions', requireAdmin, async (req: Request
         isActive: version.isActive,
         createdBy: version.createdBy,
         createdAt: version.createdAt,
+        label: version.label ?? null,
         metadata: version.metadata
       }
     });

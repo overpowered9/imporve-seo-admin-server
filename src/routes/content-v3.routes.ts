@@ -8,6 +8,13 @@
  *                                            Both in content-v3-steps.handler.ts; keyword data
  *                                            (Option B) applies when ISEO_V3_KEYWORD_DATA=true and
  *                                            the request sends use_keyword_data: true.
+ *   POST /api/v1/content-v3/prompts/seed?mode=replace — requireAdmin. Also makes every doc-sourced
+ *                                            prompt the active version, backing the old value up as
+ *                                            "pre-v3" first (OPS2, WR3).
+ *   POST /api/v1/content-v3/prompts/backup-pre-v3 — requireAdmin. Only the backup, nothing activated.
+ *   GET  /api/v1/content-v3/prompts/check  — requireAdmin. Active DB text vs the doc text, per prompt.
+ *   GET  /api/v1/content-v3/status         — validateApiAccess (plugin). Is CONTENT_V3_ENABLED on?
+ *   POST /api/v1/content-v3/session/clear  — validateApiAccess (plugin). The wizard's Leave (W10).
  *   POST /api/v1/content-v3/keyword-data/prefetch — validateApiAccess (plugin). Warms the keyword
  *                                            data cache; see content-v3-keyword-data.handler.ts.
  *                                            The one plugin-facing route on this router (decided
@@ -39,8 +46,17 @@ import { requireAdmin } from '../middleware/adminAuth.middleware.js';
 import { sanitizeCustomInstruction } from '../services/generation-history.js';
 import keywordDataRoutes from './content-v3-keyword-data.routes.js';
 import stepsRoutes from './content-v3-steps.routes.js';
+import { createContentV3PluginRouter } from './content-v3-plugin.handler.js';
+import { validateApiAccessWithoutStamp } from '../middleware/apiAuth.middleware.js';
+import { getContentV3Store } from '../services/content-v3/store.default.js';
+import { checkV3Prompts, v3DocPromptDefs } from '../services/prompt-seed.v3.js';
+import { PromptManagementService } from '../services/prompt-management.service.js';
 
 const router = Router();
+
+// Plugin-facing status and session housekeeping (content-v3-plugin.handler.ts). The status check
+// does not stamp the website's last connection: it is a capability probe, not a generation.
+router.use('/', createContentV3PluginRouter({ auth: validateApiAccessWithoutStamp, store: getContentV3Store }));
 
 // Keyword data (Option A/B plumbing). Auth is applied INSIDE the sub-router: prefetch is
 // plugin-authenticated, everything else on it is requireAdmin.
@@ -224,9 +240,10 @@ router.post('/article/test', requireAdmin, async (req: Request, res: Response) =
  * Idempotent and skip-only: a template with an active version is untouched, so this can never
  * clobber a prompt tuned in the panel. Safe to call from a button.
  */
-router.post('/prompts/seed', requireAdmin, async (_req: Request, res: Response) => {
+router.post('/prompts/seed', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const report = await seedV3Prompts();
+    const mode = req.query?.mode === 'replace' || req.body?.mode === 'replace' ? 'replace' : 'skip';
+    const report = await seedV3Prompts(undefined, { mode });
     const seeded = report.filter((r) => r.version === 'seeded').length;
     res.json({
       success: true,
@@ -237,6 +254,30 @@ router.post('/prompts/seed', requireAdmin, async (_req: Request, res: Response) 
     res
       .status(500)
       .json({ success: false, error: e instanceof Error ? e.message : 'Seeding failed' });
+  }
+});
+
+/** Back up the active value of every content_v3_* template as "pre-v3" (once). Activates nothing. */
+router.post('/prompts/backup-pre-v3', requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const legacy = ['content_v3_intelligence', 'content_v3_system', 'content_v3_humanize', 'content_v3_blueprint_directives', 'content_v3_seo_rules', 'content_v3_business_context'];
+    const types = [...new Set([...legacy, ...v3DocPromptDefs().map((d) => d.templateType)])];
+    const report = await new PromptManagementService().backupPreV3(types, 'admin-backup');
+    res.json({ success: true, data: { report } });
+  } catch (e) {
+    console.error('❌ [v3] pre-v3 backup error:', e);
+    res.status(500).json({ success: false, error: 'Backup failed' });
+  }
+});
+
+/** Production gate item 2: active DB text vs the doc text, per doc-sourced prompt. Read-only. */
+router.get('/prompts/check', requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const report = await checkV3Prompts();
+    res.json({ success: true, data: { report, all_equal: report.every((r) => r.status === 'equal') } });
+  } catch (e) {
+    console.error('❌ [v3] prompt check error:', e);
+    res.status(500).json({ success: false, error: 'Check failed' });
   }
 });
 

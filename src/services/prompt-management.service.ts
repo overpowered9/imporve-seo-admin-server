@@ -6,8 +6,39 @@ import {
   IPromptVersion
 } from '../models/prompt.models.js';
 
+export interface ActivePromptVersion {
+  text: string;
+  version: number;
+  versionId: string;
+  label: string | null;
+}
+
+/** The label that marks the backup of an old content_v3_* value (OPS2, WR3). */
+export const PRE_V3_LABEL = 'pre-v3';
+
 export class PromptManagementService {
-  
+
+  /**
+   * The active version's text AND which version it is, so a run can log exactly which prompt it
+   * used (model-call.ts). Same lookup and errors as getPrompt.
+   */
+  async getPromptWithVersion(templateType: string): Promise<ActivePromptVersion> {
+    const template = await PromptTemplate.findOne({ templateType: templateType as any });
+    if (!template) {
+      throw new Error(`Template '${templateType}' not found`);
+    }
+    const activeVersion = await PromptVersion.findOne({ templateId: template._id, isActive: true }).sort({ version: -1 });
+    if (!activeVersion) {
+      throw new Error(`No active version found for template '${templateType}'`);
+    }
+    return {
+      text: activeVersion.prompt,
+      version: activeVersion.version,
+      versionId: activeVersion._id.toString(),
+      label: activeVersion.label ?? null,
+    };
+  }
+
   /**
    * Get a specific prompt by template type (simplified for focused approach)
    */
@@ -127,6 +158,7 @@ export class PromptManagementService {
     versionData: {
       prompt: string;
       createdBy: string;
+      label?: string;
       metadata?: {
         notes?: string;
         expectedOutput?: string;
@@ -146,6 +178,7 @@ export class PromptManagementService {
       prompt: versionData.prompt,
       isActive: false, // New versions start as inactive
       createdBy: versionData.createdBy,
+      ...(versionData.label ? { label: versionData.label.slice(0, 120) } : {}),
       metadata: versionData.metadata
     });
 
@@ -156,15 +189,13 @@ export class PromptManagementService {
    * Activate a specific version (deactivates all other versions for this template)
    */
   async activateTemplateVersion(templateId: string, versionId: string): Promise<IPromptVersion> {
-    // Deactivate all versions for this template
-    await PromptVersion.updateMany(
-      { templateId },
-      { isActive: false }
-    );
-
-    // Activate the specified version
-    const activatedVersion = await PromptVersion.findByIdAndUpdate(
-      versionId,
+    // Activate the target FIRST, then deactivate the others. The old order (deactivate all, then
+    // activate one) left a window with no active version, in which every getPrompt threw and the
+    // pipelines silently fell back to their in-code text. Now the worst case is a moment with two
+    // active versions, and getPromptWithVersion picks the highest number. The version must also
+    // belong to this template, so a stray id cannot activate another template's prompt.
+    const activatedVersion = await PromptVersion.findOneAndUpdate(
+      { _id: versionId, templateId },
       { isActive: true },
       { new: true }
     );
@@ -173,7 +204,46 @@ export class PromptManagementService {
       throw new Error('Version not found');
     }
 
+    await PromptVersion.updateMany(
+      { templateId, _id: { $ne: activatedVersion._id } },
+      { isActive: false }
+    );
+
     return activatedVersion;
+  }
+
+  /**
+   * Back up the active value of each template as a version labelled "pre-v3" (OPS2, WR3), once.
+   * A template that already has a pre-v3 version, or has no active version, is left alone. The
+   * backup is inactive; the active version is not changed. Non-destructive and idempotent.
+   */
+  async backupPreV3(templateTypes: string[], createdBy = 'system-backup'): Promise<Array<{ templateType: string; result: 'backed_up' | 'already_backed_up' | 'no_template' | 'no_active_version'; version?: number }>> {
+    const out: Array<{ templateType: string; result: 'backed_up' | 'already_backed_up' | 'no_template' | 'no_active_version'; version?: number }> = [];
+    for (const templateType of templateTypes) {
+      const template = await PromptTemplate.findOne({ templateType: templateType as any });
+      if (!template) {
+        out.push({ templateType, result: 'no_template' });
+        continue;
+      }
+      const existing = await PromptVersion.findOne({ templateId: template._id, label: PRE_V3_LABEL });
+      if (existing) {
+        out.push({ templateType, result: 'already_backed_up', version: existing.version });
+        continue;
+      }
+      const active = await PromptVersion.findOne({ templateId: template._id, isActive: true }).sort({ version: -1 });
+      if (!active) {
+        out.push({ templateType, result: 'no_active_version' });
+        continue;
+      }
+      const copy = await this.createTemplateVersion(template._id.toString(), {
+        prompt: active.prompt,
+        createdBy,
+        label: PRE_V3_LABEL,
+        metadata: { notes: `Backup of v${active.version}, taken before the Content v3 doc text replaced it` },
+      });
+      out.push({ templateType, result: 'backed_up', version: copy.version });
+    }
+    return out;
   }
 
   /**
