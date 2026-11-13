@@ -175,7 +175,7 @@ describe('lookupSearchData', () => {
     assert.deepEqual(r.block!.ranking_titles!.map((i) => [i.text, i.scope]), [['Espanola plumbing', 'local'], ['Water heater repair cost guide', 'national']]);
     assert.deepEqual(r.meta.local_domains, ['espanolaplumbing.com'], 'national domains stay out even when they repeat a local one');
     assert.equal(r.meta.cost_usd, 0.0043);
-    assert.match(logs[0], /^\[search-data\] seed="water heater repair Española" mode=local location="Española, NM" national_call=yes local=t1\/q1\/r1 national=t2\/q3\/r3 merged=t2\/q3\/r3 town=listed cost_usd=0\.0043 ms=\d+$/);
+    assert.match(logs[0], /^\[search-data\] seed="water heater repair Española" mode=local location="Española, NM" national_fallback=yes local=t1\/q1\/r1 national=t2\/q3\/r3 merged=t2\/q3\/r3 town=listed cost_usd=0\.0043 ms=\d+$/);
     const xml = searchDataBlock(r.block!);
     assert.match(xml, /^<search_data location="Española, NM" national_fallback="yes">/);
     assert.match(xml, /<people_also_ask count="3">/);
@@ -235,6 +235,9 @@ describe('lookupSearchData', () => {
     assert.equal(languageCodeFor('Spanish'), 'es');
     assert.equal(languageCodeFor(''), 'en');
     assert.equal(languageCodeFor('Klingon'), 'en');
+    assert.equal(languageCodeFor('US English'), 'en');
+    assert.equal(languageCodeFor('UK English'), 'en');
+    assert.equal(languageCodeFor('German'), 'de');
     assert.equal(searchDataCacheKey({ seed_keyword: ' Water  Heater ', reach: 'local', target_town: 'Española' }), 'water heater|town:española|en');
     assert.equal(searchDataCacheKey({ seed_keyword: 'water heater', reach: 'nationwide', target_town: 'Española' }), 'water heater|country|en');
   });

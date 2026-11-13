@@ -23,7 +23,7 @@ DataForSEO Google organic, Live mode, advanced, depth 10, People Also Ask click 
 - A town DataForSEO does not list: `SEARCH_DATA_TOWN_ALIASES_JSON` (nearest listed city), else coordinates when the caller has them, else one country call with the keyword as typed (logged `town=unresolved`). Open question for Zaid; the alias map is the working value.
 - Failures never block the title: a failed town call still runs the country call; if nothing returns, the Title prompt works from the keyword. A task-level error (inside a 200) is retried once.
 - Results are stored in the wizard session and reused on Regenerate title.
-- Log: `[search-data] seed="…" mode=local location="Española, NM" national_call=yes local=t9/q6/r2 national=t8/q6/r3 merged=t10/q8/r5 town=listed cost_usd=0.0043 ms=5298`
+- Log: `[search-data] seed="…" mode=local location="Española, NM" national_fallback=yes local=t9/q6/r2 national=t8/q6/r3 merged=t10/q8/r5 town=listed cost_usd=0.0043 ms=5298`
 - Real run, 14 Nov: "water heater repair Española" at Española, NM → town call thin (2 related) → country call → merged block as above, $0.0043, 5.3 s. Field names confirmed: organic `title`/`domain`/`url`; `people_also_ask.items[].title`; `related_searches.items` strings.
 
 ## Routes

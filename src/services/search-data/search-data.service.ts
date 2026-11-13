@@ -269,7 +269,7 @@ export async function lookupSearchData(req: SearchDataRequest, deps: SearchDataD
     .map((c) => `${c.scope}=${c.ok ? `t${c.counts.titles}/q${c.counts.questions}/r${c.counts.related}` : `failed(${c.error})`}`)
     .join(' ');
   log(
-    `[search-data] seed="${keyword}" mode=${mode} location="${locationUsed}" national_call=${calls.some((c) => c.scope === 'national') ? 'yes' : 'no'} ` +
+    `[search-data] seed="${keyword}" mode=${mode} location="${locationUsed}" national_fallback=${nationalFallback ? 'yes' : 'no'} ` +
       `${callPart} merged=t${meta.counts.titles}/q${meta.counts.questions}/r${meta.counts.related}` +
       `${resolution.status !== 'not_needed' ? ` town=${resolution.status}` : ''} cost_usd=${cost_usd} ms=${meta.ms}`,
   );

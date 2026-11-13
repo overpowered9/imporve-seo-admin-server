@@ -79,5 +79,9 @@ export function languageCodeFor(language: string | undefined): string {
   const raw = String(language ?? '').trim();
   if (!raw) return 'en';
   if (/^[a-z]{2}(-[A-Za-z]{2})?$/.test(raw)) return raw;
-  return LANGUAGE_CODES[raw.toLowerCase()] ?? 'en';
+  const lower = raw.toLowerCase();
+  if (LANGUAGE_CODES[lower]) return LANGUAGE_CODES[lower];
+  // The wizard sends "US English", "UK English", "German": match the language word inside.
+  const word = Object.keys(LANGUAGE_CODES).find((name) => new RegExp(`\\b${name}\\b`).test(lower));
+  return word ? LANGUAGE_CODES[word] : 'en';
 }

@@ -14,6 +14,8 @@
  *   POST /api/v1/content-v3/prompts/backup-pre-v3 — requireAdmin. Only the backup, nothing activated.
  *   GET  /api/v1/content-v3/prompts/check  — requireAdmin. Active DB text vs the doc text, per prompt.
  *   POST /api/v1/content-v3/search-data    — requireAdmin. The search data lookup alone (S1–S12).
+ *   POST /api/v1/content-v3/wizard/title   — validateApiAccess (plugin). Search data → Title (W2, W12, W15).
+ *   POST /api/v1/content-v3/wizard/town-check — validateApiAccess (plugin). W6 town line.
  *   GET  /api/v1/content-v3/status         — validateApiAccess (plugin). Is CONTENT_V3_ENABLED on?
  *   POST /api/v1/content-v3/session/clear  — validateApiAccess (plugin). The wizard's Leave (W10).
  *   POST /api/v1/content-v3/keyword-data/prefetch — validateApiAccess (plugin). Warms the keyword
@@ -54,9 +56,32 @@ import { checkV3Prompts, v3DocPromptDefs } from '../services/prompt-seed.v3.js';
 import { PromptManagementService } from '../services/prompt-management.service.js';
 import { createSearchDataRouter } from './content-v3-search-data.handler.js';
 import { lookupSearchData } from '../services/search-data/search-data.service.js';
-import { liveSearchDataDeps } from '../services/search-data/search-data.default.js';
+import { liveSearchDataDeps, sessionSearchData } from '../services/search-data/search-data.default.js';
+import { createContentV3WizardRouter } from './content-v3-wizard.handler.js';
+import { validateApiAccess } from '../middleware/apiAuth.middleware.js';
+import { rateLimitPerUser } from '../middleware/rateLimit.middleware.js';
+import { runTitleStep } from '../services/content-v3-steps/title.step.js';
+import { liveTitleDeps } from '../services/content-v3-steps/steps.default.js';
+import { searchDataConfig } from '../config/search-data.config.js';
 
 const router = Router();
+
+// The single wizard's v3 steps (plugin auth). Free, rate-limited per account; 409 while
+// CONTENT_V3_ENABLED is off so the plugin falls back to v2.
+router.use(
+  '/',
+  createContentV3WizardRouter({
+    auth: validateApiAccess,
+    rateLimit: rateLimitPerUser({ limit: 30, windowMs: 60_000, keyPrefix: 'content-v3-wizard', message: 'Too many requests in a short time. Please wait a minute and try again.' }),
+    store: getContentV3Store,
+    searchData: (store, ids, req) => sessionSearchData(store, ids, req),
+    runTitle: (input, { runId }) => runTitleStep(input, { ...liveTitleDeps(), runId }),
+    get locations() {
+      return liveSearchDataDeps().locations;
+    },
+    countryIso: searchDataConfig().countryIso,
+  }),
+);
 
 // Search data lookup on its own (admin: tester panel, 10-keyword run). Spends DataForSEO money.
 router.use('/', createSearchDataRouter({ auth: requireAdmin, lookup: (req) => lookupSearchData(req, liveSearchDataDeps()) }));
