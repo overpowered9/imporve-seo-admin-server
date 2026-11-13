@@ -23,6 +23,7 @@ import { PromptManagementService, PRE_V3_LABEL } from './prompt-management.servi
 import type { IPromptTemplate } from '../models/prompt.models.js';
 import { V3_PROMPT_DEFS } from './claude-content-generator-v3.service.js';
 import { V3_STEP_PROMPT_DEFS } from './content-v3-steps/prompts.js';
+import { RESEARCH_PROMPT_DEF } from './research/prompt.js';
 
 export interface SeedReportEntry {
   templateType: string;
@@ -45,7 +46,7 @@ interface PromptDef {
  * the Writer draft 2 core and the rules blocks here.
  */
 export function v3DocPromptDefs(): PromptDef[] {
-  return [...Object.values(V3_STEP_PROMPT_DEFS)];
+  return [...Object.values(V3_STEP_PROMPT_DEFS), RESEARCH_PROMPT_DEF];
 }
 
 export const DOC_VERSION_LABEL = 'content-v3 doc';

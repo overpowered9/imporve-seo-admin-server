@@ -9,6 +9,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { docBlock, parseDocBlocks, repoDocBlocks } from './doc-blocks.js';
 import { TITLE_SYSTEM_V1, PLANNER_SYSTEM_V1 } from '../content-v3-steps/prompts.js';
+import { RESEARCH_INSTRUCTIONS_V1 } from '../research/prompt.js';
 
 export function assertSameText(actual: string, expected: string, what: string): void {
   if (actual === expected) return;
@@ -37,6 +38,10 @@ describe('stored prompts equal the doc', () => {
 
   test('PROMPT 1 · Title: system prompt', () => {
     assertSameText(TITLE_SYSTEM_V1, docBlock(blocks, 'PROMPT 1 · Title', 'System prompt'), 'TITLE_SYSTEM_V1');
+  });
+
+  test('PROMPT 2 · Research query: instructions', () => {
+    assertSameText(RESEARCH_INSTRUCTIONS_V1, docBlock(blocks, 'PROMPT 2 · Research query', 'System prompt'), 'RESEARCH_INSTRUCTIONS_V1');
   });
 
   test('PROMPT 3 · Planner: system prompt', () => {

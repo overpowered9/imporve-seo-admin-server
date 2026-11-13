@@ -80,13 +80,13 @@ export function researchBlock(r?: ResearchInput): string {
   if (!r) return '';
   const facts = (r.facts ?? [])
     .filter((f) => f && !isBlank(f.claim))
-    .map((f, i) => `<fact id="S${i + 1}"${attrString({ scope: f.scope, conflict: f.conflict ? 'true' : undefined })}>${inline(f.claim)}</fact>`);
+    .map((f, i) => `<fact id="${f.token && /^S\d+$/.test(f.token) ? f.token : `S${i + 1}`}"${attrString({ scope: f.scope, conflict: f.conflict ? 'true' : undefined })}>${inline(f.claim)}</fact>`);
   const questions = (r.follow_up_questions ?? [])
     .filter((q) => q && !isBlank(q.question))
     .map((q) => `<question>${inline(q.question)}</question>`);
   const conditions = (r.local_conditions ?? [])
     .filter((c) => c && !isBlank(c.claim))
-    .map((c) => `<condition>${inline(c.claim)}</condition>`);
+    .map((c) => `<condition${c.token && /^S\d+$/.test(c.token) ? ` id="${c.token}"` : ''}>${inline(c.claim)}</condition>`);
   const children = [
     listTag('facts', facts),
     listTag('follow_up_questions', questions),

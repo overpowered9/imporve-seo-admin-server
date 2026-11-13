@@ -30,6 +30,8 @@ export interface ResearchFact {
   scope?: 'local' | 'state' | 'national' | 'general';
   source_ids?: number[];
   conflict?: boolean;
+  /** The source token ("S3") research.service.ts assigned; when absent, facts are numbered by position. */
+  token?: string;
 }
 
 export interface ResearchQuestion {
@@ -40,6 +42,8 @@ export interface ResearchQuestion {
 export interface ResearchCondition {
   claim: string;
   source_ids?: number[];
+  /** Local conditions continue the fact numbering ("S16"…), so the Writer can cite them (rules_local_seo). */
+  token?: string;
 }
 
 export interface ResearchInput {

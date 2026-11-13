@@ -26,11 +26,24 @@ DataForSEO Google organic, Live mode, advanced, depth 10, People Also Ask click 
 - Log: `[search-data] seed="…" mode=local location="Española, NM" national_fallback=yes local=t9/q6/r2 national=t8/q6/r3 merged=t10/q8/r5 town=listed cost_usd=0.0043 ms=5298`
 - Real run, 14 Nov: "water heater repair Española" at Española, NM → town call thin (2 related) → country call → merged block as above, $0.0043, 5.3 s. Field names confirmed: organic `title`/`domain`/`url`; `people_also_ask.items[].title`; `related_searches.items` strings.
 
+## Research (phase 4)
+
+PROMPT 2 on the Perplexity Agent API (`services/research/`), request shape checked against Perplexity's docs on 14 Nov: `POST https://api.perplexity.ai/v1/agent` with `instructions` (the doc text, template `content_v3_research`), `input` (the doc's data block), `tools: [{ type: "web_search", max_results, filters: { search_domain_filter }, user_location }]`, `response_format: { type: "json_schema", json_schema: { name: "research", schema } }`, `effort` (and optional `model`).
+
+- Competitor filter: the LOCAL ranking domains from the search data lookup as `-domain` entries, max 20; government, education, encyclopedia and major news domains never filtered (`RESEARCH_FILTER_SKIP_DOMAINS` adds more).
+- `user_location { city, region, country }` when the post has a Target town.
+- Every source number is mapped to its search result; a fact, question or local condition without a match is dropped. Caps 15 / 10 / 6 in code. Facts get tokens S1…, local conditions continue the numbering; each token maps to one URL and date for the Writer's links.
+- Up to 3 attempts (timeout `CONTENT_V3_TIMEOUT_RESEARCH_MS`). If all fail, or `PERPLEXITY_API_KEY` is unset, the run continues without research.
+- Stored in the wizard session for Regenerate and Change Image.
+- Cost: `usage.cost.total_cost` from Perplexity, in the `[model-call] step=research` line; summary `[research] run=… facts=… questions=… local_conditions=… dropped=f/q/c … cost_usd=…`.
+- **Not run live yet: needs `PERPLEXITY_API_KEY`, and Zaid's choice of model and effort (working value `PERPLEXITY_EFFORT=low`).** Built and tested against a mocked provider.
+
 ## Routes
 
 | Route | Auth | Purpose |
 |---|---|---|
 | `POST /api/v1/content-v3/search-data` | admin | The search data lookup alone: block, exact XML, per-call meta. Spends ~$0.002 per call. |
+| `POST /api/v1/content-v3/research` | admin | Research alone (optionally after a search data lookup with `run_search_data: true`): mapped research, the `<research>` XML, cost. |
 | `GET /api/v1/content-v3/status` | plugin | `{ enabled, keyword_data }`. The plugin caches it 5 minutes. |
 | `POST /api/v1/content-v3/session/clear` | plugin | Wizard Leave: deletes the session row. Works with v3 off. |
 | `POST /api/v1/content-v3/prompts/seed` | admin | Registers templates; `?mode=replace` makes every doc-sourced prompt active, backing the old value up as "pre-v3" first. Nothing is deleted. |

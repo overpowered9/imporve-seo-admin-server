@@ -14,6 +14,8 @@
  *   POST /api/v1/content-v3/prompts/backup-pre-v3 — requireAdmin. Only the backup, nothing activated.
  *   GET  /api/v1/content-v3/prompts/check  — requireAdmin. Active DB text vs the doc text, per prompt.
  *   POST /api/v1/content-v3/search-data    — requireAdmin. The search data lookup alone (S1–S12).
+ *   POST /api/v1/content-v3/research       — requireAdmin. Research alone (R1–R10), optionally
+ *                                            after a search data lookup.
  *   POST /api/v1/content-v3/wizard/title   — validateApiAccess (plugin). Search data → Title (W2, W12, W15).
  *   POST /api/v1/content-v3/wizard/town-check — validateApiAccess (plugin). W6 town line.
  *   GET  /api/v1/content-v3/status         — validateApiAccess (plugin). Is CONTENT_V3_ENABLED on?
@@ -63,8 +65,48 @@ import { rateLimitPerUser } from '../middleware/rateLimit.middleware.js';
 import { runTitleStep } from '../services/content-v3-steps/title.step.js';
 import { liveTitleDeps } from '../services/content-v3-steps/steps.default.js';
 import { searchDataConfig } from '../config/search-data.config.js';
+import { z } from 'zod';
+import { runResearch, toResearchInput } from '../services/research/research.service.js';
+import { liveResearchInstructions } from '../services/research/research.default.js';
+import { researchBlock } from '../services/content-v3-steps/xml.js';
+
+const researchRequestSchema = z.object({
+  title: z.string().trim().min(1).max(200),
+  seed_keyword: z.string().trim().min(1).max(200),
+  language: z.string().trim().max(40).optional(),
+  niche: z.string().trim().max(120).optional(),
+  featured_service: z.string().trim().max(200).optional(),
+  reach: z.enum(['local', 'nationwide']).optional(),
+  target_town: z.string().trim().max(120).optional(),
+  state_hint: z.string().trim().max(40).optional(),
+  people_also_ask: z.array(z.object({ text: z.string().max(300), scope: z.enum(['local', 'national']) })).max(20).optional(),
+  local_domains: z.array(z.string().max(200)).max(40).optional(),
+  /** Run the search data lookup first and feed its questions and local domains in. */
+  run_search_data: z.boolean().optional(),
+});
 
 const router = Router();
+
+// Research alone (admin: tester panel, 10-keyword run). Spends Perplexity money when configured.
+router.post('/research', requireAdmin, async (req: Request, res: Response) => {
+  const parsed = researchRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ success: false, error: 'invalid_request', message: parsed.error.issues.map((i) => i.message).join('; ') });
+  }
+  const b = parsed.data;
+  let paa = b.people_also_ask;
+  let localDomains = b.local_domains;
+  if (b.run_search_data) {
+    const sd = await lookupSearchData({ seed_keyword: b.seed_keyword, language: b.language, reach: b.reach, target_town: b.target_town }, liveSearchDataDeps());
+    paa = sd.block?.people_also_ask ?? [];
+    localDomains = sd.meta.local_domains;
+  }
+  const r = await runResearch(
+    { ...b, people_also_ask: paa, local_domains: localDomains },
+    { resolveInstructions: () => liveResearchInstructions() },
+  );
+  return res.json({ success: true, data: { ...r, xml: r.research ? researchBlock(toResearchInput(r.research)) : '' } });
+});
 
 // The single wizard's v3 steps (plugin auth). Free, rate-limited per account; 409 while
 // CONTENT_V3_ENABLED is off so the plugin falls back to v2.
