@@ -11,7 +11,7 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { runPlannerStep, buildPlannerUserMessage, normalizePlannerOutput, validatePlannerOutput } from './planner.step.js';
+import { runPlannerStep, buildPlannerUserMessage, normalizePlannerOutput, validatePlannerOutput, plannerEvidencePresent } from './planner.step.js';
 import { PLANNER_SYSTEM_V1, PLANNER_SYSTEM_V2_KEYWORD_DATA, fallbackStepPromptResolver } from './prompts.js';
 import type { KeywordDataService, PromptKeywordData } from '../keyword-data/keyword-data.service.js';
 import type { ModelCall, StepDeps } from './step-common.js';
@@ -172,6 +172,23 @@ describe("the doc's code checks", () => {
     assert.equal(validatePlannerOutput({ ...base, overlap: { post_id: 2, reason: 'dup' }, demand_notes: 'one line' }, v2), null);
     // With V1 the two contract fields are not judged at all.
     assert.equal(validatePlannerOutput({ ...base, overlap: { post_id: 99, reason: '' }, demand_notes: 'x'.repeat(500) }, ctx), null);
+  });
+
+  test('C2: 0 FAQ questions is rejected only when there were real questions to use', () => {
+    const ctx = { minimumSize: 'small' as const, keywordDataInEffect: false, sentPostIds: new Set<number>() };
+    const none = { ...normalizePlannerOutput(PLAN), faq_questions: [] };
+    const sd = (paa: number, related: number) => ({
+      location: 'United States', national_fallback: false, ranking_titles: [{ text: 'A', scope: 'national' as const }],
+      people_also_ask: Array.from({ length: paa }, (_, i) => ({ text: `Question ${i}?`, scope: 'national' as const })),
+      related_searches: Array.from({ length: related }, (_, i) => ({ text: `related ${i}`, scope: 'national' as const })),
+    });
+    // 14 Nov run: 9 results, 0 People Also Ask, 2 related searches — an empty FAQ list is honest.
+    assert.equal(plannerEvidencePresent({ search_data: sd(0, 2) as any }), false);
+    assert.equal(validatePlannerOutput(none, { ...ctx, evidencePresent: plannerEvidencePresent({ search_data: sd(0, 2) as any }) }), null);
+    assert.equal(plannerEvidencePresent({ search_data: sd(0, 0) as any, research: { facts: [{ text: 'f' }], follow_up_questions: [] } as any }), false);
+    assert.equal(plannerEvidencePresent({ search_data: sd(3, 0) as any }), true);
+    assert.equal(plannerEvidencePresent({ research: { facts: [], follow_up_questions: ['Is it safe?'] } as any }), true);
+    assert.match(validatePlannerOutput(none, { ...ctx, evidencePresent: true }) ?? '', /too_few_faq_questions/);
   });
 
   test('normalizePlannerOutput coerces loosely and never throws on shapes', () => {

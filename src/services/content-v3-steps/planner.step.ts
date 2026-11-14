@@ -183,21 +183,22 @@ export interface PlannerValidationContext {
   /**
    * Conflict C2 (approved 14 Nov): the doc asks for "1 to 5 FAQ questions" but also lets the
    * Planner "return fewer" when evidence is thin. So at least 1 FAQ question is required only when
-   * there IS evidence (search data questions/related searches, or research); with none, 0 is valid.
+   * there IS evidence: real questions the FAQ can use (see plannerEvidencePresent); else 0 is valid.
    */
   evidencePresent?: boolean;
 }
 
-/** True when the Planner had questions to draw on: People Also Ask, related searches or research. */
+/**
+ * True when the Planner had real questions to draw FAQ candidates from: People Also Ask or the
+ * research's follow-up questions. Related searches and research facts are not questions; making
+ * one into an FAQ question is the "invent or reword one to reach a number" the doc forbids (D:275).
+ * 10-keyword run, 14 Nov: 0 People Also Ask + 2 related searches → three rejected Planner attempts
+ * for an honest empty FAQ list, then the bare fallback plan.
+ */
 export function plannerEvidencePresent(input: Pick<PlannerStepInput, 'search_data' | 'research'>): boolean {
   const sd = input.search_data;
   const r = input.research;
-  return (
-    (sd?.people_also_ask?.length ?? 0) > 0 ||
-    (sd?.related_searches?.length ?? 0) > 0 ||
-    (r?.facts?.length ?? 0) > 0 ||
-    (r?.follow_up_questions?.length ?? 0) > 0
-  );
+  return (sd?.people_also_ask?.length ?? 0) > 0 || (r?.follow_up_questions?.length ?? 0) > 0;
 }
 
 export function validatePlannerOutput(o: PlannerStepOutput, ctx: PlannerValidationContext): string | null {
@@ -206,7 +207,7 @@ export function validatePlannerOutput(o: PlannerStepOutput, ctx: PlannerValidati
   if (sizeRank(o.post_size) < sizeRank(ctx.minimumSize)) return `post_size_below_minimum: ${o.post_size} < ${ctx.minimumSize}`;
   if (o.body_questions.length > BODY_QUESTIONS_MAX) return `too_many_body_questions: ${o.body_questions.length}`;
   if (o.faq_questions.length > FAQ_QUESTIONS_MAX) return `too_many_faq_questions: ${o.faq_questions.length}`;
-  if (ctx.evidencePresent && o.faq_questions.length < 1) return 'too_few_faq_questions: 0 with search data or research present';
+  if (ctx.evidencePresent && o.faq_questions.length < 1) return 'too_few_faq_questions: 0 with People Also Ask or research questions present';
   const body = new Set(o.body_questions.map(normalizeQuestion));
   const dup = o.faq_questions.find((q) => body.has(normalizeQuestion(q)));
   if (dup) return `faq_repeats_body_question: ${dup.slice(0, 80)}`;
