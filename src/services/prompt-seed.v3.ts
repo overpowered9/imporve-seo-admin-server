@@ -28,6 +28,7 @@ import { REGULATED_TOPICS_DEF } from './content-v3/regulated-topics.js';
 import { NICHE_SETTINGS_DEF } from './niche-profile/niche-profile.js';
 import { NICHE_REGULATED_PIECE_DEF, NICHE_STANDARD_PIECE_DEF } from './niche-profile/pieces.js';
 import { DISCLAIMERS_DEF } from './niche-profile/niche-profile.default.js';
+import { BLUEPRINT_DIRECTIVES_DEF } from './blueprint/pieces.js';
 
 export interface SeedReportEntry {
   templateType: string;
@@ -50,7 +51,7 @@ interface PromptDef {
  * the Writer draft 2 core and the rules blocks here.
  */
 export function v3DocPromptDefs(): PromptDef[] {
-  return [...Object.values(V3_STEP_PROMPT_DEFS), RESEARCH_PROMPT_DEF, NICHE_STANDARD_PIECE_DEF, NICHE_REGULATED_PIECE_DEF];
+  return [...Object.values(V3_STEP_PROMPT_DEFS), RESEARCH_PROMPT_DEF, NICHE_STANDARD_PIECE_DEF, NICHE_REGULATED_PIECE_DEF, BLUEPRINT_DIRECTIVES_DEF];
 }
 
 export const DOC_VERSION_LABEL = 'content-v3 doc';
@@ -71,7 +72,9 @@ export async function seedV3Prompts(
   // The Writer-chain prompts (claude-content-generator-v3.service.ts) plus the Title/Planner step
   // prompts (content-v3-steps/prompts.ts), all with the same idempotent, skip-only treatment.
   const seen = new Set<string>();
-  const defs: PromptDef[] = [...Object.values(V3_PROMPT_DEFS), ...v3DocPromptDefs(), ...v3SettingDefs()].filter((d) => {
+  // Doc-sourced definitions first: where one shares a template with the legacy Writer chain
+  // (content_v3_blueprint_directives), the doc's text is what gets seeded and replaced.
+  const defs: PromptDef[] = [...v3DocPromptDefs(), ...v3SettingDefs(), ...Object.values(V3_PROMPT_DEFS)].filter((d) => {
     if (seen.has(d.templateType)) return false;
     seen.add(d.templateType);
     return true;

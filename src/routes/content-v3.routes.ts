@@ -14,6 +14,8 @@
  *   POST /api/v1/content-v3/prompts/backup-pre-v3 — requireAdmin. Only the backup, nothing activated.
  *   GET  /api/v1/content-v3/prompts/check  — requireAdmin. Active DB text vs the doc text, per prompt.
  *   POST /api/v1/content-v3/search-data    — requireAdmin. The search data lookup alone (S1–S12).
+ *   POST /api/v1/content-v3/blueprint/preview — requireAdmin. The <blueprint> for given inputs and
+ *                                            pins, no model call (X1–X7).
  *   POST /api/v1/content-v3/research       — requireAdmin. Research alone (R1–R10), optionally
  *                                            after a search data lookup.
  *   POST /api/v1/content-v3/wizard/title   — validateApiAccess (plugin). Search data → Title (W2, W12, W15).
@@ -75,6 +77,7 @@ import { runPlannerStep } from '../services/content-v3-steps/planner.step.js';
 import { livePlannerDeps } from '../services/content-v3-steps/steps.default.js';
 import { liveRegulatedTopics, REGULATED_TOPICS_DEF } from '../services/content-v3/regulated-topics.js';
 import { liveNicheSettings } from '../services/niche-profile/niche-profile.default.js';
+import { createBlueprintRouter } from './content-v3-blueprint.handler.js';
 import { researchBlock } from '../services/content-v3-steps/xml.js';
 
 const researchRequestSchema = z.object({
@@ -93,6 +96,9 @@ const researchRequestSchema = z.object({
 });
 
 const router = Router();
+
+// Blueprint preview for the tester panel (admin, no model call).
+router.use('/', createBlueprintRouter({ auth: requireAdmin }));
 
 // Research alone (admin: tester panel, 10-keyword run). Spends Perplexity money when configured.
 router.post('/research', requireAdmin, async (req: Request, res: Response) => {
