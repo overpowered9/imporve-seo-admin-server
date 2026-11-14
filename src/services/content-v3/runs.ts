@@ -65,6 +65,23 @@ export interface RunsStore {
   bySession(session_key: string, limit?: number): Promise<RunRow[]>;
   /** Deletes runs older than this many days; returns how many. */
   purge(olderThanDays: number): Promise<number>;
+  /**
+   * H2: running rows not touched for staleAfterMs belong to a process that died (a deploy, a
+   * crash): charged ones become refund_pending (the retry loop refunds them), the rest failed.
+   */
+  sweepStale(staleAfterMs: number): Promise<number>;
+  /** Leave: removes the stored answers (the article) of this user's runs of the session. */
+  forgetResponses(userId: number, sessionKey: string): Promise<number>;
+  /** Rows left in `refunding` longer than this: the refund may or may not have gone through. */
+  stuckRefunding(olderThanMs: number): Promise<RunRow[]>;
+}
+
+/** charged / succeeded / failed only move a row that is still running (L2). */
+export class RunNotRunningError extends Error {
+  constructor(readonly id: number) {
+    super(`run ${id} is no longer running (closed by the stale sweep)`);
+    this.name = 'RunNotRunningError';
+  }
 }
 
 export const REQUEST_ID_RE = /^[A-Za-z0-9_-]{8,120}$/;
@@ -117,16 +134,19 @@ export function createMemoryRunsStore(now: () => number = () => Date.now()): Run
       return { kind: 'claimed', id: row.id };
     },
     async charged(id, p) {
-      const r = rows.find((x) => x.id === id);
-      if (r) touch(r, { cost: p.cost, action: p.action, variant: p.variant });
+      const r = rows.find((x) => x.id === id && x.status === 'running');
+      if (!r) throw new RunNotRunningError(id);
+      touch(r, { cost: p.cost, action: p.action, variant: p.variant });
     },
     async succeeded(id, p) {
-      const r = rows.find((x) => x.id === id);
-      if (r) touch(r, { status: 'succeeded', generation_id: p.generation_id, response: structuredClone(p.response), step_costs: { ...p.step_costs }, timings: { ...p.timings } });
+      const r = rows.find((x) => x.id === id && x.status === 'running');
+      if (!r) throw new RunNotRunningError(id);
+      touch(r, { status: 'succeeded', generation_id: p.generation_id, response: structuredClone(p.response), step_costs: { ...p.step_costs }, timings: { ...p.timings } });
     },
     async failed(id, p) {
-      const r = rows.find((x) => x.id === id);
-      if (r) touch(r, { status: p.refund_pending ? 'refund_pending' : r.cost > 0 ? 'refunded' : 'failed', error: p.error.slice(0, 500) });
+      const r = rows.find((x) => x.id === id && x.status === 'running');
+      if (!r) throw new RunNotRunningError(id);
+      touch(r, { status: p.refund_pending ? 'refund_pending' : r.cost > 0 ? 'refunded' : 'failed', error: p.error.slice(0, 500) });
     },
     async takePendingRefunds(limit) {
       const out = rows.filter((r) => r.status === 'refund_pending').slice(0, limit);
@@ -150,6 +170,29 @@ export function createMemoryRunsStore(now: () => number = () => Date.now()): Run
         }
       }
       return n;
+    },
+    async sweepStale(staleAfterMs) {
+      let n = 0;
+      for (const r of rows) {
+        if (r.status === 'running' && now() - Date.parse(r.updated_at) > staleAfterMs) {
+          touch(r, { status: r.cost > 0 ? 'refund_pending' : 'failed', error: 'stale: the process stopped before answering' });
+          n++;
+        }
+      }
+      return n;
+    },
+    async forgetResponses(userId, sessionKey) {
+      let n = 0;
+      for (const r of rows) {
+        if (r.user_id === userId && r.session_key === sessionKey && r.response !== null) {
+          r.response = null;
+          n++;
+        }
+      }
+      return n;
+    },
+    async stuckRefunding(olderThanMs) {
+      return rows.filter((r) => r.status === 'refunding' && now() - Date.parse(r.updated_at) > olderThanMs).map((r) => structuredClone(r));
     },
   };
 }
@@ -227,23 +270,32 @@ export function createPostgresRunsStore(sql: SqlLike): RunsStore {
       return { kind: 'busy' };
     },
     async charged(id, p) {
-      await sql`UPDATE content_v3_runs SET cost = ${p.cost}, action = ${p.action}, variant = ${p.variant}, updated_at = NOW() WHERE id = ${id}`;
+      const rows = await sql`
+        UPDATE content_v3_runs SET cost = ${p.cost}, action = ${p.action}, variant = ${p.variant}, updated_at = NOW()
+         WHERE id = ${id} AND status = 'running'
+        RETURNING id
+      `;
+      if (!rows.length) throw new RunNotRunningError(id);
     },
     async succeeded(id, p) {
-      await sql`
+      const rows = await sql`
         UPDATE content_v3_runs
            SET status = 'succeeded', generation_id = ${p.generation_id}, response = ${JSON.stringify(p.response)}::text::jsonb,
                step_costs = ${JSON.stringify(p.step_costs)}::text::jsonb, timings = ${JSON.stringify(p.timings)}::text::jsonb, updated_at = NOW()
-         WHERE id = ${id}
+         WHERE id = ${id} AND status = 'running'
+        RETURNING id
       `;
+      if (!rows.length) throw new RunNotRunningError(id);
     },
     async failed(id, p) {
-      await sql`
+      const rows = await sql`
         UPDATE content_v3_runs
            SET status = CASE WHEN ${p.refund_pending} THEN 'refund_pending' WHEN cost > 0 THEN 'refunded' ELSE 'failed' END,
                error = ${p.error.slice(0, 500)}, updated_at = NOW()
-         WHERE id = ${id}
+         WHERE id = ${id} AND status = 'running'
+        RETURNING id
       `;
+      if (!rows.length) throw new RunNotRunningError(id);
     },
     async takePendingRefunds(limit) {
       const rows = await sql`
@@ -268,6 +320,32 @@ export function createPostgresRunsStore(sql: SqlLike): RunsStore {
         RETURNING 1
       `;
       return rows.length;
+    },
+    async sweepStale(staleAfterMs) {
+      const staleSeconds = Math.max(1, Math.round(staleAfterMs / 1000));
+      const rows = await sql`
+        UPDATE content_v3_runs
+           SET status = CASE WHEN cost > 0 THEN 'refund_pending' ELSE 'failed' END,
+               error = 'stale: the process stopped before answering', updated_at = NOW()
+         WHERE status = 'running' AND updated_at < NOW() - make_interval(secs => ${staleSeconds})
+        RETURNING 1
+      `;
+      return rows.length;
+    },
+    async forgetResponses(userId, sessionKey) {
+      const rows = await sql`
+        UPDATE content_v3_runs SET response = NULL, updated_at = NOW()
+         WHERE user_id = ${userId} AND session_key = ${sessionKey} AND response IS NOT NULL
+        RETURNING 1
+      `;
+      return rows.length;
+    },
+    async stuckRefunding(olderThanMs) {
+      const secs = Math.max(1, Math.round(olderThanMs / 1000));
+      const rows = await sql`
+        SELECT * FROM content_v3_runs WHERE status = 'refunding' AND updated_at < NOW() - make_interval(secs => ${secs}) ORDER BY id LIMIT 50
+      `;
+      return rows.map(toRow);
     },
   };
 }
@@ -294,13 +372,23 @@ export async function retryPendingRefunds(
   for (const r of rows) {
     try {
       await refund(r.user_id, r.cost, `Refund (retried) — content v3 generation failed: run ${r.id}`, r.website_id ?? undefined);
-      await runs.refundDone(r.id, true);
-      refunded++;
-      log(`[content-v3] refund retried ok run=${r.session_key} id=${r.id} user=${r.user_id} amount=${r.cost}`);
     } catch (err) {
       await runs.refundDone(r.id, false).catch(() => {});
       failed++;
-      log(`[content-v3] REFUND FAILED (will retry) id=${r.id} user=${r.user_id} amount=${r.cost}: ${err instanceof Error ? err.message : String(err)}`);
+      log(`[content-v3] REFUND FAILED (will retry) run=${r.session_key} id=${r.id} user=${r.user_id} amount=${r.cost}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    refunded++;
+    try {
+      await runs.refundDone(r.id, true);
+      log(`[content-v3] refund retried ok run=${r.session_key} id=${r.id} user=${r.user_id} amount=${r.cost}`);
+    } catch (err) {
+      // The credits went back; only the ledger update failed. Never queue it again (that would
+      // refund twice): the row stays `refunding` and is reported for a person to close.
+      log(
+        `[content-v3] REFUND APPLIED, LEDGER NOT UPDATED run=${r.session_key} id=${r.id} user=${r.user_id} amount=${r.cost} — ` +
+          `set this row to refunded by hand; do not retry: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
   return { refunded, failed };

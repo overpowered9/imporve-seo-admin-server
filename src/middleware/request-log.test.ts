@@ -7,6 +7,8 @@ test('content v3 bodies: only the field names reach the log (owner answers, phon
   assert.deepEqual(requestLogBody('/api/v1/content-v3/article', body), { fields: ['session_key', 'owner_answers', 'cta_phone', 'anything_else'] });
   assert.deepEqual(requestLogBody('/api/v1/content-v3/wizard/approve', { title: 'T' }), { fields: ['title'] });
   assert.doesNotMatch(JSON.stringify(requestLogBody('/api/v1/content-v3/article', body)), /300|555|van/);
+  // L6: Express matches routes case-insensitively, so the log does too.
+  assert.deepEqual(requestLogBody('/API/v1/Content-V3/article', { anything_else: 'x' }), { fields: ['anything_else'] });
 });
 
 test('other routes keep the deep redaction, now including cta_phone', () => {

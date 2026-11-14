@@ -21,7 +21,7 @@
 import { randomUUID } from 'node:crypto';
 import { Router, type RequestHandler, type Response } from 'express';
 import { z } from 'zod';
-import { REQUEST_ID_RE, type RunsStore } from '../services/content-v3/runs.js';
+import { REQUEST_ID_RE, RunNotRunningError, type RunsStore } from '../services/content-v3/runs.js';
 import type { QuotaStore } from '../services/content-v3/quota.js';
 import type { AuthenticatedRequest } from '../middleware/apiAuth.middleware.js';
 import { contentV3Enabled, costCeilingUsd } from '../config/content-v3.config.js';
@@ -100,6 +100,8 @@ export interface ContentV3ArticleDeps {
   disclaimerKeys?: () => Promise<string[]>;
   /** B-5: per-minute limiter per account (none = no limit). */
   rateLimit?: RequestHandler;
+  /** M1: false while the v3 tables (migrations 023 and 024) are missing; the article is then refused as v3 off. */
+  ready?: () => Promise<boolean>;
   /** B-5: today's counters; a delivered article raises the free steps' daily allowance. */
   quota?: () => Promise<QuotaStore>;
   env?: NodeJS.ProcessEnv;
@@ -109,7 +111,19 @@ export interface ContentV3ArticleDeps {
 
 export const DEFAULT_ARTICLE_DEADLINE_MS = 480_000;
 /** A running ledger row older than the deadline plus this is from a dead process (B-3). */
-const STALE_GRACE_MS = 60_000;
+export const STALE_GRACE_MS = 60_000;
+
+/**
+ * H2: the article generations this process is running. On shutdown (every deploy and the
+ * rollback itself) they are failed at once, so each request refunds its credits and answers
+ * within the drain window instead of being killed after the charge.
+ */
+const shutdownHooks = new Set<(err: Error) => void>();
+export function abortInFlightArticles(): number {
+  const hooks = [...shutdownHooks];
+  for (const stop of hooks) stop(Object.assign(new Error('the server is restarting'), { status: 503, shutdown: true }));
+  return hooks.length;
+}
 /** The generation promise gets this long past the deadline before the request gives up on it. */
 const DEADLINE_GRACE_MS = 15_000;
 
@@ -165,6 +179,7 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
   router.use(runContext);
   router.post('/article', deps.auth, deps.rateLimit ?? pass, async (req: AuthenticatedRequest, res: Response) => {
     if (!contentV3Enabled(env)) return res.status(409).json(v3ErrorBody(v3Error('v3_disabled')));
+    if (deps.ready && !(await deps.ready().catch(() => false))) return res.status(409).json(v3ErrorBody(v3Error('v3_disabled')));
     const parsed = articleRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json(v3ErrorBody(v3Error('invalid_request', parsed.error.issues[0]?.message ?? 'The request was not valid.')));
@@ -174,228 +189,255 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
     const websiteId = req.website?.id ? Number(req.website.id) : null;
     const lockKey = `${userId}:${b.session_key}`;
     if (inFlight.has(lockKey)) return res.status(409).json(v3ErrorBody(v3Error('already_generating')));
-
-    const store = await deps.store();
-    const session = ((await store.getSession(userId, websiteId ?? 0, b.session_key)) ?? {}) as SessionShape;
-    if (!session.approved?.title || !session.plan) return res.status(409).json(v3ErrorBody(v3Error('session_expired')));
-    const a = session.approved;
-    // W8: a numbered title's minimum size holds on the server too (the wizard greys smaller sizes out).
-    const minimum = session.plan_meta?.minimum_size;
-    if (minimum && SIZES.indexOf(minimum) > SIZES.indexOf(b.post_size)) {
-      const name = { small: 'Small', medium: 'Medium', large: 'Large' }[minimum];
-      return res.status(400).json(v3ErrorBody(v3Error('invalid_request', `This title needs at least a ${name} post to deliver every item. Choose ${name} or larger.`)));
-    }
-    if (a.proof_level === 'regulated' && deps.disclaimerKeys) {
-      const keys = await deps.disclaimerKeys().catch(() => [] as string[]);
-      if (!regulatedV3Allowed(keys, a.niche_key, a.niche_profile)) {
-        log(`[content-v3] article refused run=${b.session_key} reason=regulated_without_disclaimer niche=${a.niche_key ?? '-'}`);
-        return res.status(409).json(v3ErrorBody(v3Error('v3_regulated_disabled')));
-      }
-    }
-
-    // B-3: claim this request in the run ledger before any charge. A finished request with the same
-    // request_id is answered from the ledger (no second charge); another run of this session → 409.
-    const requestId = b.request_id ?? `srv_${randomUUID().replace(/-/g, '')}`;
-    const deadlineMs = deps.deadlineMs ?? DEFAULT_ARTICLE_DEADLINE_MS;
-    let ledgerId: number | null = null;
-    if (deps.runs) {
-      try {
-        const claim = await deps.runs.claim({ user_id: userId, website_id: websiteId, session_key: b.session_key, request_id: requestId, stale_after_ms: deadlineMs + STALE_GRACE_MS });
-        if (claim.kind === 'replay') {
-          log(`[content-v3] article replayed run=${b.session_key} request=${requestId} (no charge)`);
-          return res.json(claim.response);
-        }
-        if (claim.kind === 'busy') return res.status(409).json(v3ErrorBody(v3Error('already_generating')));
-        ledgerId = claim.id;
-      } catch (err) {
-        log(`[content-v3] runs ledger unavailable — using the in-process lock: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
-      }
-    }
-    const ledgerWrite = async (what: string, fn: (runs: RunsStore, id: number) => Promise<void>) => {
-      if (ledgerId === null || !deps.runs) return;
-      await fn(deps.runs, ledgerId).catch((err) => log(`[content-v3] runs ledger ${what} failed id=${ledgerId}: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`));
-    };
-
+    // M1: taken before any await, so two near-simultaneous requests cannot both pass the check.
     inFlight.add(lockKey);
-    const variant = b.post_size;
-    let charged = 0;
-    const startedAt = now();
-    const deadlineAt = startedAt + deadlineMs;
     try {
-      const regen = await deps.billing.isRegeneration(userId, b.session_key);
-      const action = regen ? 'content_regen' : 'content';
-      const cost = deps.billing.price(action, variant);
-      const reservation = await deps.billing.reserve(userId, cost, `Content v3 (${regen ? 'regen' : 'new'}, ${variant}): ${a.seed_keyword.substring(0, 180)}`, websiteId ?? undefined);
-      if (!reservation.ok) {
-        await ledgerWrite('failed', (runs, id) => runs.failed(id, { error: 'insufficient_credits', refund_pending: false }));
-        const s = await deps.billing.shortfall(userId, cost);
-        return res.status(402).json({
-          success: false,
-          error: 'insufficient_credits',
-          message: s.also_affords
-            ? `Not enough credits: this needs ${cost} and you have ${s.available}. Your balance is still enough for ${s.also_affords}.`
-            : `Not enough credits: this needs ${cost} and you have ${s.available}.`,
-          required: cost,
-          available: s.available,
-          shortfall: Math.max(0, cost - s.available),
-          also_affords: s.also_affords,
-        });
+
+      const store = await deps.store();
+      const session = ((await store.getSession(userId, websiteId ?? 0, b.session_key)) ?? {}) as SessionShape;
+      if (!session.approved?.title || !session.plan) return res.status(409).json(v3ErrorBody(v3Error('session_expired')));
+      const a = session.approved;
+      // W8: a numbered title's minimum size holds on the server too (the wizard greys smaller sizes out).
+      const minimum = session.plan_meta?.minimum_size;
+      if (minimum && SIZES.indexOf(minimum) > SIZES.indexOf(b.post_size)) {
+        const name = { small: 'Small', medium: 'Medium', large: 'Large' }[minimum];
+        return res.status(400).json(v3ErrorBody(v3Error('invalid_request', `This title needs at least a ${name} post to deliver every item. Choose ${name} or larger.`)));
       }
-      charged = cost;
-      await ledgerWrite('charged', (runs, id) => runs.charged(id, { cost, action, variant }));
-
-      // C9: the blueprint keeps the last 20 posts of the article's type, so read enough rows to find them.
-      const history = historyFor(await store.recentPosts(userId, websiteId ?? 0, 100));
-      const started = now();
-      const generation = deps.generate(
-        {
-          title: a.title,
-          seed_keyword: a.seed_keyword,
-          language: b.language || a.language || undefined,
-          niche: a.niche_key || a.niche || undefined,
-          niche_profile: a.niche_profile ?? null,
-          reach: a.reach === 'nationwide' ? 'nationwide' : 'local',
-          target_town: a.target_town || undefined,
-          featured_service: a.featured_service || undefined,
-          business_description: a.business_description || undefined,
-          ideal_client: a.ideal_client || undefined,
-          business_name: b.business_name,
-          stand_out: b.stand_out,
-          business_pricing: b.business_pricing,
-          business_proof_level: a.proof_level === 'regulated' ? 'regulated' : 'standard',
-          regulated_suggested: !!session.regulated?.suggested,
-          regulated_choice: b.regulated ?? null,
-          plan: session.plan,
-          title_form: session.title_step?.title === a.title ? session.title_step.form : null,
-          title_items: session.title_step?.title === a.title ? session.title_step.items ?? null : null,
-          research: session.research?.result?.research ?? null,
-          article_type: b.article_type,
-          post_size: variant,
-          point_of_view: b.point_of_view,
-          tone: b.tone,
-          cta: { text: b.cta_text, url: b.cta_url || undefined, phone: b.cta_phone },
-          post_answers: b.owner_answers?.filter((x) => x.answer),
-          anything_else: b.anything_else,
-          history,
-        },
-        { runId: b.session_key, deadlineAt },
-      );
-      // B-3: the model calls stop at the deadline; this bounds anything else that could hang.
-      const r = await withDeadline(generation, Math.max(1_000, deadlineAt - now()) + DEADLINE_GRACE_MS);
-      const processing = now() - started;
-
-      const generationId = await deps.insertGeneration({
-        user_id: userId,
-        website_id: websiteId,
-        parameters: { seed_keyword: a.seed_keyword, title: a.title, niche: a.niche_key || a.niche, post_size: variant, nos_of_words: SIZE_WORDS[variant], article_type: r.article_type, proof_level: r.proof_level, language: b.language || a.language },
-        result: { content: r.content, meta_title: r.meta_title, meta_description: r.meta_description, faq: r.faq, faq_schema: r.faq_schema },
-        metadata: {
-          method: 'claude-v3',
-          model: r.model,
-          prompt_version: r.prompt_version,
-          prompt_versions: r.prompt_versions,
-          picks: r.picks,
-          fingerprint: r.fingerprint,
-          validator: r.validator,
-          needs_review: r.needs_review,
-          repaired: r.repaired,
-          billed: { action, variant, cost },
-        },
-        processing_time_ms: processing,
-        target_key: b.session_key,
-        custom_instruction: b.anything_else || null,
-      });
-
-      await store.recordPost({
-        user_id: userId,
-        website_id: websiteId ?? 0,
-        session_key: b.session_key,
-        bulk_batch: session.bulk_batch ?? null,
-        article_type: r.article_type,
-        post_size: variant,
-        proof_level: r.proof_level,
-        picks: r.picks as unknown as Record<string, unknown>,
-        fingerprint: r.fingerprint,
-        headings: r.headings,
-        validator: r.validator as unknown as Record<string, unknown>,
-      });
-
-      const ledger = createCostLedger();
-      for (const [step, usd] of Object.entries(session.cost ?? {})) ledger.add(step, Number(usd) || 0);
-      ledger.add('writer', r.cost.writer, r.usage.writer as never);
-      ledger.add('meta', r.cost.meta, r.usage.meta as never);
-      log(ledger.line(b.session_key));
-      // D: a warning when one article cost us more than its size's ceiling (billing unchanged).
-      const ceiling = costCeilingUsd(env)[variant];
-      const spent = ledger.total();
-      if (spent !== null && spent > ceiling) {
-        log(`[content-v3] cost over ceiling run=${b.session_key} size=${variant} total=${spent.toFixed(4)} ceiling=${ceiling.toFixed(2)} credits=${cost}`);
+      if (a.proof_level === 'regulated' && deps.disclaimerKeys) {
+        const keys = await deps.disclaimerKeys().catch(() => [] as string[]);
+        if (!regulatedV3Allowed(keys, a.niche_key, a.niche_profile)) {
+          log(`[content-v3] article refused run=${b.session_key} reason=regulated_without_disclaimer niche=${a.niche_key ?? '-'}`);
+          return res.status(409).json(v3ErrorBody(v3Error('v3_regulated_disabled')));
+        }
       }
-      log(`[content-v3] latency run=${b.session_key} route=article ms=${now() - startedAt} writer_ms=${r.timings.writer_ms} meta_ms=${r.timings.meta_ms} writer_attempts=${r.writer_attempts}`);
-      await store.mergeSession(userId, websiteId ?? 0, b.session_key, {
-        last_article: { generation_id: generationId, fingerprint: r.fingerprint, proof_level: r.proof_level, needs_review: r.needs_review },
-      });
 
-      const body = {
-        success: true,
-        data: {
-          generation_id: generationId,
-          title: a.title,
-          content: r.content,
-          meta_title: r.meta_title,
-          meta_description: r.meta_description,
-          faq: r.faq,
-          faq_schema: r.faq_schema,
-          proof_level: r.proof_level,
-          article_type: r.article_type,
-          needs_review: r.needs_review,
-          review: {
-            passed: r.validator.passed,
-            word_count: r.validator.word_count,
-            issues: r.validator.issues.map((i) => ({ code: i.code, severity: i.severity, message: i.message })),
-          },
-        },
-        metadata: {
-          method: 'claude-v3',
-          model: r.model,
-          prompt_version: r.prompt_version,
-          processing_time_ms: processing,
-          cost_usd: ledger.total(),
-          credits: { charged: cost, action, variant, balance_after: reservation.balance_after ?? null },
-        },
+      // B-3: claim this request in the run ledger before any charge. A finished request with the same
+      // request_id is answered from the ledger (no second charge); another run of this session → 409.
+      const requestId = b.request_id ?? `srv_${randomUUID().replace(/-/g, '')}`;
+      const deadlineMs = deps.deadlineMs ?? DEFAULT_ARTICLE_DEADLINE_MS;
+      let ledgerId: number | null = null;
+      if (deps.runs) {
+        try {
+          const claim = await deps.runs.claim({ user_id: userId, website_id: websiteId, session_key: b.session_key, request_id: requestId, stale_after_ms: deadlineMs + STALE_GRACE_MS });
+          if (claim.kind === 'replay') {
+            log(`[content-v3] article replayed run=${b.session_key} request=${requestId} (no charge)`);
+            return res.json(claim.response);
+          }
+          if (claim.kind === 'busy') return res.status(409).json(v3ErrorBody(v3Error('already_generating')));
+          ledgerId = claim.id;
+        } catch (err) {
+          log(`[content-v3] runs ledger unavailable — using the in-process lock: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+        }
+      }
+      const ledgerWrite = async (what: string, fn: (runs: RunsStore, id: number) => Promise<void>) => {
+        if (ledgerId === null || !deps.runs) return;
+        // The charge record decides whether a stopped run is refunded (H2), so it gets a second try.
+        const tries = what === 'charged' ? 2 : 1;
+        for (let t = 1; t <= tries; t++) {
+          try {
+            await fn(deps.runs, ledgerId);
+            return;
+          } catch (err) {
+            if (t === tries || err instanceof RunNotRunningError) {
+              log(`[content-v3] runs ledger ${what} failed id=${ledgerId}: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+              return;
+            }
+          }
+        }
       };
-      // B-3: the answer is kept, so a retry of this click replays it instead of buying it again.
-      await ledgerWrite('succeeded', (runs, id) =>
-        runs.succeeded(id, {
-          generation_id: generationId,
-          response: body,
-          step_costs: { ...(session.cost ?? {}), writer: r.cost.writer ?? 0, meta: r.cost.meta ?? 0 },
-          timings: { total_ms: now() - startedAt, writer_ms: r.timings.writer_ms, meta_ms: r.timings.meta_ms },
-        }),
-      );
-      // B-5: count the delivered article (raises today's allowance for the free steps).
-      if (deps.quota) {
-        await deps
-          .quota()
-          .then((q) => q.countArticle(userId))
-          .catch((err) => log(`[content-v3] article not counted run=${b.session_key}: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`));
-      }
-      return res.json(body);
-    } catch (err) {
-      let refundFailed = false;
-      if (charged > 0) {
-        await deps.billing
-          .refund(userId, charged, `Refund — content v3 generation failed: ${a.seed_keyword.substring(0, 160)}`, websiteId ?? undefined)
-          .catch((e) => {
-            refundFailed = true;
-            log(`[content-v3] REFUND FAILED user=${userId} amount=${charged} (${ledgerId !== null ? 'queued for retry' : 'no ledger: refund by hand'}): ${e instanceof Error ? e.message : String(e)}`);
+
+      const variant = b.post_size;
+      let charged = 0;
+      const startedAt = now();
+      const deadlineAt = startedAt + deadlineMs;
+      try {
+        const regen = await deps.billing.isRegeneration(userId, b.session_key);
+        const action = regen ? 'content_regen' : 'content';
+        const cost = deps.billing.price(action, variant);
+        const reservation = await deps.billing.reserve(userId, cost, `Content v3 (${regen ? 'regen' : 'new'}, ${variant}): ${a.seed_keyword.substring(0, 180)}`, websiteId ?? undefined);
+        if (!reservation.ok) {
+          await ledgerWrite('failed', (runs, id) => runs.failed(id, { error: 'insufficient_credits', refund_pending: false }));
+          const s = await deps.billing.shortfall(userId, cost);
+          return res.status(402).json({
+            success: false,
+            error: 'insufficient_credits',
+            message: s.also_affords
+              ? `Not enough credits: this needs ${cost} and you have ${s.available}. Your balance is still enough for ${s.also_affords}.`
+              : `Not enough credits: this needs ${cost} and you have ${s.available}.`,
+            required: cost,
+            available: s.available,
+            shortfall: Math.max(0, cost - s.available),
+            also_affords: s.also_affords,
           });
+        }
+        charged = cost;
+        await ledgerWrite('charged', (runs, id) => runs.charged(id, { cost, action, variant }));
+
+        // C9: the blueprint keeps the last 20 posts of the article's type, so read enough rows to find them.
+        const history = historyFor(await store.recentPosts(userId, websiteId ?? 0, 100));
+        const started = now();
+        const generation = deps.generate(
+          {
+            title: a.title,
+            seed_keyword: a.seed_keyword,
+            language: b.language || a.language || undefined,
+            niche: a.niche_key || a.niche || undefined,
+            niche_profile: a.niche_profile ?? null,
+            reach: a.reach === 'nationwide' ? 'nationwide' : 'local',
+            target_town: a.target_town || undefined,
+            featured_service: a.featured_service || undefined,
+            business_description: a.business_description || undefined,
+            ideal_client: a.ideal_client || undefined,
+            business_name: b.business_name,
+            stand_out: b.stand_out,
+            business_pricing: b.business_pricing,
+            business_proof_level: a.proof_level === 'regulated' ? 'regulated' : 'standard',
+            regulated_suggested: !!session.regulated?.suggested,
+            regulated_choice: b.regulated ?? null,
+            plan: session.plan,
+            title_form: session.title_step?.title === a.title ? session.title_step.form : null,
+            title_items: session.title_step?.title === a.title ? session.title_step.items ?? null : null,
+            research: session.research?.result?.research ?? null,
+            article_type: b.article_type,
+            post_size: variant,
+            point_of_view: b.point_of_view,
+            tone: b.tone,
+            cta: { text: b.cta_text, url: b.cta_url || undefined, phone: b.cta_phone },
+            post_answers: b.owner_answers?.filter((x) => x.answer),
+            anything_else: b.anything_else,
+            history,
+          },
+          { runId: b.session_key, deadlineAt },
+        );
+        // H2: a shutdown fails this request at once (the catch refunds), instead of the process dying after the charge.
+        let stop: (err: Error) => void = () => {};
+        const stopped = new Promise<never>((_resolve, reject) => {
+          stop = reject;
+        });
+        shutdownHooks.add(stop);
+        // B-3: the model calls stop at the deadline; this bounds anything else that could hang.
+        const r = await withDeadline(Promise.race([generation, stopped]), Math.max(1_000, deadlineAt - now()) + DEADLINE_GRACE_MS).finally(() => {
+          shutdownHooks.delete(stop);
+        });
+        const processing = now() - started;
+
+        const generationId = await deps.insertGeneration({
+          user_id: userId,
+          website_id: websiteId,
+          parameters: { seed_keyword: a.seed_keyword, title: a.title, niche: a.niche_key || a.niche, post_size: variant, nos_of_words: SIZE_WORDS[variant], article_type: r.article_type, proof_level: r.proof_level, language: b.language || a.language },
+          result: { content: r.content, meta_title: r.meta_title, meta_description: r.meta_description, faq: r.faq, faq_schema: r.faq_schema },
+          metadata: {
+            method: 'claude-v3',
+            model: r.model,
+            prompt_version: r.prompt_version,
+            prompt_versions: r.prompt_versions,
+            picks: r.picks,
+            fingerprint: r.fingerprint,
+            validator: r.validator,
+            needs_review: r.needs_review,
+            repaired: r.repaired,
+            billed: { action, variant, cost },
+          },
+          processing_time_ms: processing,
+          target_key: b.session_key,
+          custom_instruction: b.anything_else || null,
+        });
+
+        await store.recordPost({
+          user_id: userId,
+          website_id: websiteId ?? 0,
+          session_key: b.session_key,
+          bulk_batch: session.bulk_batch ?? null,
+          article_type: r.article_type,
+          post_size: variant,
+          proof_level: r.proof_level,
+          picks: r.picks as unknown as Record<string, unknown>,
+          fingerprint: r.fingerprint,
+          headings: r.headings,
+          validator: r.validator as unknown as Record<string, unknown>,
+        });
+
+        const ledger = createCostLedger();
+        for (const [step, usd] of Object.entries(session.cost ?? {})) ledger.add(step, Number(usd) || 0);
+        ledger.add('writer', r.cost.writer, r.usage.writer as never);
+        ledger.add('meta', r.cost.meta, r.usage.meta as never);
+        log(ledger.line(b.session_key));
+        // D: a warning when one article cost us more than its size's ceiling (billing unchanged).
+        const ceiling = costCeilingUsd(env)[variant];
+        const spent = ledger.total();
+        if (spent !== null && spent > ceiling) {
+          log(`[content-v3] cost over ceiling run=${b.session_key} size=${variant} total=${spent.toFixed(4)} ceiling=${ceiling.toFixed(2)} credits=${cost}`);
+        }
+        log(`[content-v3] latency run=${b.session_key} route=article ms=${now() - startedAt} writer_ms=${r.timings.writer_ms} meta_ms=${r.timings.meta_ms} writer_attempts=${r.writer_attempts}`);
+        await store.mergeSession(userId, websiteId ?? 0, b.session_key, {
+          last_article: { generation_id: generationId, fingerprint: r.fingerprint, proof_level: r.proof_level, needs_review: r.needs_review },
+        });
+
+        const body = {
+          success: true,
+          data: {
+            generation_id: generationId,
+            title: a.title,
+            content: r.content,
+            meta_title: r.meta_title,
+            meta_description: r.meta_description,
+            faq: r.faq,
+            faq_schema: r.faq_schema,
+            proof_level: r.proof_level,
+            article_type: r.article_type,
+            needs_review: r.needs_review,
+            review: {
+              passed: r.validator.passed,
+              word_count: r.validator.word_count,
+              issues: r.validator.issues.map((i) => ({ code: i.code, severity: i.severity, message: i.message })),
+            },
+          },
+          metadata: {
+            method: 'claude-v3',
+            model: r.model,
+            prompt_version: r.prompt_version,
+            processing_time_ms: processing,
+            cost_usd: ledger.total(),
+            credits: { charged: cost, action, variant, balance_after: reservation.balance_after ?? null },
+          },
+        };
+        // B-3: the answer is kept, so a retry of this click replays it instead of buying it again.
+        await ledgerWrite('succeeded', (runs, id) =>
+          runs.succeeded(id, {
+            generation_id: generationId,
+            response: body,
+            step_costs: { ...(session.cost ?? {}), writer: r.cost.writer ?? 0, meta: r.cost.meta ?? 0 },
+            timings: { total_ms: now() - startedAt, writer_ms: r.timings.writer_ms, meta_ms: r.timings.meta_ms },
+          }),
+        );
+        // B-5: count the delivered article (raises today's allowance for the free steps).
+        if (deps.quota) {
+          await deps
+            .quota()
+            .then((q) => q.countArticle(userId))
+            .catch((err) => log(`[content-v3] article not counted run=${b.session_key}: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`));
+        }
+        return res.json(body);
+      } catch (err) {
+        let refundFailed = false;
+        if (charged > 0) {
+          await deps.billing
+            .refund(userId, charged, `Refund — content v3 generation failed: ${a.seed_keyword.substring(0, 160)}`, websiteId ?? undefined)
+            .catch((e) => {
+              refundFailed = true;
+              log(`[content-v3] REFUND FAILED user=${userId} amount=${charged} (${ledgerId !== null ? 'queued for retry' : 'no ledger: refund by hand'}): ${e instanceof Error ? e.message : String(e)}`);
+            });
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        await ledgerWrite('failed', (runs, id) => runs.failed(id, { error: message, refund_pending: refundFailed }));
+        log(`[content-v3] article failed run=${b.session_key} refunded=${refundFailed ? 0 : charged}: ${message}`);
+        const e = (err as { shutdown?: boolean }).shutdown
+          ? v3Error('service_unavailable', 'The server restarted while writing this article. Your credits were refunded. Please try again in a minute.')
+          : toV3UserError(err);
+        return res.status(e.status).json(v3ErrorBody(e));
+      } finally {
+        inFlight.delete(lockKey);
       }
-      const message = err instanceof Error ? err.message : String(err);
-      await ledgerWrite('failed', (runs, id) => runs.failed(id, { error: message, refund_pending: refundFailed }));
-      log(`[content-v3] article failed run=${b.session_key} refunded=${refundFailed ? 0 : charged}: ${message}`);
-      const e = toV3UserError(err);
-      return res.status(e.status).json(v3ErrorBody(e));
     } finally {
       inFlight.delete(lockKey);
     }

@@ -87,9 +87,11 @@ describe('POST /session/clear', () => {
       app = null;
       await prev.close();
     }
+    const answers: Array<[number, string]> = [];
     app = await startTestApp([['/api/v1/content-v3', createContentV3PluginRouter({
       auth: fakeAuth, store: async () => store, env: {}, log: () => {},
       forgetArticles: async (u, k) => { forgotten.push([u, k]); return 1; },
+      forgetRunResponses: async (u, k) => { answers.push([u, k]); return 1; },
     })]]);
     const post = { user_id: 5, website_id: 9, session_key: KEY, picks: {}, headings: [] };
     await store.recordPost(post);
@@ -100,6 +102,19 @@ describe('POST /session/clear', () => {
     assert.equal(r.status, 200);
     assert.equal((await store.recentPosts(5, 9, 10)).length, 0);
     assert.deepEqual(forgotten, [[5, KEY]]);
+    assert.deepEqual(answers, [[5, KEY]], 'M2: the stored answer in the run ledger goes too');
+  });
+
+  test('M1: switched on but its tables missing → status says off (every site stays on v2)', async () => {
+    if (app) {
+      const prev = app;
+      app = null;
+      await prev.close();
+    }
+    app = await startTestApp([['/api/v1/content-v3', createContentV3PluginRouter({ auth: fakeAuth, store: async () => createMemoryContentV3Store(), env: { CONTENT_V3_ENABLED: 'true' }, log: () => {}, ready: async () => false })]]);
+    const r = await app.get('/api/v1/content-v3/status', { 'x-api-key': 'good' });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.data.enabled, false);
   });
 
   test('a malformed key is a plain 400', async () => {

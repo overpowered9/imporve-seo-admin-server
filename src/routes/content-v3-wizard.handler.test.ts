@@ -413,6 +413,25 @@ describe('B-5: daily allowance for the free steps', () => {
     assert.equal(quota.counts.size, 0);
   });
 
+  test('M1: with the v3 tables missing the steps answer v3 off', async () => {
+    const store = createMemoryContentV3Store();
+    const router = createContentV3WizardRouter({
+      auth: fakePluginAuth({ id: 5 }, { id: 9 }),
+      rateLimit: (_req, _res, next) => next(),
+      store: async () => store,
+      searchData: async () => SD,
+      runTitle: async () => titleResult('x'),
+      locations: staticLocationIndexProvider(INDEX),
+      env: ON,
+      ready: async () => false,
+      log: () => {},
+    });
+    app = await startTestApp([['/api/v1/content-v3', router]]);
+    const r = await app.post('/api/v1/content-v3/wizard/title', BODY, PLUGIN_HEADERS);
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error, 'v3_disabled');
+  });
+
   test('GET /niches answers only while v3 is on', async () => {
     const off = await startGuarded({ env: {} });
     const r = await off.app.get('/api/v1/content-v3/niches', PLUGIN_HEADERS);

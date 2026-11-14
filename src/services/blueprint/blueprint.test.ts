@@ -221,6 +221,15 @@ describe('numbered titles (B6)', () => {
     assert.equal(numberedFromTitle('7 signs your water heater is failing', 'question', null), null, 'the Title step said not numbered');
   });
 
+  test('M3 / C13: with no price, the line that demands a figure is left out and the no-figure piece follows', () => {
+    const r = buildBlueprint({ ...BASE, priceAvailable: false, rng: mulberry32(4) });
+    assert.equal(r.picks.no_figure, true);
+    assert.doesNotMatch(r.block, /At least one figure/);
+    assert.match(r.block, /COST GUIDE, NO FIGURE AVAILABLE\nReplace the price range with how pricing works/);
+    const priced = buildBlueprint({ ...BASE, priceAvailable: true, rng: mulberry32(4) });
+    assert.match(priced.block, /At least one figure, from <research> or the business details\./);
+  });
+
   test('B8: a price is a currency amount, before or after the number; a weight is not', () => {
     for (const t of ['$300 to $450', 'about € 90', 'USD 300', '300 €', '1,200 dollars', '90 euros', '120 GBP', '£85 call-out']) assert.equal(priceAvailable([t]), true, t);
     for (const t of ['a 50 pounds bag of salt', 'takes 2 hours', '15 years', null]) assert.equal(priceAvailable([t]), false, String(t));

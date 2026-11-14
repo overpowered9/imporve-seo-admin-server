@@ -1,7 +1,7 @@
 import { test, describe, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { startTestApp, fakePluginAuth, PLUGIN_HEADERS, type TestApp } from '../test/helpers/http-app.js';
-import { createContentV3ArticleRouter, regulatedV3Allowed, type BillingDeps, type GenerationRow } from './content-v3-article.handler.js';
+import { abortInFlightArticles, createContentV3ArticleRouter, regulatedV3Allowed, type BillingDeps, type GenerationRow } from './content-v3-article.handler.js';
 import { createMemoryContentV3Store } from '../services/content-v3/store.js';
 import { createMemoryRunsStore, retryPendingRefunds, type RunsStore } from '../services/content-v3/runs.js';
 import { createMemoryQuotaStore, type QuotaStore } from '../services/content-v3/quota.js';
@@ -38,7 +38,7 @@ afterEach(async () => {
   await a?.close();
 });
 
-async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, unknown> | null; generate?: (i: ArticleV3Input) => Promise<ArticleV3Result>; regen?: boolean; reserveOk?: boolean; disclaimerKeys?: string[]; runs?: RunsStore; deadlineMs?: number; refundFails?: boolean; quota?: QuotaStore; rateLimit?: RequestHandler } = {}) {
+async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, unknown> | null; generate?: (i: ArticleV3Input) => Promise<ArticleV3Result>; regen?: boolean; reserveOk?: boolean; disclaimerKeys?: string[]; runs?: RunsStore; deadlineMs?: number; refundFails?: boolean; quota?: QuotaStore; rateLimit?: RequestHandler; ready?: () => Promise<boolean> } = {}) {
   const store = createMemoryContentV3Store();
   if (opts.session !== null) await store.mergeSession(7, 3, KEY, opts.session ?? SESSION);
   const events: string[] = [];
@@ -78,6 +78,7 @@ async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, u
     deadlineMs: opts.deadlineMs,
     quota: opts.quota ? async () => opts.quota! : undefined,
     rateLimit: opts.rateLimit,
+    ready: opts.ready,
   });
   app = await startTestApp([['/api/v1/content-v3', router]]);
   return { app, store, events, rows, inputs, logs };
@@ -245,6 +246,45 @@ describe('POST /content-v3/article', () => {
     assert.equal(r.status, 200);
     assert.deepEqual(events, ['reserve:10', 'generate']);
     assert.match(logs.join('\n'), /runs ledger unavailable — using the in-process lock/);
+  });
+
+  test('H2: a shutdown fails an article in progress at once: refunded, with a plain message', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { app, events } = await start({ generate: async () => { await gate; return result(); } });
+    const pending = app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);
+    for (let i = 0; i < 200 && !events.includes('generate'); i++) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(abortInFlightArticles(), 1);
+    const r = await pending;
+    assert.equal(r.status, 503);
+    assert.match(r.body.message, /restarted .* credits were refunded/);
+    assert.deepEqual(events, ['reserve:10', 'generate', 'refund:10']);
+    assert.equal(abortInFlightArticles(), 0, 'nothing left registered');
+    release();
+  });
+
+  test('M1: with the v3 tables missing the article answers v3 off, before anything', async () => {
+    const { app, events } = await start({ ready: async () => false });
+    const r = await app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error, 'v3_disabled');
+    assert.deepEqual(events, []);
+  });
+
+  test('M1: two requests at the same moment without the ledger: one runs, the other is refused', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { app, events } = await start({ generate: async () => { await gate; return result(); } });
+    const a = app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);
+    const b = app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);
+    // Whichever arrives second must be refused while the first is still writing (never wait on it).
+    const tooLong = new Promise<{ status: number }>((r) => setTimeout(() => r({ status: -1 }), 5000));
+    const first = await Promise.race([a.then((x) => ({ who: 'a', x })), b.then((x) => ({ who: 'b', x })), tooLong.then((x) => ({ who: 'none', x }))]);
+    assert.equal(first.x.status, 409, 'the second request is refused at once');
+    release();
+    const other = await (first.who === 'a' ? b : a);
+    assert.equal(other.status, 200);
+    assert.deepEqual(events.filter((e) => e.startsWith('reserve')), ['reserve:10'], 'charged once');
   });
 
   test('D: an article that cost more than its size\'s ceiling logs a warning (billing unchanged)', async () => {

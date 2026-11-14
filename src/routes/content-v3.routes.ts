@@ -85,7 +85,7 @@ import { liveRegulatedTopics, REGULATED_TOPICS_DEF } from '../services/content-v
 import { liveNicheSettings } from '../services/niche-profile/niche-profile.default.js';
 import { createBlueprintRouter } from './content-v3-blueprint.handler.js';
 import { createTrailRouter } from './content-v3-trail.handler.js';
-import { createContentV3ArticleRouter } from './content-v3-article.handler.js';
+import { createContentV3ArticleRouter, STALE_GRACE_MS } from './content-v3-article.handler.js';
 import { liveGenerateArticle } from '../services/writer/article.default.js';
 import { isContentV3Regeneration } from '../services/generation-history.js';
 import { reserveCredits, refundCredits, getLiveBalance, ISEO_CREDIT_TYPE } from '../models/user.models.js';
@@ -137,12 +137,46 @@ const lazyRuns: RunsStore = {
   refundDone: async (id, ok) => (await getContentV3Runs()).refundDone(id, ok),
   bySession: async (k, n) => (await getContentV3Runs()).bySession(k, n),
   purge: async (d) => (await getContentV3Runs()).purge(d),
+  sweepStale: async (ms) => (await getContentV3Runs()).sweepStale(ms),
+  forgetResponses: async (u, k) => (await getContentV3Runs()).forgetResponses(u, k),
+  stuckRefunding: async (ms) => (await getContentV3Runs()).stuckRefunding(ms),
 };
+
+/**
+ * M1: v3 needs its tables. While migration 023 (sessions, post history) or 024 (run ledger, daily
+ * counters) is missing, /status says v3 is off and the v3 routes answer v3_disabled, so every site
+ * stays on v2 instead of failing at the paid step. Checked at most once a minute; local development
+ * with CONTENT_V3_STORE=memory needs no tables.
+ */
+let readyCache: { at: number; ok: boolean } | null = null;
+async function v3TablesReady(): Promise<boolean> {
+  if (process.env.CONTENT_V3_STORE === 'memory') return true;
+  if (readyCache && Date.now() - readyCache.at < 60_000) return readyCache.ok;
+  let ok = false;
+  try {
+    const rows = await sql`
+      SELECT to_regclass('public.content_v3_sessions') IS NOT NULL AS sessions,
+             to_regclass('public.content_v3_posts') IS NOT NULL AS posts,
+             to_regclass('public.content_v3_runs') IS NOT NULL AS runs,
+             to_regclass('public.content_v3_quota') IS NOT NULL AS quota
+    `;
+    const r = rows[0] ?? {};
+    ok = !!(r.sessions && r.posts && r.runs && r.quota);
+    if (!ok && (!readyCache || readyCache.ok)) {
+      console.warn(`[content-v3] switched on but its tables are missing (sessions=${!!r.sessions} posts=${!!r.posts} runs=${!!r.runs} quota=${!!r.quota}): apply migrations 023 and 024; v3 is reported off until then`);
+    }
+  } catch (err) {
+    console.warn(`[content-v3] could not check the v3 tables, v3 reported off: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+  }
+  readyCache = { at: Date.now(), ok };
+  return ok;
+}
 const refundV3 = async (userId: number, cost: number, reason: string, websiteId?: number) => {
   await refundCredits(userId, ISEO_CREDIT_TYPE, cost, reason, websiteId);
 };
-// Refunds that failed are retried every 10 minutes while v3 is on.
-if (contentV3Enabled()) startRunsHousekeeping(refundV3);
+// H2: stopped runs are swept and failed refunds retried every 10 minutes, whether v3 is on or not
+// (a rollback must still refund what it interrupted).
+startRunsHousekeeping(refundV3, { staleAfterMs: contentV3Config().articleDeadlineMs + STALE_GRACE_MS });
 
 // The paid v3 article (plugin auth). Same price and reserve/refund path as v2's /content-v2/article.
 router.use(
@@ -175,6 +209,7 @@ router.use(
     },
     disclaimerKeys: liveDisclaimerKeys,
     runs: lazyRuns,
+    ready: v3TablesReady,
     deadlineMs: contentV3Config().articleDeadlineMs,
     // B-5: credits already bound the article; this stops a client hammering the route.
     rateLimit: rateLimitPerUser({ limit: 30, windowMs: 60_000, keyPrefix: 'content-v3-article', message: 'Too many requests in a short time. Please wait a minute and try again.' }),
@@ -243,6 +278,7 @@ router.use(
     countryIso: searchDataConfig().countryIso,
     // B-5: daily allowance per free step, tied to the articles generated that day.
     freeStepGuard: (step) => freeStepGuard(step, getContentV3Quota, { limits: freeStepLimits() }),
+    ready: v3TablesReady,
     titleDeadlineMs: contentV3Config().titleDeadlineMs,
     approveDeadlineMs: contentV3Config().approveDeadlineMs,
   }),
@@ -259,6 +295,8 @@ router.use(
     auth: validateApiAccessWithoutStamp,
     store: getContentV3Store,
     disclaimerKeys: liveDisclaimerKeys,
+    ready: v3TablesReady,
+    forgetRunResponses: (userId, sessionKey) => lazyRuns.forgetResponses(userId, sessionKey),
     // Leave (W10): the unsubmitted article's text goes; the row, its billing and its status stay
     // (so a later regeneration in the same slot is still priced as one). Written exactly as the
     // insert above writes `result` (same parameter, no cast), so readers see the same encoding.
@@ -417,7 +455,9 @@ router.post('/article/test', requireAdmin, async (req: Request, res: Response) =
 
   const prof = params!.business_profile ?? {};
   const reach: 'local' | 'nationwide' = prof.is_local === false ? 'nationwide' : 'local';
-  const pov = ['we', 'i', 'business_name'].includes(req.body?.point_of_view) ? req.body.point_of_view : 'we';
+  // X6: Auto (no pin) means the Business details point of view, sent by the tester as business_pov.
+  const POVS = ['we', 'i', 'business_name'];
+  const pov = POVS.includes(req.body?.point_of_view) ? req.body.point_of_view : POVS.includes(req.body?.business_pov) ? req.body.business_pov : 'we';
   const tone = typeof req.body?.tone === 'string' && req.body.tone.trim() ? req.body.tone.trim().slice(0, 40)
     : typeof params!.niche_data?.preferred_tone === 'string' ? String(params!.niche_data.preferred_tone).slice(0, 40) : undefined;
   const seed = params!.seed !== undefined && /^-?\d+$/.test(params!.seed) ? Number(params!.seed) : undefined;

@@ -103,3 +103,8 @@ test('R7: runModelCall puts the spend of attempts that all failed on the StepFai
   assert.equal(n, 2);
   assert.equal(err.cost_usd, 0.04);
 });
+
+test('L5: Retry-After is read from a fetch Response\'s headers too (Perplexity)', () => {
+  const err = Object.assign(new Error('perplexity http 429'), { status: 429, headers: new Headers({ 'retry-after': '7' }) });
+  assert.equal(retryDelayMs(err, 1, { baseMs: 1000, maxMs: 30_000 } as any, () => 0.5), 7000);
+});

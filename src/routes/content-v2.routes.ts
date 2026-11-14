@@ -35,6 +35,7 @@ import {
 import { variantFromWords } from '../services/content-blueprint.js';
 import sql from '../data/db.js';
 import { config } from '../config/config.js';
+import { modelCostUsd } from '../services/model-pricing.js';
 
 const router = Router();
 
@@ -343,6 +344,14 @@ router.post('/image', validateApiAccess, async (req: AuthenticatedRequest, res: 
     const img = await generateOpenAiImage({ ...params!, custom_instruction: customInstruction ?? undefined });
     const hostedUrl = await uploadImageToSupabase(img.b64); // best-effort; null if not configured
     const processingTime = Date.now() - start;
+    // OPS3 (Content v3): the image's cost line, tagged with the wizard run it belongs to (the image
+    // slot is "<run>:image"). Log only; cost_usd stays null until the image model's price is in
+    // MODEL_PRICES_JSON.
+    const imageUsage = (img.usage ?? {}) as { input_tokens?: number; output_tokens?: number };
+    console.log(
+      `[image] run=${String(targetKey ?? '-').replace(/:image$/, '')} model=${img.model} in=${Number(imageUsage.input_tokens) || 0} ` +
+        `out=${Number(imageUsage.output_tokens) || 0} cost_usd=${modelCostUsd(img.model, img.usage as never) ?? 'null'} ms=${processingTime}`,
+    );
 
     const generationRecord = await sql`
       INSERT INTO user_generations (user_id, website_id, type, status, parameters, result, metadata, processing_time_ms, target_key, custom_instruction)

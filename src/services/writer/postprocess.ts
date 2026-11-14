@@ -167,9 +167,17 @@ export function sanitizeArticle(html: string, opts: { ctaUrl?: string | null } =
     }
   }
 
+  // Straight quotes and apostrophes, never curly (<rules_formatting>), in text nodes only: an
+  // attribute (the CTA link's href) is never touched (L4).
+  const straighten = (node: any): void => {
+    if (node.type === 'text') {
+      node.data = String(node.data).replace(/[‘’‛′]/g, "'").replace(/[“”‟″]/g, '"');
+      return;
+    }
+    for (const child of node.children ?? []) straighten(child);
+  };
+  straighten($.root()[0]);
   let out = $.html();
-  // Straight quotes and apostrophes, never curly (<rules_formatting>). Text only, so attributes are safe.
-  out = out.replace(/[‘’‛′]/g, "'").replace(/[“”‟″]/g, '"');
   out = out.replace(/<p>\s*<\/p>/g, '').replace(/\n{3,}/g, '\n\n').trim();
   return { html: out, report };
 }

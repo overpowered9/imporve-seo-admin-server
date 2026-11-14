@@ -37,6 +37,10 @@ export interface ContentV3PluginDeps {
   disclaimerKeys?: () => Promise<string[]>;
   /** Leave: blanks the article text of this session's content_v3 generation rows; returns how many. */
   forgetArticles?: (userId: number, sessionKey: string) => Promise<number>;
+  /** Leave (M2): removes the stored answer (the article) from this session's run ledger rows. */
+  forgetRunResponses?: (userId: number, sessionKey: string) => Promise<number>;
+  /** M1: false while the v3 tables (migrations 023 and 024) are missing; status then says v3 is off. */
+  ready?: () => Promise<boolean>;
   env?: NodeJS.ProcessEnv;
   log?: (line: string) => void;
 }
@@ -48,10 +52,12 @@ export function createContentV3PluginRouter(deps: ContentV3PluginDeps): Router {
   router.get('/status', deps.auth, async (_req: AuthenticatedRequest, res: Response) => {
     // A3: unreadable disclaimer settings answer an empty list, which keeps Regulated businesses on v2.
     const disclaimerNiches = deps.disclaimerKeys ? await deps.disclaimerKeys().catch(() => [] as string[]) : [];
+    // M1: switched on but its tables are missing → reported off, so every site stays on v2.
+    const enabled = contentV3Enabled(env) && (deps.ready ? await deps.ready().catch(() => false) : true);
     res.json({
       success: true,
       data: {
-        enabled: contentV3Enabled(env),
+        enabled,
         keyword_data: keywordDataFlagOn(env) && keywordDataConfigured(env),
         disclaimer_niches: disclaimerNiches,
       },
@@ -72,7 +78,8 @@ export function createContentV3PluginRouter(deps: ContentV3PluginDeps): Router {
     if (parsed.data.left) {
       const posts = await store.deletePosts(userId, websiteId, key);
       const blanked = deps.forgetArticles ? await deps.forgetArticles(userId, key).catch(() => -1) : 0;
-      left = ` left=1 post_rows=${posts ? 'deleted' : 'kept'} articles_blanked=${blanked}`;
+      const answers = deps.forgetRunResponses ? await deps.forgetRunResponses(userId, key).catch(() => -1) : 0;
+      left = ` left=1 post_rows=${posts ? 'deleted' : 'kept'} articles_blanked=${blanked} stored_answers_removed=${answers}`;
     }
     log(`[content-v3] session cleared run=${key} user=${userId} website=${websiteId} ok=${cleared}${left}`);
     return res.json({ success: true, cleared });

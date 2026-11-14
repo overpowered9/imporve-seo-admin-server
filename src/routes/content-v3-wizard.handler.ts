@@ -122,6 +122,8 @@ export interface ContentV3WizardDeps {
   countryIso?: string;
   /** B-5: the daily allowance guard per free step (none = no allowance check). */
   freeStepGuard?: (step: 'title' | 'town_check' | 'approve') => RequestHandler;
+  /** M1: false while the v3 tables (migrations 023 and 024) are missing; the steps then answer v3 off. */
+  ready?: () => Promise<boolean>;
   /** B-3: request budgets below the plugin's waits (240 s title, 420 s approve). */
   titleDeadlineMs?: number;
   approveDeadlineMs?: number;
@@ -150,8 +152,9 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
   const approveMs = deps.approveDeadlineMs ?? DEFAULT_APPROVE_DEADLINE_MS;
   const router = Router();
 
-  const requireV3: RequestHandler = (_req, res, next) => {
+  const requireV3: RequestHandler = async (_req, res, next) => {
     if (!contentV3Enabled(env)) return res.status(409).json(v3ErrorBody(v3Error('v3_disabled')));
+    if (deps.ready && !(await deps.ready().catch(() => false))) return res.status(409).json(v3ErrorBody(v3Error('v3_disabled')));
     next();
   };
   // D: every log line of a wizard request (search data, DataForSEO, keyword data) carries run=<key>.

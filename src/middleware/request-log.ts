@@ -47,7 +47,8 @@ export function redactBody(body: unknown, depth = 0): unknown {
   return out;
 }
 
-const FIELD_NAMES_ONLY = /^\/api\/v1\/content-v3(?:\/|$)/;
+// Case-insensitive, as Express routes are (L6).
+const FIELD_NAMES_ONLY = /^\/api\/v1\/content-v3(?:\/|$)/i;
 
 /** The body as the request log line shows it. */
 export function requestLogBody(path: string, body: unknown): unknown {

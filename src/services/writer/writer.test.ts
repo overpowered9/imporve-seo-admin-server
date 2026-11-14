@@ -175,6 +175,14 @@ describe('parse, sanitize, link, TOC, disclaimer, FAQ', () => {
     assert.equal(sanitizeArticle(input).html, '<h2>T</h2><p>x <strong>y</strong> <em>z</em></p><h2 data-iseo="body">H</h2><h2>H2</h2><h3>sub</h3>jcall');
   });
 
+  test('L4: curly quotes become straight in the text only; a CTA link with them keeps its href', () => {
+    const cta = 'mailto:info@acme.example?subject=“Quote”';
+    const { html } = sanitizeArticle(`<p>We’re “fast” — <a href="${cta}">email us</a>.</p>`, { ctaUrl: cta });
+    assert.match(html, /<p>We're "fast"/);
+    assert.match(html, /href="mailto:info@acme\.example\?subject=/);
+    assert.doesNotMatch(html, /subject="Quote"/, 'no straight quote inside the attribute');
+  });
+
   test('B-4: links the model invents are unwrapped; the CTA is kept in its normalized form', () => {
     const cta = 'https://acme.example/book';
     const { html } = sanitizeArticle('<p>Book <a href="https://acme.example/book">here</a> or see <a href="https://competitor.example/">them</a> or <a href="mailto:x@y.z">mail</a>.</p>', { ctaUrl: cta });

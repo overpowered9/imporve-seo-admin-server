@@ -21,6 +21,7 @@ import { startLedgerMonitor } from './services/billing/ledger-monitor.js';
 import { startEmailWorker } from './services/billing/email-worker.js';
 import sql from './data/db.js';
 import { requestLogBody } from './middleware/request-log.js';
+import { abortInFlightArticles } from './routes/content-v3-article.handler.js';
 
 dotenv.config();
 
@@ -149,6 +150,10 @@ async function startServer() {
       if (shuttingDown) return;
       shuttingDown = true;
       console.log(`\n${signal} received — draining connections…`);
+      // H2: v3 articles still being written are failed now, so each one refunds its credits and
+      // answers before the drain ends, instead of the process dying after the charge.
+      const aborted = abortInFlightArticles();
+      if (aborted) console.log(`[content-v3] shutdown: ${aborted} article(s) in progress stopped and refunded`);
       server.close((err) => {
         if (err) {
           console.error('Error during server close:', err);

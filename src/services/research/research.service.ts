@@ -267,7 +267,8 @@ export function perplexityProviderCall(cfg: ResearchConfig, body: Record<string,
     }
     if (!res.ok || !json) {
       // Status only; a provider's error body never reaches a log line or a user.
-      throw Object.assign(new Error(`perplexity http ${res.status}`), { status: res.status });
+      // The headers ride along so a 429's Retry-After is honoured (L5).
+      throw Object.assign(new Error(`perplexity http ${res.status}`), { status: res.status, headers: res.headers });
     }
     const u = json.usage ?? {};
     const usage = {

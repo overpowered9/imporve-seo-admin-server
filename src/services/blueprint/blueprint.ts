@@ -540,6 +540,9 @@ function typePieceFor(p: BlueprintPicks, pieces: Readonly<Record<string, string>
       return !m || want.has(m[1].toLowerCase());
     });
   }
+  // M3 / C13: with no price available, the one line that demands a figure goes; the no-figure piece
+  // below says what replaces the price range. Every other line stays the doc's text.
+  if (p.no_figure) lines = lines.filter((l) => !/^At least one figure\b/.test(l));
   let text = lines.join('\n');
   if (p.no_figure) {
     // "Cost guide, no figure available": sent after the Cost guide piece; the header's developer
