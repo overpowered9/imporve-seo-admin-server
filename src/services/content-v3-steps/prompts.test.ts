@@ -12,8 +12,7 @@ import {
   PLANNER_SYSTEM_V1,
   PLANNER_SYSTEM_V2_KEYWORD_DATA,
   PLANNER_KEYWORD_DATA_SECTION,
-  PLANNER_OUTPUT_V1_TAIL,
-  PLANNER_OUTPUT_V2_TAIL,
+  PLANNER_KEYWORD_DATA_JSON_SENTENCE,
   V3_STEP_PROMPT_DEFS,
   fallbackStepPromptResolver,
 } from './prompts.js';
@@ -56,20 +55,22 @@ describe('V2 = V1 + exactly the contract rules', () => {
 
   test('Title V2 carries the four rules, before BEFORE YOU ANSWER, and nothing else changes', () => {
     for (const rule of TITLE_RULES) assert.ok(TITLE_SYSTEM_V2_KEYWORD_DATA.includes(rule), rule);
-    assert.ok(TITLE_SYSTEM_V2_KEYWORD_DATA.indexOf('KEYWORD DATA') < TITLE_SYSTEM_V2_KEYWORD_DATA.indexOf('BEFORE YOU ANSWER'));
+    // T9 (C6): V1 byte for byte, then one appended block.
+    assert.ok(TITLE_SYSTEM_V2_KEYWORD_DATA.startsWith(TITLE_SYSTEM_V1));
+    assert.equal(TITLE_SYSTEM_V2_KEYWORD_DATA.slice(TITLE_SYSTEM_V1.length), `\n\n${TITLE_KEYWORD_DATA_SECTION.trimEnd()}`);
     assert.notEqual(TITLE_SYSTEM_V2_KEYWORD_DATA, TITLE_SYSTEM_V1);
-    assert.equal(TITLE_SYSTEM_V2_KEYWORD_DATA.replace(TITLE_KEYWORD_DATA_SECTION, ''), TITLE_SYSTEM_V1);
   });
 
   test('Planner V2 carries the five rules as section 7 and adds demand_notes and overlap to the OUTPUT JSON', () => {
     for (const rule of PLANNER_RULES) assert.ok(PLANNER_SYSTEM_V2_KEYWORD_DATA.includes(rule), rule);
-    assert.ok(PLANNER_SYSTEM_V2_KEYWORD_DATA.includes('7. KEYWORD DATA AND RECENT POSTS'));
+    // P6 (C6): V1 byte for byte, then the contract's rules and ONE new sentence naming the JSON fields.
+    assert.ok(PLANNER_SYSTEM_V2_KEYWORD_DATA.startsWith(PLANNER_SYSTEM_V1));
+    assert.equal(
+      PLANNER_SYSTEM_V2_KEYWORD_DATA.slice(PLANNER_SYSTEM_V1.length),
+      `\n\n${PLANNER_KEYWORD_DATA_SECTION.trimEnd()}\n${PLANNER_KEYWORD_DATA_JSON_SENTENCE}`,
+    );
     assert.ok(PLANNER_SYSTEM_V2_KEYWORD_DATA.includes('"demand_notes": "one sentence, or null"'));
     assert.ok(PLANNER_SYSTEM_V2_KEYWORD_DATA.includes('"overlap": {"post_id": the post_id from recent_posts, "reason": "one sentence"} or null'));
-    assert.equal(
-      PLANNER_SYSTEM_V2_KEYWORD_DATA.replace(PLANNER_KEYWORD_DATA_SECTION, '').replace(PLANNER_OUTPUT_V2_TAIL, PLANNER_OUTPUT_V1_TAIL),
-      PLANNER_SYSTEM_V1,
-    );
   });
 
   test('both V2 prompts keep the doc\'s own output contract line', () => {
