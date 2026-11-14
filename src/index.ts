@@ -101,7 +101,9 @@ app.use((req, res, next) => {
 
 // ===== ROUTES CONFIGURATION =====
 app.use('/api/v1', v1);
-app.use('/api/v1/generations', generationsRoutes);
+// The admin tester's saved generations (parameters, article text): list, read, create and delete
+// were open to anyone. Only the admin panel calls these, with its admin token.
+app.use('/api/v1/generations', requireAdmin, generationsRoutes);
 // requireAdmin is applied at the MOUNT rather than inside prompts.routes.ts so that a route added
 // to that router later cannot ship unprotected by someone forgetting a per-route guard. This mount
 // previously had no auth at all, and the router's own `requireAdmin` was a stub calling next().
