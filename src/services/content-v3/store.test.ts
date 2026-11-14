@@ -122,3 +122,15 @@ describe('migration 023', () => {
     assert.match(src, /export const DOWN_SQL = `\nDROP TABLE IF EXISTS content_v3_posts;\nDROP TABLE IF EXISTS content_v3_sessions;/);
   });
 });
+
+// postgres.js serialises a parameter it is told is json/jsonb with JSON.stringify, so
+// `${JSON.stringify(x)}::jsonb` stores a JSON *string* (a session's second merge then turns it into
+// an array and the wizard loses its session). Casting through text sends the string as-is.
+// Checked against postgres:16 with postgres.js 3.4.7 (migrations up/down, merge, replay, history).
+test('JSON parameters are cast through text (never `${…}::jsonb`) in the v3 stores and the keyword cache', () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  for (const rel of ['store.ts', 'runs.ts', 'quota.ts', '../keyword-data/keyword-data-cache.ts']) {
+    const src = fs.readFileSync(path.join(here, rel), 'utf8');
+    assert.doesNotMatch(src, /\}::jsonb/, `${rel} passes a JSON parameter straight to ::jsonb`);
+  }
+});

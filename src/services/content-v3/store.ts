@@ -118,7 +118,7 @@ export function createContentV3Store(deps: ContentV3StoreDeps): ContentV3Store {
       try {
         await sql`
           INSERT INTO content_v3_sessions (user_id, website_id, session_key, data, expires_at)
-          VALUES (${userId}, ${websiteId}, ${sessionKey}, ${json}::jsonb, NOW() + make_interval(days => ${ttlDays}))
+          VALUES (${userId}, ${websiteId}, ${sessionKey}, ${json}::text::jsonb, NOW() + make_interval(days => ${ttlDays}))
           ON CONFLICT (user_id, website_id, session_key) DO UPDATE SET
             data = CASE WHEN content_v3_sessions.expires_at > NOW()
                         THEN content_v3_sessions.data || EXCLUDED.data
@@ -156,9 +156,9 @@ export function createContentV3Store(deps: ContentV3StoreDeps): ContentV3Store {
           VALUES (
             ${rec.user_id}, ${rec.website_id}, ${rec.session_key ?? null}, ${rec.bulk_batch ?? null},
             ${rec.article_type ?? null}, ${rec.post_size ?? null}, ${rec.proof_level ?? null},
-            ${JSON.stringify(rec.picks ?? {})}::jsonb, ${rec.fingerprint ?? null},
-            ${JSON.stringify(rec.headings ?? [])}::jsonb,
-            ${rec.validator ? JSON.stringify(rec.validator) : null}::jsonb
+            ${JSON.stringify(rec.picks ?? {})}::text::jsonb, ${rec.fingerprint ?? null},
+            ${JSON.stringify(rec.headings ?? [])}::text::jsonb,
+            ${rec.validator ? JSON.stringify(rec.validator) : null}::text::jsonb
           )
         `;
         return true;

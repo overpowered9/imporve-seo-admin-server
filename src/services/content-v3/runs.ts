@@ -158,6 +158,16 @@ export function createMemoryRunsStore(now: () => number = () => Date.now()): Run
 
 const UNIQUE_VIOLATION = '23505';
 
+/** A JSONB value as written; a row stored as a JSON string scalar is read back as its object. */
+function jsonValue(raw: unknown): unknown {
+  if (typeof raw !== 'string') return raw ?? null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
 function toRow(r: Record<string, unknown>): RunRow {
   return {
     id: Number(r.id),
@@ -170,9 +180,9 @@ function toRow(r: Record<string, unknown>): RunRow {
     action: (r.action as string | null) ?? null,
     variant: (r.variant as string | null) ?? null,
     generation_id: r.generation_id === null || r.generation_id === undefined ? null : Number(r.generation_id),
-    response: r.response ?? null,
-    step_costs: (r.step_costs as Record<string, number>) ?? {},
-    timings: (r.timings as Record<string, number>) ?? {},
+    response: jsonValue(r.response),
+    step_costs: (jsonValue(r.step_costs) as Record<string, number>) ?? {},
+    timings: (jsonValue(r.timings) as Record<string, number>) ?? {},
     error: (r.error as string | null) ?? null,
     created_at: String(r.created_at),
     updated_at: String(r.updated_at),
@@ -201,7 +211,7 @@ export function createPostgresRunsStore(sql: SqlLike): RunsStore {
       const same = await sql`SELECT id, status, response FROM content_v3_runs WHERE user_id = ${p.user_id} AND request_id = ${p.request_id}`;
       const row = same[0];
       if (!row) return { kind: 'busy' }; // another run of this session is running
-      if (row.status === 'succeeded') return { kind: 'replay', id: Number(row.id), response: row.response };
+      if (row.status === 'succeeded') return { kind: 'replay', id: Number(row.id), response: jsonValue(row.response) };
       if (row.status === 'failed' || row.status === 'refunded') {
         try {
           const again = await sql`
@@ -222,8 +232,8 @@ export function createPostgresRunsStore(sql: SqlLike): RunsStore {
     async succeeded(id, p) {
       await sql`
         UPDATE content_v3_runs
-           SET status = 'succeeded', generation_id = ${p.generation_id}, response = ${JSON.stringify(p.response)}::jsonb,
-               step_costs = ${JSON.stringify(p.step_costs)}::jsonb, timings = ${JSON.stringify(p.timings)}::jsonb, updated_at = NOW()
+           SET status = 'succeeded', generation_id = ${p.generation_id}, response = ${JSON.stringify(p.response)}::text::jsonb,
+               step_costs = ${JSON.stringify(p.step_costs)}::text::jsonb, timings = ${JSON.stringify(p.timings)}::text::jsonb, updated_at = NOW()
          WHERE id = ${id}
       `;
     },

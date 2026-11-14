@@ -179,7 +179,7 @@ export function createKeywordDataCache(deps: KeywordDataCacheDeps): KeywordDataC
           INSERT INTO keyword_related_cache (seed, location_code, language_code, related, fetched_at, expires_at)
           VALUES (
             ${key}, ${location_code}, ${lang},
-            ${JSON.stringify(related)}::jsonb,
+            ${JSON.stringify(related)}::text::jsonb,
             ${fetchedAt}::timestamptz,
             ${fetchedAt}::timestamptz + make_interval(days => ${ttlDays})
           )
