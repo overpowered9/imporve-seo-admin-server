@@ -19,6 +19,7 @@ export type V3ErrorCode =
   | 'not_configured'
   | 'session_expired'
   | 'already_generating'
+  | 'v3_regulated_disabled'
   | 'server_error';
 
 export interface V3UserError {
@@ -46,6 +47,7 @@ export const V3_MESSAGES = {
   server_error: 'Something went wrong on our side. Please try again. If it keeps happening, contact support.',
   session_expired: "This post's plan is no longer available. Go back to step 1 and approve the title again.",
   already_generating: 'This post is already being generated. Please wait for it to finish.',
+  v3_regulated_disabled: 'Content v3 is not available for regulated businesses yet. Your post will be generated the usual way.',
 } as const;
 
 export function v3Error(code: V3ErrorCode, message?: string): V3UserError {
@@ -60,6 +62,7 @@ export function v3Error(code: V3ErrorCode, message?: string): V3UserError {
     not_configured: 503,
     session_expired: 409,
     already_generating: 409,
+    v3_regulated_disabled: 409,
     server_error: 500,
   };
   const fallback = (V3_MESSAGES as Record<string, string>)[code] ?? V3_MESSAGES.server_error;

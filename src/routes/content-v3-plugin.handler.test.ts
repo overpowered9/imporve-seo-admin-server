@@ -24,13 +24,13 @@ afterEach(async () => {
   await a?.close();
 });
 
-async function start(env: NodeJS.ProcessEnv, store = createMemoryContentV3Store()) {
+async function start(env: NodeJS.ProcessEnv, store = createMemoryContentV3Store(), disclaimerKeys?: () => Promise<string[]>) {
   if (app) {
     const prev = app;
     app = null;
     await prev.close();
   }
-  app = await startTestApp([['/api/v1/content-v3', createContentV3PluginRouter({ auth: fakeAuth, store: async () => store, env, log: () => {} })]]);
+  app = await startTestApp([['/api/v1/content-v3', createContentV3PluginRouter({ auth: fakeAuth, store: async () => store, env, log: () => {}, disclaimerKeys })]]);
   return { app, store };
 }
 
@@ -50,8 +50,19 @@ describe('GET /status', () => {
       const { app } = await start(env as NodeJS.ProcessEnv);
       const r = await app.get('/api/v1/content-v3/status', { 'x-api-key': 'good' });
       assert.equal(r.status, 200);
-      assert.deepEqual(r.body, { success: true, data: { enabled, keyword_data: kd } });
+      assert.deepEqual(r.body, { success: true, data: { enabled, keyword_data: kd, disclaimer_niches: [] } });
     }
+  });
+
+  test('A3: lists the niches that have a disclaimer text; unreadable settings list none (v2 for Regulated)', async () => {
+    const ok = await start({ CONTENT_V3_ENABLED: 'true' }, undefined, async () => ['dental', 'legal']);
+    assert.deepEqual((await ok.app.get('/api/v1/content-v3/status', { 'x-api-key': 'good' })).body.data.disclaimer_niches, ['dental', 'legal']);
+    const broken = await start({ CONTENT_V3_ENABLED: 'true' }, undefined, async () => {
+      throw new Error('mongo down');
+    });
+    const r = await broken.app.get('/api/v1/content-v3/status', { 'x-api-key': 'good' });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.data.disclaimer_niches, []);
   });
 });
 

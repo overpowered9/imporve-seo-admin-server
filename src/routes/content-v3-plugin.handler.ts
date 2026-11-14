@@ -1,7 +1,9 @@
 /**
  * Plugin-facing Content v3 routes that are not a generation step (plugin auth: x-api-key + x-site-code).
  *
- *   GET  /api/v1/content-v3/status          { success, data: { enabled, keyword_data } }
+ *   GET  /api/v1/content-v3/status          { success, data: { enabled, keyword_data, disclaimer_niches } }
+ *        disclaimer_niches (A3): niche/profile keys with a disclaimer text; a Regulated business
+ *        whose niche is not listed stays on v2.
  *        The plugin's "Use Content v3" setting only takes effect when this says enabled: true
  *        (CONTENT_V3_ENABLED). The plugin caches the answer for a few minutes and uses v2 otherwise,
  *        so turning the env flag off is the rollback.
@@ -28,6 +30,8 @@ export const sessionKeySchema = z
 export interface ContentV3PluginDeps {
   auth: RequestHandler;
   store: () => Promise<ContentV3Store>;
+  /** A3: niche and profile keys with a disclaimer text (a Regulated business needs one for v3). */
+  disclaimerKeys?: () => Promise<string[]>;
   env?: NodeJS.ProcessEnv;
   log?: (line: string) => void;
 }
@@ -36,12 +40,15 @@ export function createContentV3PluginRouter(deps: ContentV3PluginDeps): Router {
   const { env = process.env, log = (line) => console.log(line) } = deps;
   const router = Router();
 
-  router.get('/status', deps.auth, (_req: AuthenticatedRequest, res: Response) => {
+  router.get('/status', deps.auth, async (_req: AuthenticatedRequest, res: Response) => {
+    // A3: unreadable disclaimer settings answer an empty list, which keeps Regulated businesses on v2.
+    const disclaimerNiches = deps.disclaimerKeys ? await deps.disclaimerKeys().catch(() => [] as string[]) : [];
     res.json({
       success: true,
       data: {
         enabled: contentV3Enabled(env),
         keyword_data: keywordDataFlagOn(env) && keywordDataConfigured(env),
+        disclaimer_niches: disclaimerNiches,
       },
     });
   });

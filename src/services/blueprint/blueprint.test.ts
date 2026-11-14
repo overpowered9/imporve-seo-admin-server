@@ -13,6 +13,8 @@ import {
   patternShares,
   priceAvailable,
   recentHeadingsBlock,
+  rescaledBlueprint,
+  scaleTargets,
   structureFingerprint,
   tocAuto,
   topicTriggers,
@@ -96,16 +98,45 @@ describe('draw rules (B2–B7, B10, B11)', () => {
     }
   });
 
-  test('section count never above the Planner\'s body questions, never below the size\'s minimum', () => {
+  test('C12: sections never above body questions + optional elements, never below the size\'s minimum', () => {
+    const cap = (r: ReturnType<typeof buildBlueprint>, questions: number, lo: number, hi: number) =>
+      Math.max(lo, Math.min(hi, questions + r.picks.optional_elements.length));
     for (let s = 1; s <= 40; s++) {
+      // 3m over 4 questions: the top of Medium (6), capped at 4 questions + the optional elements.
       const four = buildBlueprint({ ...BASE, bodyQuestions: BASE.bodyQuestions.slice(0, 4), postSize: 'medium', suggestedSize: 'small', rng: mulberry32(s) });
-      assert.equal(four.picks.sections, 4, `3m over 4 questions: ${four.picks.sections}`);
+      assert.equal(four.picks.sections, cap(four, 4, 4, 6), `3m over 4 questions: ${four.picks.sections}`);
       assert.match(four.block, /Body questions, most important first:\n1\. .*\n2\. .*\n3\. .*\n4\. [^\n]*\nFORMAT:/);
       const five = buildBlueprint({ ...BASE, bodyQuestions: BASE.bodyQuestions.slice(0, 5), postSize: 'medium', suggestedSize: 'medium', rng: mulberry32(s) });
-      assert.ok(five.picks.sections >= 4 && five.picks.sections <= 5, `medium over 5 questions: ${five.picks.sections}`);
+      assert.ok(five.picks.sections >= 4 && five.picks.sections <= cap(five, 5, 4, 6), `medium over 5 questions: ${five.picks.sections}`);
+      // Too few questions and elements for Large: the size's minimum holds.
       const two = buildBlueprint({ ...BASE, bodyQuestions: BASE.bodyQuestions.slice(0, 2), postSize: 'large', suggestedSize: 'medium', rng: mulberry32(s) });
       assert.equal(two.picks.sections, 6, `large keeps its minimum: ${two.picks.sections}`);
     }
+  });
+
+  test('A1: calibrated targets — the BODY line carries word_targets × the factor; picks and fingerprint keep the doc formula', () => {
+    assert.deepEqual(scaleTargets([540, 270, 270, 270], 1), [540, 270, 270, 270]);
+    assert.deepEqual(scaleTargets([540, 270], 1.3), [700, 350]);
+    for (let s = 1; s <= 20; s++) {
+      const plain = buildBlueprint({ ...BASE, rng: mulberry32(s) });
+      const scaled = buildBlueprint({ ...BASE, rng: mulberry32(s), targetScale: 1.3 });
+      assert.deepEqual(scaled.picks.word_targets, plain.picks.word_targets, 'the doc formula is unchanged');
+      assert.deepEqual(scaled.picks.writer_targets, scaleTargets(plain.picks.word_targets, 1.3));
+      assert.equal(scaled.fingerprint, plain.fingerprint, 'calibration is not a structure pick');
+      // Same wording; only the numbers in the BODY line differ.
+      const words = (b: string) => b.replace(/\d+/g, '#');
+      assert.equal(words(scaled.block), words(plain.block));
+      for (const n of scaled.picks.writer_targets) assert.ok(scaled.block.includes(String(n)), `${n} in the BODY line`);
+    }
+  });
+
+  test('A1: rescaledBlueprint changes only the numbers of the BODY line', () => {
+    const bp = buildBlueprint({ ...BASE, rng: mulberry32(3), targetScale: 1.3 });
+    const again = rescaledBlueprint(bp.picks, BASE, 1.5);
+    assert.deepEqual(again.picks.writer_targets, scaleTargets(bp.picks.writer_targets, 1.5));
+    assert.deepEqual(again.picks.word_targets, bp.picks.word_targets);
+    assert.equal(again.block.replace(/\d+/g, '#'), bp.block.replace(/\d+/g, '#'));
+    assert.notEqual(again.block, bp.block);
   });
 
   test('3m: larger than suggested → top section count, top optional count, aim at the bottom of the range', () => {

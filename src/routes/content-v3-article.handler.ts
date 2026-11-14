@@ -83,9 +83,19 @@ export interface ContentV3ArticleDeps {
   billing: BillingDeps;
   generate: (input: ArticleV3Input, opts: { runId: string }) => Promise<ArticleV3Result>;
   insertGeneration: (row: GenerationRow) => Promise<number | null>;
+  /**
+   * A3 (decision 14 Nov): the niche and profile keys that have a disclaimer text. A Regulated
+   * business whose niche has none stays on v2 (409 v3_regulated_disabled, before any charge).
+   */
+  disclaimerKeys?: () => Promise<string[]>;
   env?: NodeJS.ProcessEnv;
   log?: (line: string) => void;
   now?: () => number;
+}
+
+/** A3: true when a Regulated business may use v3 (its niche or profile has a disclaimer text). */
+export function regulatedV3Allowed(keys: readonly string[], nicheKey: string | null | undefined, profileKey: string | null | undefined): boolean {
+  return [nicheKey, profileKey].some((k) => !!k && keys.includes(k));
 }
 
 interface SessionShape {
@@ -137,6 +147,13 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
     const session = ((await store.getSession(userId, websiteId ?? 0, b.session_key)) ?? {}) as SessionShape;
     if (!session.approved?.title || !session.plan) return res.status(409).json(v3ErrorBody(v3Error('session_expired')));
     const a = session.approved;
+    if (a.proof_level === 'regulated' && deps.disclaimerKeys) {
+      const keys = await deps.disclaimerKeys().catch(() => [] as string[]);
+      if (!regulatedV3Allowed(keys, a.niche_key, a.niche_profile)) {
+        log(`[content-v3] article refused run=${b.session_key} reason=regulated_without_disclaimer niche=${a.niche_key ?? '-'}`);
+        return res.status(409).json(v3ErrorBody(v3Error('v3_regulated_disabled')));
+      }
+    }
 
     inFlight.add(lockKey);
     const variant = b.post_size;

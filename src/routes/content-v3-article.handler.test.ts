@@ -1,7 +1,7 @@
 import { test, describe, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { startTestApp, fakePluginAuth, PLUGIN_HEADERS, type TestApp } from '../test/helpers/http-app.js';
-import { createContentV3ArticleRouter, type BillingDeps, type GenerationRow } from './content-v3-article.handler.js';
+import { createContentV3ArticleRouter, regulatedV3Allowed, type BillingDeps, type GenerationRow } from './content-v3-article.handler.js';
 import { createMemoryContentV3Store } from '../services/content-v3/store.js';
 import type { ArticleV3Input, ArticleV3Result } from '../services/writer/article.js';
 
@@ -35,7 +35,7 @@ afterEach(async () => {
   await a?.close();
 });
 
-async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, unknown> | null; generate?: (i: ArticleV3Input) => Promise<ArticleV3Result>; regen?: boolean; reserveOk?: boolean } = {}) {
+async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, unknown> | null; generate?: (i: ArticleV3Input) => Promise<ArticleV3Result>; regen?: boolean; reserveOk?: boolean; disclaimerKeys?: string[] } = {}) {
   const store = createMemoryContentV3Store();
   if (opts.session !== null) await store.mergeSession(7, 3, KEY, opts.session ?? SESSION);
   const events: string[] = [];
@@ -69,6 +69,7 @@ async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, u
     },
     env: opts.env ?? ON,
     log: (l) => logs.push(l),
+    disclaimerKeys: async () => opts.disclaimerKeys ?? [],
   });
   app = await startTestApp([['/api/v1/content-v3', router]]);
   return { app, store, events, rows, inputs, logs };
@@ -143,6 +144,26 @@ describe('POST /content-v3/article', () => {
     assert.equal(second.body.error, 'already_generating');
     assert.equal((await first).status, 200);
     assert.equal(events.filter((e) => e.startsWith('reserve')).length, 1);
+  });
+
+  test('A3: a Regulated business whose niche has no disclaimer text stays on v2 (409, nothing charged)', async () => {
+    const regulated = { ...SESSION, approved: { ...SESSION.approved, niche_key: 'dental', proof_level: 'regulated' } };
+    const off = await start({ session: regulated });
+    const r = await off.app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error, 'v3_regulated_disabled');
+    assert.deepEqual(off.events, [], 'no reserve, no generation');
+    assert.match(off.logs.join('\n'), /article refused run=iseo_tk_\w+ reason=regulated_without_disclaimer niche=dental/);
+    await off.app.close();
+    app = null;
+    // With a text for the niche (or its profile), the article goes ahead as usual.
+    const on = await start({ session: regulated, disclaimerKeys: ['dental'] });
+    const r2 = await on.app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);
+    assert.equal(r2.status, 200, JSON.stringify(r2.body));
+    assert.deepEqual(on.events, ['reserve:10', 'generate']);
+    // A Standard business never needs a disclaimer text.
+    assert.equal(regulatedV3Allowed([], 'plumbing', null), false);
+    assert.equal(regulatedV3Allowed(['health_regulated'], 'dental', 'health_regulated'), true);
   });
 
   test('v3 off → 409 v3_disabled; bad input → 400', async () => {

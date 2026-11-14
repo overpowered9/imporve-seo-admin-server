@@ -88,6 +88,7 @@ export async function liveGenerateArticle(input: ArticleV3Input, opts: { runId: 
     writerParts,
     blueprintPieces,
     niche,
+    targetCalibration: cfg.targetCalibration,
     runId: opts.runId,
   });
 }

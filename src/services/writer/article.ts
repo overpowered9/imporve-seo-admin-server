@@ -6,13 +6,15 @@
  *   2 <niche_profile> (N4) and <blueprint> (B1–B12), with <recent_headings> from the site's history.
  *   3 the Writer (WR1–WR4): cached system prompt (core + six rules blocks), per-article user message.
  *   4 post-processing (WR5–WR8, WR10): sanitize → source links → validate → TOC → disclaimer.
- *   5 U2: when the validator finds errors, the Writer runs once more with the same inputs; the better
- *     of the two is kept. Still failing → needs_review (U3, decided by the caller).
+ *   5 U2: when the validator finds errors, the Writer runs once more; the better of the two is kept
+ *     (fewer errors, then closer to the size's range). A draft outside the range gets the second run
+ *     with its word targets rescaled (A1: numbers only, same wording); "regulated sources" alone with
+ *     fewer than 3 research sources skips it (A2: it cannot help). Still failing → needs_review (U3).
  *   6 U4 meta on the final article; the FAQ read from the HTML for the schema.
  * U1: the old humanizer is skipped on this path (it breaks tokens, the em-dash rule and the sections).
  */
 import { runModelCall, promptVersionLabel, type ProviderCall } from '../model-call.js';
-import { buildBlueprint, priceAvailable, recentHeadingsBlock, type BlueprintPins, type BlueprintPicks, type HistoryPost } from '../blueprint/blueprint.js';
+import { buildBlueprint, priceAvailable, recentHeadingsBlock, rescaledBlueprint, type BlueprintPins, type BlueprintPicks, type HistoryPost } from '../blueprint/blueprint.js';
 import { BLUEPRINT_PIECES_V1 } from '../blueprint/pieces.js';
 import { buildNicheProfile, DEFAULT_NICHE_SETTINGS, type NicheSettings } from '../niche-profile/niche-profile.js';
 import { disclaimerFor } from '../niche-profile/niche-profile.default.js';
@@ -33,7 +35,7 @@ import {
   type FaqPair,
   type WriterOutput,
 } from './postprocess.js';
-import { validateArticle, type ValidatorReport } from './validator.js';
+import { validateArticle, SIZE_RANGE, type ValidatorReport } from './validator.js';
 import { generateMetaV3 } from './meta.js';
 
 export type ArticleType = 'cost' | 'decision' | 'question' | 'topic';
@@ -85,9 +87,39 @@ export interface ArticleV3Deps {
   writerParts?: Partial<Record<WriterPart, { text: string; source: 'db' | 'fallback'; dbVersion?: number | null }>>;
   niche?: { settings: NicheSettings; standardPiece?: string; regulatedPiece?: string; disclaimers?: Record<string, string> };
   blueprintPieces?: Readonly<Record<string, string>>;
+  /** A1: word-target factor per size (config CONTENT_V3_TARGET_CALIBRATION_JSON); missing = 1. */
+  targetCalibration?: Partial<Record<PostSize, number>>;
   runId?: string;
   log?: (line: string) => void;
   now?: () => number;
+}
+
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+/**
+ * A1: how much the second Writer run's targets move after a draft outside the size's range — up by
+ * the shortfall (1.1–1.6×) when too short, down (0.7–0.95×) when too long; 1 when the length is fine.
+ */
+export function repairTargetFactor(words: number, size: PostSize): number {
+  const [lo, hi] = SIZE_RANGE[size];
+  if (words > 0 && words < lo) return clamp(lo / words, 1.1, 1.6);
+  if (words > hi) return clamp(hi / words, 0.7, 0.95);
+  return 1;
+}
+
+/** Distance in words from the size's range (0 inside it): breaks a tie between two drafts (A1). */
+export function rangeDistance(words: number, size: PostSize): number {
+  const [lo, hi] = SIZE_RANGE[size];
+  return words < lo ? lo - words : words > hi ? words - hi : 0;
+}
+
+/**
+ * A2 (decision 14 Nov): a second run cannot add sources the research did not supply, so when
+ * "regulated sources" is the only failure and research gave fewer than 3 sources, it is skipped.
+ */
+export function skipSecondRun(report: ValidatorReport, sourceCount: number): boolean {
+  const codes = report.issues.filter((i) => i.severity === 'error').map((i) => i.code);
+  return codes.length > 0 && codes.every((c) => c === 'regulated_sources') && sourceCount < 3;
 }
 
 export interface ArticleV3Result {
@@ -174,6 +206,7 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
       history: input.history,
       rng: input.rng,
       pieces,
+      targetScale: deps.targetCalibration?.[input.post_size] ?? 1,
     },
     log,
   );
@@ -182,9 +215,9 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
 
   const partsText = Object.fromEntries(Object.entries(deps.writerParts ?? {}).map(([k, v]) => [k, v?.text])) as Partial<Record<WriterPart, string>>;
   const system = buildWriterSystem(partsText);
-  const user = buildWriterUserMessage({
+  const userFor = (blueprintBlock: string) => buildWriterUserMessage({
     nicheProfile: niche.block,
-    blueprint: bp.block,
+    blueprint: blueprintBlock,
     recentHeadings,
     title: input.title,
     seed_keyword: input.seed_keyword,
@@ -206,6 +239,7 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
     searcher_profile: input.plan.searcher_profile,
     research: input.research,
   });
+  const user = userFor(bp.block);
   const promptVersion = writerPromptLabel(system, deps.writerParts);
   const sources = input.research?.sources ?? {};
 
@@ -214,14 +248,14 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
   let writerAttempts = 0;
   let writerMs = 0;
 
-  const writeOnce = async () => {
+  const writeOnce = async (userMessage: string) => {
     const t0 = now();
     const r = await runModelCall<WriterOutput>({
       step: 'writer',
       model: deps.writerModel,
       promptVersion,
       system,
-      user,
+      user: userMessage,
       maxTokens: WRITER_MAX_TOKENS[input.post_size],
       timeoutMs: deps.writerTimeoutMs,
       maxAttempts: deps.maxAttempts,
@@ -252,19 +286,35 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
       faqQuestions: input.plan.faq_questions,
     });
     if (linked.report.unknown.length) log(`[content-v3] writer run=${deps.runId ?? '-'} unknown source tokens removed: ${linked.report.unknown.join(',')}`);
-    return { html: linked.html, json: r.value.json, report, linked: linked.report.linked };
+    return { html: linked.html, json: r.value.json, report, linked: linked.report.linked, user: userMessage, picks: bp.picks };
   };
 
-  let best = await writeOnce();
+  let best = await writeOnce(user);
   let repaired = false;
   if (!best.report.passed) {
-    log(`[content-v3] validator run=${deps.runId ?? '-'} errors=${best.report.errors} codes=${best.report.issues.filter((x) => x.severity === 'error').map((x) => x.code).join(',')} — writing once more (U2)`);
-    try {
-      const second = await writeOnce();
-      repaired = true;
-      if (second.report.errors <= best.report.errors) best = second;
-    } catch (err) {
-      log(`[content-v3] repair run failed run=${deps.runId ?? '-'}: ${err instanceof Error ? err.message : String(err)} — keeping the first article`);
+    const codes = best.report.issues.filter((x) => x.severity === 'error').map((x) => x.code).join(',');
+    if (skipSecondRun(best.report, Object.keys(sources).length)) {
+      log(`[content-v3] validator run=${deps.runId ?? '-'} errors=${best.report.errors} codes=${codes} — second run skipped (regulated sources need research: ${Object.keys(sources).length} source(s))`);
+    } else {
+      // A1: a draft outside the size's range gets its second run with rescaled targets (same wording).
+      const factor = best.report.issues.some((x) => x.code === 'word_count') ? repairTargetFactor(best.report.word_count, input.post_size) : 1;
+      const rescaled = factor !== 1 ? rescaledBlueprint(bp.picks, { bodyQuestions: input.plan.body_questions, faqQuestions: input.plan.faq_questions }, factor, pieces) : null;
+      log(
+        `[content-v3] validator run=${deps.runId ?? '-'} errors=${best.report.errors} codes=${codes} — writing once more (U2)` +
+          (rescaled ? ` with targets ×${factor.toFixed(2)} (${rescaled.picks.writer_targets.join('/')})` : ''),
+      );
+      try {
+        const second = await writeOnce(rescaled ? userFor(rescaled.block) : user);
+        if (rescaled) second.picks = rescaled.picks;
+        repaired = true;
+        const better =
+          second.report.errors < best.report.errors ||
+          (second.report.errors === best.report.errors &&
+            rangeDistance(second.report.word_count, input.post_size) <= rangeDistance(best.report.word_count, input.post_size));
+        if (better) best = second;
+      } catch (err) {
+        log(`[content-v3] repair run failed run=${deps.runId ?? '-'}: ${err instanceof Error ? err.message : String(err)} — keeping the first article`);
+      }
     }
   }
 
@@ -295,7 +345,7 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
     repaired,
     proof_level,
     article_type,
-    picks: bp.picks,
+    picks: best.picks,
     fingerprint: bp.fingerprint,
     headings: headingsOf(html),
     linked_sources: best.linked,
@@ -305,7 +355,7 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
     usage: { writer: writerUsage, meta: meta.usage },
     prompt_version: promptVersion,
     model: deps.writerModel,
-    messages: { system, user, blueprint: bp.block, niche_profile: niche.block },
+    messages: { system, user: best.user, blueprint: bp.block, niche_profile: niche.block },
     timings: { writer_ms: writerMs, meta_ms: metaMs, total_ms: now() - started },
   };
 }

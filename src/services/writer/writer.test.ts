@@ -23,7 +23,7 @@ import {
   WRITER_MARKER,
 } from './postprocess.js';
 import { countWords, keywordInFirstWords, validateArticle } from './validator.js';
-import { finalProofLevel, generateArticleV3, writerPromptLabel, type ArticleV3Input } from './article.js';
+import { finalProofLevel, generateArticleV3, rangeDistance, repairTargetFactor, skipSecondRun, writerPromptLabel, type ArticleV3Input } from './article.js';
 import { buildBlueprint, mulberry32, type BlueprintPicks } from '../blueprint/blueprint.js';
 import type { ProviderCall } from '../model-call.js';
 import type { MappedResearch } from '../research/research.service.js';
@@ -270,6 +270,13 @@ describe('validator (V1–V9, V11)', () => {
     assert.equal(warnOnly.passed, true);
     assert.equal(warnOnly.warnings, 2);
   });
+
+  test('V7: compact HTML counts the words it shows (block boundaries are spaces)', () => {
+    assert.equal(countWords('<p>one two</p><p>three</p><ul><li>four</li><li>five</li></ul><h2>six seven</h2>'), 7);
+    assert.equal(countWords('<p>one two</p>\n<p>three</p>'), 3, 'spaced HTML unchanged');
+    assert.equal(countWords('<p>line one<br>line two</p>'), 4);
+    assert.equal(countWords('<p>a <strong>bold</strong> word</p>'), 3, 'inline tags do not split words');
+  });
 });
 
 // ---------------------------------------------------------------- pipeline
@@ -313,9 +320,9 @@ const INPUT = (over: Partial<ArticleV3Input> = {}): ArticleV3Input => ({
 const DEPS = (call: ProviderCall, logs: string[] = []) => ({ call, writerModel: 'claude-sonnet-5', metaModel: 'claude-sonnet-5', writerTimeoutMs: 1000, metaTimeoutMs: 1000, log: (l: string) => logs.push(l) });
 
 /** The article the scripted writer returns: valid for the picks the same seed will draw. */
-function writerText(input: ArticleV3Input, mutate: (html: string) => string = (h) => h): string {
+function writerText(input: ArticleV3Input, mutate: (html: string) => string = (h) => h, bodyWords?: number): string {
   const bp = buildBlueprint({ articleType: 'cost', postSize: input.post_size, suggestedSize: PLAN.post_size, title: input.title, reach: input.reach, readiness: 'comparing', bodyQuestions: PLAN.body_questions, faqQuestions: PLAN.faq_questions, firmest: 'direct', priceAvailable: true, businessSupplied: false, history: input.history, rng: mulberry32(7) });
-  const html = mutate(article(bp.picks, { faq: PLAN.faq_questions.slice(0, bp.picks.faq_count), tokens: ['S1', 'S2', 'S3', 'S1'] }));
+  const html = mutate(article(bp.picks, { faq: PLAN.faq_questions.slice(0, bp.picks.faq_count), tokens: ['S1', 'S2', 'S3', 'S1'], bodyWords }));
   return `${html}\n${WRITER_MARKER}\n{"facts_used":[{"claim":"Repairs run $150 to $700.","from":"S1"}],"claims_to_check":[],"items_delivered":null}`;
 }
 
@@ -353,6 +360,53 @@ describe('generateArticleV3', () => {
     const r2 = await generateArticleV3(INPUT(), DEPS(s2.call));
     assert.equal(r2.needs_review, true);
     assert.ok(r2.validator.issues.some((i) => i.code === 'data_iseo'));
+  });
+
+  test('A1: a too-short draft gets its second run with rescaled targets, same BODY wording', async () => {
+    const input = INPUT({ post_size: 'large' });
+    const text = writerText(input, (h) => h, 130); // 130 words a section: far below Large's 2,400
+    const s = scripted([text, text]);
+    const logs: string[] = [];
+    const r = await generateArticleV3(input, { ...DEPS(s.call, logs), targetCalibration: { large: 1.6 } });
+    assert.equal(s.users.length, 2);
+    assert.ok(r.validator.issues.some((i) => i.code === 'word_count'), JSON.stringify(r.validator.issues));
+    const body = (u: string) => (u.match(/^BODY: .*$/m) ?? [''])[0];
+    assert.notEqual(body(s.users[1]), body(s.users[0]), 'new numbers');
+    assert.equal(body(s.users[1]).replace(/\d+/g, '#'), body(s.users[0]).replace(/\d+/g, '#'), 'same wording');
+    // Both drafts are the same text, so the final count is the first draft's: factor = 2,400 / words.
+    const factor = repairTargetFactor(r.validator.word_count, 'large');
+    assert.ok(factor > 1.1 && factor <= 1.6, String(factor));
+    assert.ok(logs.join('\n').includes(`writing once more (U2) with targets ×${factor.toFixed(2)}`), logs.join('\n'));
+    // The calibrated first run already asked for word_targets × 1.6.
+    assert.deepEqual(r.picks.word_targets.length, r.picks.writer_targets.length);
+  });
+
+  test('A1 helpers: rescale factor by shortfall or overshoot; distance from the size range', () => {
+    assert.equal(repairTargetFactor(1300, 'medium'), 1, 'inside the range');
+    assert.equal(repairTargetFactor(1100, 'medium'), 1.1, 'a small shortfall still moves at least ×1.1');
+    assert.equal(repairTargetFactor(1000, 'large'), 1.6, 'capped at ×1.6');
+    assert.ok(repairTargetFactor(3000, 'medium') < 1 && repairTargetFactor(3000, 'medium') >= 0.7);
+    assert.equal(rangeDistance(1300, 'medium'), 0);
+    assert.equal(rangeDistance(1132, 'medium'), 68);
+    assert.equal(rangeDistance(2500, 'medium'), 100);
+  });
+
+  test('A2: "regulated sources" alone, with fewer than 3 research sources, skips the second run', async () => {
+    const twoSources: MappedResearch = { ...RESEARCH, sources: { S1: RESEARCH.sources.S1, S2: RESEARCH.sources.S2 } };
+    const input = INPUT({ business_proof_level: 'regulated', research: twoSources });
+    const s = scripted([writerText(input)]);
+    const logs: string[] = [];
+    const r = await generateArticleV3(input, DEPS(s.call, logs));
+    assert.equal(s.users.length, 1, 'one Writer run');
+    assert.equal(r.repaired, false);
+    assert.equal(r.needs_review, true);
+    assert.deepEqual(r.validator.issues.filter((i) => i.severity === 'error').map((i) => i.code), ['regulated_sources']);
+    assert.match(logs.join('\n'), /second run skipped \(regulated sources need research: 2 source\(s\)\)/);
+    // Another failure next to it still gets the second run; so does the same failure with 3+ sources.
+    const report = (codes: string[]) => ({ passed: false, errors: codes.length, warnings: 0, word_count: 900, issues: codes.map((code) => ({ code, severity: 'error' as const, message: code })) });
+    assert.equal(skipSecondRun(report(['regulated_sources']), 2), true);
+    assert.equal(skipSecondRun(report(['regulated_sources', 'word_count']), 2), false);
+    assert.equal(skipSecondRun(report(['regulated_sources']), 3), false);
   });
 
   test('the Writer failing 3 times throws (the route refunds)', async () => {

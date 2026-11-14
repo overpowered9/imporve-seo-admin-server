@@ -108,6 +108,19 @@ const researchRequestSchema = z.object({
 
 const router = Router();
 
+// A3 (decision 14 Nov): niche/profile keys with a disclaimer text. A Regulated business stays on v2
+// until its niche has one. Cached for a minute (the plugin's status check asks often).
+let disclaimerKeysCache: { at: number; keys: string[] } | null = null;
+async function liveDisclaimerKeys(): Promise<string[]> {
+  if (disclaimerKeysCache && Date.now() - disclaimerKeysCache.at < 60_000) return disclaimerKeysCache.keys;
+  const all = (await liveNicheSettings()).disclaimers;
+  const keys = Object.entries(all)
+    .filter(([, text]) => typeof text === 'string' && text.trim() !== '')
+    .map(([key]) => key);
+  disclaimerKeysCache = { at: Date.now(), keys };
+  return keys;
+}
+
 // The paid v3 article (plugin auth). Same price and reserve/refund path as v2's /content-v2/article.
 router.use(
   '/',
@@ -139,6 +152,7 @@ router.use(
       `;
       return rows[0]?.id ?? null;
     },
+    disclaimerKeys: liveDisclaimerKeys,
   }),
 );
 
@@ -192,7 +206,7 @@ router.use('/', createSearchDataRouter({ auth: requireAdmin, lookup: (req) => lo
 
 // Plugin-facing status and session housekeeping (content-v3-plugin.handler.ts). The status check
 // does not stamp the website's last connection: it is a capability probe, not a generation.
-router.use('/', createContentV3PluginRouter({ auth: validateApiAccessWithoutStamp, store: getContentV3Store }));
+router.use('/', createContentV3PluginRouter({ auth: validateApiAccessWithoutStamp, store: getContentV3Store, disclaimerKeys: liveDisclaimerKeys }));
 
 // Keyword data (Option A/B plumbing). Auth is applied INSIDE the sub-router: prefetch is
 // plugin-authenticated, everything else on it is requireAdmin.

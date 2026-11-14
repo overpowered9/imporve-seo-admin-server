@@ -36,6 +36,31 @@ export interface ContentV3Config {
   timeoutsMs: Record<V3Step, number>;
   /** Abandoned wizard sessions are purged after this many days (OPS5). */
   sessionTtlDays: number;
+  /**
+   * A1 (decision 14 Nov): factor per size for the word targets the Writer is given, because it
+   * delivers ~95 / 70 / 55% of its targets on Small / Medium / Large. Numbers only; the wording of
+   * the BODY line is the doc's. CONTENT_V3_TARGET_CALIBRATION_JSON, e.g. {"medium":1.3}.
+   */
+  targetCalibration: Record<'small' | 'medium' | 'large', number>;
+}
+
+export const DEFAULT_TARGET_CALIBRATION = { small: 1.0, medium: 1.3, large: 1.6 } as const;
+
+/** Each size's factor from JSON, kept within 0.5–2.5; anything unreadable falls back to the default. */
+export function targetCalibration(env: NodeJS.ProcessEnv = process.env): Record<'small' | 'medium' | 'large', number> {
+  const out: Record<'small' | 'medium' | 'large', number> = { ...DEFAULT_TARGET_CALIBRATION };
+  const raw = env.CONTENT_V3_TARGET_CALIBRATION_JSON;
+  if (!raw || !raw.trim()) return out;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    for (const size of ['small', 'medium', 'large'] as const) {
+      const v = Number(parsed?.[size]);
+      if (Number.isFinite(v) && v >= 0.5 && v <= 2.5) out[size] = v;
+    }
+  } catch {
+    // keep the defaults
+  }
+  return out;
 }
 
 export function contentV3Config(env: NodeJS.ProcessEnv = process.env): ContentV3Config {
@@ -51,5 +76,6 @@ export function contentV3Config(env: NodeJS.ProcessEnv = process.env): ContentV3
       meta: intEnv(env, 'CONTENT_V3_TIMEOUT_META_MS', 60_000, 5_000, 300_000),
     },
     sessionTtlDays: intEnv(env, 'CONTENT_V3_SESSION_TTL_DAYS', 7, 1, 90),
+    targetCalibration: targetCalibration(env),
   };
 }

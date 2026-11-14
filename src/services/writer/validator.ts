@@ -66,8 +66,11 @@ export const BACK_REFERENCES = [
   'see below', 'see above', 'as stated above', 'mentioned above', 'discussed above', 'as we discussed', 'as we mentioned',
 ];
 
+// V7: block boundaries become spaces before the text is read, so "a</p><p>b" (compact HTML) counts
+// as two words, as it reads, not one.
+const BLOCK_END = /<\/(?:p|li|h[1-6]|td|th|tr|div|ul|ol|table|thead|tbody|nav|section|blockquote)>|<br\s*\/?>/gi;
 const text = (html: string) =>
-  load(`<div>${html}</div>`, null, false)
+  load(`<div>${html.replace(BLOCK_END, (m) => `${m} `)}</div>`, null, false)
     .text()
     .replace(/\s+/g, ' ')
     .trim();

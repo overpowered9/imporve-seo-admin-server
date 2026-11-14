@@ -14,9 +14,13 @@
  *  - "draw one section fewer" never goes below the size's range minimum; if a section is still under
  *    120 words there, it is raised to 120 and the difference taken from the longest sections;
  *  - step 3m aims a quarter of the way into the chosen range (AIM_BOTTOM), not at its edge;
- *  - the section count never goes above the number of Planner body questions (but never below the
- *    size's minimum): in the 10-keyword run, 6 sections over 4 questions made the Writer drop a
- *    section and fall under the size's word range; 3m "takes more" questions only while they last;
+ *  - the section count never goes above the Planner's body questions plus the optional elements to
+ *    cover (but never below the size's minimum), as in the doc's own example (4 sections over 3
+ *    questions + 2 "Also cover" elements); 3m "takes more" questions only while they last (C12);
+ *  - calibrated word targets (decision 14 Nov): the BODY line carries word_targets × the size's
+ *    factor (`targetScale`, config CONTENT_V3_TARGET_CALIBRATION_JSON) as `writer_targets`, because
+ *    the Writer delivers ~95 / 70 / 55% of its targets on Small / Medium / Large. Numbers only: the
+ *    sentence's wording is unchanged. The picks keep the doc-formula targets;
  *  - the 40% spread limit applies once the site has at least 5 earlier v3 posts;
  *  - numbered titles: items under 2–3 grouping H2s from 8 items up, else items as H2 sections;
  *  - an optional element marked "(supplied only)" is drawn only when the business details hold
@@ -106,6 +110,8 @@ export interface BlueprintInput {
   history?: HistoryPost[];
   rng?: () => number;
   pieces?: Readonly<Record<string, string>>;
+  /** Calibration factor for this size's word targets in the BODY line (A1); default 1. */
+  targetScale?: number;
 }
 
 export interface NumberedPick {
@@ -133,7 +139,10 @@ export interface BlueprintPicks {
   closing_format: ClosingFormat;
   firmness: FirmnessLevel;
   toc: boolean;
+  /** The doc's formula (aim minus fixed parts, split by the pattern). */
   word_targets: number[];
+  /** What the BODY line tells the Writer: word_targets × the size's calibration factor (A1). */
+  writer_targets: number[];
   larger_than_suggested: boolean;
   numbered: NumberedPick | null;
   topic_triggers: string[];
@@ -349,10 +358,8 @@ function drawPicks(input: BlueprintInput, rng: () => number, pieces: Readonly<Re
     numberedPick = { ...numbered, grouping, order_by };
     sections = grouping === 'h2_items' ? numbered.items : intIn(rng, [2, 3]);
   } else {
-    // Never more sections than the Planner has body questions, unless the size's minimum needs them.
-    const [lo, hi] = SECTION_RANGE[size];
-    const top = input.bodyQuestions.length ? Math.max(lo, Math.min(hi, input.bodyQuestions.length)) : hi;
-    sections = larger ? top : intIn(rng, [lo, top]);
+    // A draw within the size's range (3m: its top); capped after step d (C12).
+    sections = larger ? SECTION_RANGE[size][1] : intIn(rng, SECTION_RANGE[size]);
   }
 
   // d. Optional elements: count by size, from the type's pool; none for a numbered title.
@@ -380,6 +387,12 @@ function drawPicks(input: BlueprintInput, rng: () => number, pieces: Readonly<Re
         bag.splice(i, 1);
       }
     }
+  }
+
+  // c, continued (C12): never more sections than the body questions plus the optional elements to
+  // cover — the doc's example has 4 sections over 3 questions + 2 elements — never below the minimum.
+  if (!numbered && input.bodyQuestions.length) {
+    sections = Math.max(SECTION_RANGE[size][0], Math.min(sections, input.bodyQuestions.length + optional_elements.length));
   }
 
   // e. Length pattern.
@@ -439,6 +452,7 @@ function drawPicks(input: BlueprintInput, rng: () => number, pieces: Readonly<Re
     firmness,
     toc: pins.toc ?? tocAuto(size),
     word_targets,
+    writer_targets: scaleTargets(word_targets, input.targetScale ?? 1),
     larger_than_suggested: larger,
     numbered: numberedPick,
     topic_triggers: type === 'topic' ? topicTriggers(input.title) : [],
@@ -495,8 +509,29 @@ function summaryLine(p: BlueprintPicks): string {
   return `SUMMARY: key takeaways, directly after the introduction. ${p.takeaway_points} points, as a ${p.takeaway_list === 'numbered' ? 'numbered' : 'bulleted'} list. The first point answers the title. This is the only summary: no separate quick answer.`;
 }
 
+/** Targets × factor, rounded to 10 (the doc's rounding), never under 10. Factor 1 = unchanged. */
+export function scaleTargets(targets: number[], factor: number): number[] {
+  if (!(factor > 0) || factor === 1) return [...targets];
+  return targets.map((t) => Math.max(10, Math.round((t * factor) / 10) * 10));
+}
+
+/**
+ * The same picks with the Writer's targets scaled once more, re-assembled into a block: the second
+ * Writer run after a too-short (or too-long) draft gets new numbers in the same sentence (A1).
+ */
+export function rescaledBlueprint(
+  picks: BlueprintPicks,
+  input: Pick<BlueprintInput, 'bodyQuestions' | 'faqQuestions'>,
+  factor: number,
+  pieces: Readonly<Record<string, string>> = BLUEPRINT_PIECES_V1,
+): { picks: BlueprintPicks; block: string } {
+  const base = picks.writer_targets?.length ? picks.writer_targets : picks.word_targets;
+  const next = { ...picks, writer_targets: scaleTargets(base, factor) };
+  return { picks: next, block: assembleBlueprint(next, input, pieces) };
+}
+
 function targetsSentence(p: BlueprintPicks): string {
-  const t = p.word_targets;
+  const t = p.writer_targets?.length ? p.writer_targets : p.word_targets;
   if (!t.length) return '';
   if (p.length_pattern === 'anchor' && t.length > 1) return `About ${t[0]} words for the main section, about ${t[1]} for each of the others.`;
   if (t.length === 1) return `About ${t[0]} words.`;
