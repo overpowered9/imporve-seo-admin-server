@@ -29,6 +29,7 @@ import { NICHE_SETTINGS_DEF } from './niche-profile/niche-profile.js';
 import { NICHE_REGULATED_PIECE_DEF, NICHE_STANDARD_PIECE_DEF } from './niche-profile/pieces.js';
 import { DISCLAIMERS_DEF } from './niche-profile/niche-profile.default.js';
 import { BLUEPRINT_DIRECTIVES_DEF } from './blueprint/pieces.js';
+import { WRITER_PROMPT_DEFS } from './writer/prompt.js';
 
 export interface SeedReportEntry {
   templateType: string;
@@ -51,7 +52,7 @@ interface PromptDef {
  * the Writer draft 2 core and the rules blocks here.
  */
 export function v3DocPromptDefs(): PromptDef[] {
-  return [...Object.values(V3_STEP_PROMPT_DEFS), RESEARCH_PROMPT_DEF, NICHE_STANDARD_PIECE_DEF, NICHE_REGULATED_PIECE_DEF, BLUEPRINT_DIRECTIVES_DEF];
+  return [...Object.values(V3_STEP_PROMPT_DEFS), RESEARCH_PROMPT_DEF, NICHE_STANDARD_PIECE_DEF, NICHE_REGULATED_PIECE_DEF, BLUEPRINT_DIRECTIVES_DEF, ...Object.values(WRITER_PROMPT_DEFS)];
 }
 
 export const DOC_VERSION_LABEL = 'content-v3 doc';

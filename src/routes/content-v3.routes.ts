@@ -21,6 +21,8 @@
  *   POST /api/v1/content-v3/wizard/title   — validateApiAccess (plugin). Search data → Title (W2, W12, W15).
  *   POST /api/v1/content-v3/wizard/town-check — validateApiAccess (plugin). W6 town line.
  *   GET  /api/v1/content-v3/niches         — validateApiAccess (plugin). The niche list (N1 settings).
+ *   POST /api/v1/content-v3/article        — validateApiAccess (plugin), PAID like v2: the Writer
+ *                                            draft 2 article from the session's plan (phase 8).
  *   POST /api/v1/content-v3/wizard/approve — validateApiAccess (plugin). Title check → Research →
  *                                            Planner (W3, P1–P6, G2).
  *   GET  /api/v1/content-v3/status         — validateApiAccess (plugin). Is CONTENT_V3_ENABLED on?
@@ -38,7 +40,6 @@
 
 import { Router, Request, Response } from 'express';
 import {
-  generateContentV3,
   GenerateV3Params,
   ArticleType,
   ARTICLE_TYPES,
@@ -78,7 +79,17 @@ import { livePlannerDeps } from '../services/content-v3-steps/steps.default.js';
 import { liveRegulatedTopics, REGULATED_TOPICS_DEF } from '../services/content-v3/regulated-topics.js';
 import { liveNicheSettings } from '../services/niche-profile/niche-profile.default.js';
 import { createBlueprintRouter } from './content-v3-blueprint.handler.js';
+import { createContentV3ArticleRouter } from './content-v3-article.handler.js';
+import { liveGenerateArticle } from '../services/writer/article.default.js';
+import { isContentV3Regeneration } from '../services/generation-history.js';
+import { reserveCredits, refundCredits, getLiveBalance, ISEO_CREDIT_TYPE } from '../models/user.models.js';
+import { priceOf, affordableWith } from '../services/credit-pricing.js';
+import sql from '../data/db.js';
 import { researchBlock } from '../services/content-v3-steps/xml.js';
+import { runTestChain } from '../services/writer/test-chain.js';
+import { parseBlueprintPins } from './content-v3-blueprint.handler.js';
+import { variantFromWords } from '../services/content-blueprint.js';
+import { toV3UserError } from '../services/content-v3/user-errors.js';
 
 const researchRequestSchema = z.object({
   title: z.string().trim().min(1).max(200),
@@ -96,6 +107,40 @@ const researchRequestSchema = z.object({
 });
 
 const router = Router();
+
+// The paid v3 article (plugin auth). Same price and reserve/refund path as v2's /content-v2/article.
+router.use(
+  '/',
+  createContentV3ArticleRouter({
+    auth: validateApiAccess,
+    store: getContentV3Store,
+    billing: {
+      isRegeneration: (userId, key) => isContentV3Regeneration(userId, key),
+      price: (action, variant) => priceOf(action, variant),
+      reserve: async (userId, cost, reason, websiteId) => {
+        const r = await reserveCredits(userId, ISEO_CREDIT_TYPE, cost, reason, websiteId);
+        return { ok: r.ok, balance_after: r.ok ? r.included_remaining + r.purchased_remaining : undefined };
+      },
+      refund: async (userId, cost, reason, websiteId) => {
+        await refundCredits(userId, ISEO_CREDIT_TYPE, cost, reason, websiteId);
+      },
+      shortfall: async (userId) => {
+        const balance = await getLiveBalance(userId);
+        return { available: balance.total, also_affords: affordableWith(balance.total) };
+      },
+    },
+    generate: (input, opts) => liveGenerateArticle(input, opts),
+    insertGeneration: async (row) => {
+      const rows = await sql`
+        INSERT INTO user_generations (user_id, website_id, type, status, parameters, result, metadata, processing_time_ms, target_key, custom_instruction)
+        VALUES (${row.user_id}, ${row.website_id}, 'content_v3', 'success', ${JSON.stringify(row.parameters)}, ${JSON.stringify(row.result)},
+                ${JSON.stringify(row.metadata)}, ${row.processing_time_ms}, ${row.target_key}, ${row.custom_instruction})
+        RETURNING id
+      `;
+      return rows[0]?.id ?? null;
+    },
+  }),
+);
 
 // Blueprint preview for the tester panel (admin, no model call).
 router.use('/', createBlueprintRouter({ auth: requireAdmin }));
@@ -287,41 +332,89 @@ function parseParamsV3(body: any): ParseResult {
 router.post('/article/test', requireAdmin, async (req: Request, res: Response) => {
   const { error, params, warnings } = parseParamsV3(req.body);
   if (error) return res.status(400).json({ success: false, error });
+  const pins = parseBlueprintPins(req.body?.blueprint_pins);
+  if (pins.error) return res.status(400).json({ success: false, error: pins.error });
+
+  const prof = params!.business_profile ?? {};
+  const reach: 'local' | 'nationwide' = prof.is_local === false ? 'nationwide' : 'local';
+  const pov = ['we', 'i', 'business_name'].includes(req.body?.point_of_view) ? req.body.point_of_view : 'we';
+  const tone = typeof req.body?.tone === 'string' && req.body.tone.trim() ? req.body.tone.trim().slice(0, 40)
+    : typeof params!.niche_data?.preferred_tone === 'string' ? String(params!.niche_data.preferred_tone).slice(0, 40) : undefined;
+  const seed = params!.seed !== undefined && /^-?\d+$/.test(params!.seed) ? Number(params!.seed) : undefined;
+  const nicheDetails = params!.niche_data && typeof params!.niche_data === 'object'
+    ? Object.entries(params!.niche_data).filter(([k]) => k !== 'preferred_tone').map(([k, v]) => `${k}: ${String(v)}`).join('; ')
+    : '';
 
   try {
     const start = Date.now();
-    console.log(`🧪 [v3] test generation: "${params!.seed_keyword}" (${params!.niche})`);
-    const result = await generateContentV3({ ...params!, diagnostics: true });
-
-    if (result.diagnostics && warnings?.length) {
-      result.diagnostics.profile_warnings = warnings;
-    }
-
+    console.log(`🧪 [v3] test chain: "${params!.seed_keyword}" (${params!.niche})`);
+    const r = await runTestChain(
+      {
+        seed_keyword: params!.seed_keyword,
+        niche: params!.niche,
+        title: params!.title,
+        post_size: variantFromWords(params!.nos_of_words ?? '1200 to 2400 words'),
+        language: params!.content_lang,
+        reach,
+        target_town: reach === 'local' ? prof.locations_served?.[0] : undefined,
+        business_name: prof.business_name,
+        business_description: [prof.description, prof.own_words].filter(Boolean).join(' ') || undefined,
+        stand_out: prof.differentiators?.join('; ') || undefined,
+        ideal_client: prof.ideal_client,
+        featured_service: params!.services_selected?.[0] ?? prof.services?.[0]?.name,
+        business_pricing: [prof.price_range, nicheDetails].filter(Boolean).join('; ') || undefined,
+        proof_level: req.body?.proof_level === 'regulated' ? 'regulated' : 'standard',
+        tone,
+        point_of_view: pov,
+        cta: { text: params!.call_to_action ?? prof.call_to_action, url: params!.cta_url ?? prof.cta_url, phone: prof.phone },
+        anything_else: params!.custom_instruction,
+        pins: pins.pins,
+        seed,
+      },
+      {
+        searchData: (q) => lookupSearchData(q, liveSearchDataDeps()),
+        title: (input) => runTitleStep(input, liveTitleDeps()),
+        research: (q) => runResearch(q, { resolveInstructions: () => liveResearchInstructions() }),
+        planner: (input) => runPlannerStep(input, livePlannerDeps()),
+        generate: (input) => liveGenerateArticle(input, { runId: `iseo_test_${Date.now()}` }),
+      },
+    );
+    const a = r.article;
     res.json({
       success: true,
       data: {
-        content: result.content,
-        meta_title: result.meta_title,
-        meta_description: result.meta_description,
-        faq: result.faq,
-        faq_schema: result.faq_schema,
-        schema: result.schema,
-        blueprint: result.blueprint,
-        intelligence: result.intelligence,
-        diagnostics: result.diagnostics,
+        title: r.title,
+        content: a.content,
+        meta_title: a.meta_title,
+        meta_description: a.meta_description,
+        faq: a.faq,
+        faq_schema: a.faq_schema,
+        blueprint: { ...a.picks, fingerprint: a.fingerprint },
+        proof_level: a.proof_level,
+        needs_review: a.needs_review,
+        validator: a.validator,
+        plan: r.plan,
+        plan_fallback: r.plan_fallback,
+        regulated: r.regulated,
+        research: r.research,
+        search_data: r.search_data,
+        diagnostics: {
+          prompts: r.prompts,
+          blueprint_directive: a.messages.blueprint,
+          niche_profile: a.messages.niche_profile,
+          prompt_sources: [],
+          profile_warnings: warnings,
+          validator: a.validator,
+          writer_json: a.writer_json,
+          linked_sources: a.linked_sources,
+        },
       },
-      metadata: {
-        method: 'claude-v3',
-        timings: result.timings,
-        usage: result.usage,
-        totalTime: Date.now() - start,
-      },
+      metadata: { method: 'claude-v3', timings: { ...r.timings, ...a.timings }, cost: a.cost, prompt_version: a.prompt_version, model: a.model, totalTime: Date.now() - start },
     });
   } catch (e) {
-    console.error('❌ [v3] test generation error:', e);
-    res
-      .status(500)
-      .json({ success: false, error: e instanceof Error ? e.message : 'Generation failed' });
+    console.error('❌ [v3] test chain error:', e);
+    const ue = toV3UserError(e);
+    res.status(ue.status).json({ success: false, error: e instanceof Error ? e.message : ue.message });
   }
 });
 

@@ -212,6 +212,14 @@ export class PromptManagementService {
     return activatedVersion;
   }
 
+  /** True when the template has a version carrying one of these labels (e.g. the replace step ran). */
+  async hasVersionLabelled(templateType: string, labels: string[]): Promise<boolean> {
+    const template = await PromptTemplate.findOne({ templateType: templateType as any });
+    if (!template) return false;
+    const v = await PromptVersion.findOne({ templateId: template._id, label: { $in: labels } }).select('_id');
+    return !!v;
+  }
+
   /**
    * Back up the active value of each template as a version labelled "pre-v3" (OPS2, WR3), once.
    * A template that already has a pre-v3 version, or has no active version, is left alone. The

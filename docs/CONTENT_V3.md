@@ -38,12 +38,28 @@ PROMPT 2 on the Perplexity Agent API (`services/research/`), request shape check
 - Cost: `usage.cost.total_cost` from Perplexity, in the `[model-call] step=research` line; summary `[research] run=… facts=… questions=… local_conditions=… dropped=f/q/c … cost_usd=…`.
 - **Not run live yet: needs `PERPLEXITY_API_KEY`, and Zaid's choice of model and effort (working value `PERPLEXITY_EFFORT=low`).** Built and tested against a mocked provider.
 
+## The article (phase 8)
+
+`POST /api/v1/content-v3/article` (plugin auth, **paid exactly like v2**: same price for the chosen size, reserve before the model runs, refund on any failure; regeneration priced from a prior `content_v3`/`content_v2` row for the same wizard slot; a second request for the same session while one runs is refused). Everything Approve title produced is read from the wizard session; step 2's choices come in the body. A missing session answers 409 `session_expired`.
+
+- **Writer draft 2**: system prompt = the core + `<rules_no_invention>`, `<rules_reader_first>`, `<rules_human_style>`, `<rules_seo>`, `<rules_local_seo>`, `<rules_formatting>` (the core's own order), identical for every article, sent with `cache_control`. Measured 14 Nov: 8,399 cached tokens on the second call, writer cost $0.114 → $0.067. User message = `<niche_profile>`, `<blueprint>`, `<recent_headings>`, then the data tags in the doc's order.
+- **Templates**: core `content_v3_system`, `rules_seo` `content_v3_seo_rules`, `rules_reader_first` `content_v3_business_context`, plus four new `content_v3_rules_*`. **Until `/prompts/seed?mode=replace` has run, the three shared templates still hold the pre-v3 texts in production; the server then uses the doc text from code and logs `still holds the pre-v3 text`.** A core without `===WRITER_JSON===` is never used.
+- **Post-processing** (no em-dash stripping, no `<hr>`): HTML allowlist; the first use of up to 4 sources becomes a link, other tokens removed, unknown tokens logged; TOC as `<nav class="iseo-toc">` after the summary (Medium and Large by default); disclaimer before the last two sections only when a text exists (`content_v3_disclaimers` ships empty); FAQ read from the HTML.
+- **Validator**: errors (structure, summary, FAQ count, last two sections, numbered items, question headings, fixed labels, keyword in the first 100 words, vague back-references, word count, Regulated ≥ 3 sources) and warnings (repeated first words, recent headings, em dashes, bold, unknown tokens, the Writer's claims to check). Errors → the Writer runs once more; still failing → `needs_review` (wizard: "Use anyway / Regenerate"). Humanizer thresholds (V10) wait for that document.
+- **Meta** (interim U4): the existing v3 meta wording minus the FAQ part, with the existing length enforcement, on the final article.
+- **Records**: `user_generations` row type `content_v3` (model = the writer model), `content_v3_posts` row (picks, fingerprint, headings, validator), and `[content-v3] cost run=… search_data=… title=… research=… planner=… writer=… meta=… total=…`.
+- **Measured 14 Nov** (no research key): Medium standard article via the tester 1,388 words, first try, writer $0.139; Small regulated article via the wizard 976 words, $0.26 total, `needs_review` because a Regulated post needs 3 sources and there was no research.
+- `POST /api/v1/content-v3/article/test` (admin, no credits) now runs this chain end to end (search data → title if none → research → planner → writer) with the tester's `blueprint_pins`.
+
 ## Routes
 
 | Route | Auth | Purpose |
 |---|---|---|
 | `POST /api/v1/content-v3/search-data` | admin | The search data lookup alone: block, exact XML, per-call meta. Spends ~$0.002 per call. |
 | `POST /api/v1/content-v3/research` | admin | Research alone (optionally after a search data lookup with `run_search_data: true`): mapped research, the `<research>` XML, cost. |
+| `POST /api/v1/content-v3/article` | plugin | The paid v3 article (above). |
+| `POST /api/v1/content-v3/article/test` | admin | The full chain, no credits, with blueprint pins and rendered prompts. |
+| `GET /api/v1/content-v3/blueprint/options`, `POST …/blueprint/preview` | admin | Tester pools and a model-free blueprint preview. |
 | `GET /api/v1/content-v3/status` | plugin | `{ enabled, keyword_data }`. The plugin caches it 5 minutes. |
 | `POST /api/v1/content-v3/session/clear` | plugin | Wizard Leave: deletes the session row. Works with v3 off. |
 | `POST /api/v1/content-v3/prompts/seed` | admin | Registers templates; `?mode=replace` makes every doc-sourced prompt active, backing the old value up as "pre-v3" first. Nothing is deleted. |

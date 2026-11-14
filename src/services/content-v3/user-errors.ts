@@ -17,6 +17,8 @@ export type V3ErrorCode =
   | 'timeout'
   | 'service_unavailable'
   | 'not_configured'
+  | 'session_expired'
+  | 'already_generating'
   | 'server_error';
 
 export interface V3UserError {
@@ -42,6 +44,8 @@ export const V3_MESSAGES = {
   service_unavailable: 'The writing service is busy right now. Please try again in a minute.',
   not_configured: 'Content generation is not available right now. Please contact support if this continues.',
   server_error: 'Something went wrong on our side. Please try again. If it keeps happening, contact support.',
+  session_expired: "This post's plan is no longer available. Go back to step 1 and approve the title again.",
+  already_generating: 'This post is already being generated. Please wait for it to finish.',
 } as const;
 
 export function v3Error(code: V3ErrorCode, message?: string): V3UserError {
@@ -54,6 +58,8 @@ export function v3Error(code: V3ErrorCode, message?: string): V3UserError {
     timeout: 504,
     service_unavailable: 503,
     not_configured: 503,
+    session_expired: 409,
+    already_generating: 409,
     server_error: 500,
   };
   const fallback = (V3_MESSAGES as Record<string, string>)[code] ?? V3_MESSAGES.server_error;
