@@ -54,6 +54,12 @@ credits = (plan_price × target_COGS_share) / 0.0129
 
 where `$0.0129` is the per-credit cost implied by a medium article at `$0.129`.
 
+> **Content v3 (measured 14 Nov, 10-keyword run, `docs/CONTENT_V3.md`):** a v3 medium article costs
+> about `$0.13` when the Writer passes its checks on the first try (on par with the figure above) and
+> `$0.21–0.25` when it needs its second run (7 of 10 did), before research (Perplexity, not yet
+> priced) and the image. v3 charges the same credits as v2, so at today's second-run rate a v3
+> medium article's model cost is above the `$0.129` this formula assumes.
+
 All thirteen are **PM-tunable**: changing one is an env edit plus a redeploy. No code change.
 
 *Boot confirmation:* the logs will show one line — `💳 ISEO credit table loaded — sha256:…`. That

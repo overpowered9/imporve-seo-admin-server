@@ -111,8 +111,9 @@ Content v3 is off until two switches are on: the server's `CONTENT_V3_ENABLED` a
 ### What to watch
 
 - `[model-call] … outcome=…` one line per model attempt; `cache_read` > 0 on the Writer after the first article (prompt caching works).
-- `[content-v3] cost run=… total=…` per article — compare with the expected cost per size (progress doc).
-- `[content-v3] validator … — writing once more (U2)` — how often the Writer needs its second run.
+- `[content-v3] cost run=… total=…` per article. Measured in the 10-keyword run (14 Nov, all steps, no research, keyword data off): Small $0.14 first try / $0.18 with the second Writer run; Medium $0.13 / $0.21–0.25; Large $0.29 (with the second run). Research adds the Perplexity cost once the key exists. Keyword data on (same run) added $0.41 of DataForSEO keyword lookups for 10 articles, about $0.04 each, while migration 022's cache is missing; those lookups are logged per call (`[dataforseo]`), not in this line. The image is not in this line (v2 image route, unchanged).
+- `[content-v3] validator … — writing once more (U2)` — how often the Writer needs its second run (7 of 10 in the 10-keyword run).
+- `validator=fail(…)` with `word_count` on Medium and Large: the Writer wrote about 70% of the body word targets on Medium and about 55% on Large in that run (Small about 95%), so Large articles came out under 2,400 words. A tuning decision for the team lead (aims, ranges or a length note in the second run).
 - `[content-v3] article … validator=fail(…)` — articles that needed review.
 - `[search-data] … local=failed(…)` and `[research] failed` — provider trouble (the chain continues without them).
 - `REFUND FAILED` — must never appear; if it does, refund by hand with the logged user and amount.

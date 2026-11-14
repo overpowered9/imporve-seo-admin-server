@@ -22,6 +22,16 @@ Everything below is off until `CONTENT_V3_ENABLED=true` and a site switches "Use
 - `/content-v3/article/test` (admin) runs the new chain with the tester's blueprint pins.
 - The v2 article row records the writing model (BUG3).
 - The version route keeps the admin panel's version name (it was dropped).
+- `/api/v1/generations` (the admin tester's saved generations) requires an admin token; it was open to anyone.
+- The keyword-data Title and Planner prompts are the V1 text byte for byte plus one appended KEYWORD DATA block; the Planner block adds one sentence naming its two extra JSON fields (C6, approved 14 Nov).
+
+### Fixed by the 10-keyword runs
+- The Writer added a second summary (takeaways after a quick answer, or the reverse): the code-built SUMMARY line now says it is the only summary.
+- "Larger than suggested" articles landed just under their range: step 3m aims a quarter into the range.
+- The keyword check accepts the closest natural wording (contractions, -ing / -ed forms).
+- The blueprint asked for more body sections than the Planner had questions, so the Writer dropped one and fell short: the count now stops at the number of questions (never below the size's minimum).
+- An honest empty FAQ list (no People Also Ask questions) cost three Planner attempts and then the bare fallback plan: the 1-FAQ minimum now applies only when there were real questions to use.
+- `npm run v3:ten-keywords -- --keyword-data` runs the list with keyword data on as well; `--render <off>,<on>` builds one sheet with both.
 
 ### Not yet
 - Perplexity key, model and effort; disclaimer texts; the Humanizer v1.2 thresholds; the wizard input-fields doc; doc C's size table (working values are noted in the plugin's `docs/CONTENT_V3_PROGRESS.md`).
