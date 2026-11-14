@@ -89,12 +89,17 @@ export interface ArticleV3Deps {
   blueprintPieces?: Readonly<Record<string, string>>;
   /** A1: word-target factor per size (config CONTENT_V3_TARGET_CALIBRATION_JSON); missing = 1. */
   targetCalibration?: Partial<Record<PostSize, number>>;
+  /** The request's deadline (epoch ms, B-3): no model attempt starts after it. */
+  deadlineAt?: number;
   runId?: string;
   log?: (line: string) => void;
   now?: () => number;
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+/** B-3: a second Writer run needs at least this much time before the deadline (a Large run is ~2 min). */
+export const SECOND_RUN_MIN_MS = 150_000;
 
 /**
  * A1: how much the second Writer run's targets move after a draft outside the size's range — up by
@@ -264,6 +269,7 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
       runId: deps.runId,
       log,
       now,
+      deadlineAt: deps.deadlineAt,
     });
     writerMs += now() - t0;
     writerAttempts += r.attempts.length;
@@ -295,6 +301,9 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
     const codes = best.report.issues.filter((x) => x.severity === 'error').map((x) => x.code).join(',');
     if (skipSecondRun(best.report, Object.keys(sources).length)) {
       log(`[content-v3] validator run=${deps.runId ?? '-'} errors=${best.report.errors} codes=${codes} — second run skipped (regulated sources need research: ${Object.keys(sources).length} source(s))`);
+    } else if (deps.deadlineAt !== undefined && deps.deadlineAt - now() < SECOND_RUN_MIN_MS) {
+      // B-3: a second Writer run that cannot finish before the deadline would only add cost.
+      log(`[content-v3] validator run=${deps.runId ?? '-'} errors=${best.report.errors} codes=${codes} — second run skipped (deadline: ${Math.round((deps.deadlineAt - now()) / 1000)} s left)`);
     } else {
       // A1: a draft outside the size's range gets its second run with rescaled targets (same wording).
       const factor = best.report.issues.some((x) => x.code === 'word_count') ? repairTargetFactor(best.report.word_count, input.post_size) : 1;
@@ -324,7 +333,7 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
   }
 
   const tm = now();
-  const meta = await generateMetaV3(input.seed_keyword, html, { call: deps.call, model: deps.metaModel, timeoutMs: deps.metaTimeoutMs, runId: deps.runId, log });
+  const meta = await generateMetaV3(input.seed_keyword, html, { call: deps.call, model: deps.metaModel, timeoutMs: deps.metaTimeoutMs, runId: deps.runId, log, deadlineAt: deps.deadlineAt });
   const metaMs = now() - tm;
   const faq = extractFaq(html);
 

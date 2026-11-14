@@ -72,7 +72,7 @@ export function v3Error(code: V3ErrorCode, message?: string): V3UserError {
 /** Map anything thrown inside a v3 route to a user-safe error. The caller logs `err` itself. */
 export function toV3UserError(err: unknown): V3UserError {
   if (err instanceof StepFailedError) {
-    const allTimeouts = err.attempts.length > 0 && err.attempts.every((a) => (a.reason ?? '').includes('timed out after'));
+    const allTimeouts = err.attempts.length > 0 && err.attempts.every((a) => (a.reason ?? '').includes('timed out after') || (a.reason ?? '').startsWith('deadline'));
     if (allTimeouts) return v3Error('timeout');
     const what = STEP_LABEL[err.step] ?? 'finish this step';
     return v3Error('step_failed', `We couldn't ${what} this time. Please try again.`);

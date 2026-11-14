@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { startTestApp, fakePluginAuth, PLUGIN_HEADERS, type TestApp } from '../test/helpers/http-app.js';
 import { createContentV3ArticleRouter, regulatedV3Allowed, type BillingDeps, type GenerationRow } from './content-v3-article.handler.js';
 import { createMemoryContentV3Store } from '../services/content-v3/store.js';
+import { createMemoryRunsStore, retryPendingRefunds, type RunsStore } from '../services/content-v3/runs.js';
 import type { ArticleV3Input, ArticleV3Result } from '../services/writer/article.js';
 
 const KEY = 'iseo_tk_0123456789abcdef0123456789abcdef';
@@ -35,7 +36,7 @@ afterEach(async () => {
   await a?.close();
 });
 
-async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, unknown> | null; generate?: (i: ArticleV3Input) => Promise<ArticleV3Result>; regen?: boolean; reserveOk?: boolean; disclaimerKeys?: string[] } = {}) {
+async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, unknown> | null; generate?: (i: ArticleV3Input) => Promise<ArticleV3Result>; regen?: boolean; reserveOk?: boolean; disclaimerKeys?: string[]; runs?: RunsStore; deadlineMs?: number; refundFails?: boolean } = {}) {
   const store = createMemoryContentV3Store();
   if (opts.session !== null) await store.mergeSession(7, 3, KEY, opts.session ?? SESSION);
   const events: string[] = [];
@@ -51,6 +52,7 @@ async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, u
     },
     refund: async (_u, cost) => {
       events.push(`refund:${cost}`);
+      if (opts.refundFails) throw new Error('billing down');
     },
     shortfall: async () => ({ available: 4, also_affords: 'an AI image' }),
   };
@@ -70,6 +72,8 @@ async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, u
     env: opts.env ?? ON,
     log: (l) => logs.push(l),
     disclaimerKeys: async () => opts.disclaimerKeys ?? [],
+    runs: opts.runs,
+    deadlineMs: opts.deadlineMs,
   });
   app = await startTestApp([['/api/v1/content-v3', router]]);
   return { app, store, events, rows, inputs, logs };
@@ -164,6 +168,79 @@ describe('POST /content-v3/article', () => {
     // A Standard business never needs a disclaimer text.
     assert.equal(regulatedV3Allowed([], 'plumbing', null), false);
     assert.equal(regulatedV3Allowed(['health_regulated'], 'dental', 'health_regulated'), true);
+  });
+
+  test('B-3: the same click retried replays the stored article — charged once, written once', async () => {
+    const runs = createMemoryRunsStore();
+    const { app, events } = await start({ runs });
+    const body = { ...BODY, request_id: 'iseo_rq_0123456789abcdef' };
+    const first = await app.post('/api/v1/content-v3/article', body, PLUGIN_HEADERS);
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    const again = await app.post('/api/v1/content-v3/article', body, PLUGIN_HEADERS);
+    assert.equal(again.status, 200);
+    assert.deepEqual(again.body, first.body, 'the replay is the stored answer');
+    assert.deepEqual(events, ['reserve:10', 'generate'], 'one charge, one generation');
+    assert.equal(runs.rows[0].status, 'succeeded');
+    assert.equal(runs.rows[0].generation_id, 555);
+  });
+
+  test('B-3: a different click while one runs is refused by the ledger (any instance)', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const runs = createMemoryRunsStore();
+    const { app, events } = await start({ runs, generate: async () => { await gate; return result(); } });
+    const first = app.post('/api/v1/content-v3/article', { ...BODY, request_id: 'iseo_rq_aaaaaaaaaaaaaaaa' }, PLUGIN_HEADERS);
+    await new Promise((r) => setTimeout(r, 50));
+    // A second router (another server instance) sharing the same ledger.
+    const other = await startTestApp([['/api/v1/content-v3', createContentV3ArticleRouter({
+      auth: fakePluginAuth({ id: 7 }, { id: 3 }),
+      store: async () => { const s = createMemoryContentV3Store(); await s.mergeSession(7, 3, KEY, SESSION); return s; },
+      billing: { isRegeneration: async () => false, price: () => 10, reserve: async () => { events.push('reserve:other'); return { ok: true }; }, refund: async () => {}, shortfall: async () => ({ available: 0, also_affords: null }) },
+      generate: async () => result(),
+      insertGeneration: async () => 1,
+      env: ON,
+      log: () => {},
+      runs,
+    })]]);
+    const second = await other.post('/api/v1/content-v3/article', { ...BODY, request_id: 'iseo_rq_bbbbbbbbbbbbbbbb' }, PLUGIN_HEADERS);
+    await other.close();
+    release();
+    assert.equal(second.status, 409);
+    assert.equal(second.body.error, 'already_generating');
+    assert.equal((await first).status, 200);
+    assert.deepEqual(events.filter((e) => e.startsWith('reserve')), ['reserve:10']);
+  });
+
+  test('B-3: a refund that fails is queued (refund_pending) and the retry loop refunds it', async () => {
+    const runs = createMemoryRunsStore();
+    const { app, events, logs } = await start({ runs, refundFails: true, generate: async () => { throw new Error('writer: no valid output after 3 attempts'); } });
+    const r = await app.post('/api/v1/content-v3/article', { ...BODY, request_id: 'iseo_rq_cccccccccccccccc' }, PLUGIN_HEADERS);
+    assert.equal(r.status, 500);
+    assert.equal(runs.rows[0].status, 'refund_pending');
+    assert.match(logs.join('\n'), /REFUND FAILED user=7 amount=10 \(queued for retry\)/);
+    const done = await retryPendingRefunds(runs, async () => {}, () => {});
+    assert.deepEqual(done, { refunded: 1, failed: 0 });
+    assert.equal(runs.rows[0].status, 'refunded');
+    assert.deepEqual(events, ['reserve:10', 'generate', 'refund:10']);
+  });
+
+  test('B-3: a generation that hangs past the deadline is answered as a timeout and refunded', async () => {
+    const runs = createMemoryRunsStore();
+    const { app, events } = await start({ runs, deadlineMs: 30, generate: () => new Promise<ArticleV3Result>(() => {}) });
+    const r = await app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);
+    assert.equal(r.status, 504, JSON.stringify(r.body));
+    assert.equal(r.body.error, 'timeout');
+    assert.deepEqual(events, ['reserve:10', 'generate', 'refund:10']);
+    assert.equal(runs.rows[0].status, 'refunded');
+  });
+
+  test('B-3: with the ledger unavailable (no migration 024), the in-process lock still guards and the article is made', async () => {
+    const broken: RunsStore = { ...createMemoryRunsStore(), claim: async () => { throw new Error('relation "content_v3_runs" does not exist'); } };
+    const { app, events, logs } = await start({ runs: broken });
+    const r = await app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);
+    assert.equal(r.status, 200);
+    assert.deepEqual(events, ['reserve:10', 'generate']);
+    assert.match(logs.join('\n'), /runs ledger unavailable — using the in-process lock/);
   });
 
   test('v3 off → 409 v3_disabled; bad input → 400', async () => {

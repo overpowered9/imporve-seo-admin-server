@@ -58,6 +58,20 @@ CREATE TABLE IF NOT EXISTS keyword_related_cache (
 CREATE INDEX IF NOT EXISTS keyword_related_cache_expires_idx ON keyword_related_cache (expires_at);
 
 ALTER TABLE keyword_related_cache ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  id          TEXT        PRIMARY KEY,
+  applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE schema_migrations ENABLE ROW LEVEL SECURITY;
+INSERT INTO schema_migrations (id) VALUES ('022-keyword-data-cache') ON CONFLICT (id) DO NOTHING;
+`;
+
+/** Reverses 022 (the caches only hold copies of DataForSEO answers; nothing else depends on them). */
+export const DOWN_SQL = `
+DROP TABLE IF EXISTS keyword_related_cache;
+DROP TABLE IF EXISTS keyword_metrics_cache;
+DELETE FROM schema_migrations WHERE id = '022-keyword-data-cache';
 `;
 
 export async function up(): Promise<void> {

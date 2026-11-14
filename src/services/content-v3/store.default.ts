@@ -6,6 +6,7 @@
 import { contentV3Config } from '../../config/content-v3.config.js';
 import type { SqlLike } from '../keyword-data/keyword-data-cache.js';
 import { createContentV3Store, createMemoryContentV3Store, type ContentV3Store } from './store.js';
+import { createMemoryRunsStore, createPostgresRunsStore, retryPendingRefunds, type RunsStore } from './runs.js';
 
 const PURGE_EVERY_MS = 60 * 60 * 1000;
 
@@ -44,4 +45,42 @@ export async function getContentV3Store(): Promise<ContentV3Store> {
 /** Tests replace the live store. */
 export function setContentV3StoreForTests(s: ContentV3Store | null): void {
   store = s;
+}
+
+let runs: RunsStore | null = null;
+
+/** B-3: the run ledger (migration 024); in-process for CONTENT_V3_STORE=memory (local only). */
+export async function getContentV3Runs(): Promise<RunsStore> {
+  if (runs) return runs;
+  if (process.env.CONTENT_V3_STORE === 'memory') {
+    runs = createMemoryRunsStore();
+    return runs;
+  }
+  const { default: sql } = await import('../../data/db.js');
+  runs = createPostgresRunsStore(sql as unknown as SqlLike);
+  return runs;
+}
+
+let refundTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * B-3: every 10 minutes, retry refunds that failed (refund_pending); once a day, purge run rows
+ * older than 90 days. Started by the routes only while CONTENT_V3_ENABLED is on; unref'd, so it
+ * never keeps the process alive.
+ */
+export function startRunsHousekeeping(refund: (userId: number, cost: number, reason: string, websiteId?: number) => Promise<void>): void {
+  if (refundTimer) return;
+  let lastRunsPurge = 0;
+  refundTimer = setInterval(() => {
+    void (async () => {
+      const r = await getContentV3Runs();
+      await retryPendingRefunds(r, refund);
+      if (Date.now() - lastRunsPurge > 24 * 60 * 60 * 1000) {
+        lastRunsPurge = Date.now();
+        const n = await r.purge(90).catch(() => 0);
+        if (n > 0) console.log(`[content-v3] purged ${n} run ledger rows older than 90 days`);
+      }
+    })().catch((err) => console.log(`[content-v3] runs housekeeping failed: ${err instanceof Error ? err.message : String(err)}`));
+  }, 10 * 60 * 1000);
+  refundTimer.unref?.();
 }

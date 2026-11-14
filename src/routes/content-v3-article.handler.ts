@@ -18,8 +18,10 @@
  *
  * Pure handler with injected dependencies; content-v3.routes.ts does the live wiring.
  */
+import { randomUUID } from 'node:crypto';
 import { Router, type RequestHandler, type Response } from 'express';
 import { z } from 'zod';
+import { REQUEST_ID_RE, type RunsStore } from '../services/content-v3/runs.js';
 import type { AuthenticatedRequest } from '../middleware/apiAuth.middleware.js';
 import { contentV3Enabled } from '../config/content-v3.config.js';
 import type { ContentV3Store, ContentV3PostRow } from '../services/content-v3/store.js';
@@ -38,6 +40,8 @@ const txt = (max: number) => z.string().trim().max(max).optional();
 
 export const articleRequestSchema = z.object({
   session_key: sessionKeySchema,
+  /** B-3: one id per click, kept by the plugin until the article arrives; a retry with it replays. */
+  request_id: z.string().trim().regex(REQUEST_ID_RE, 'request_id is not valid').optional(),
   article_type: z.enum(['cost', 'decision', 'question', 'topic']).optional(),
   post_size: z.enum(SIZES),
   /** Step 2's Keep (true) / Turn off (false); omitted or null when no regulated line was shown. */
@@ -81,8 +85,12 @@ export interface ContentV3ArticleDeps {
   auth: RequestHandler;
   store: () => Promise<ContentV3Store>;
   billing: BillingDeps;
-  generate: (input: ArticleV3Input, opts: { runId: string }) => Promise<ArticleV3Result>;
+  generate: (input: ArticleV3Input, opts: { runId: string; deadlineAt?: number }) => Promise<ArticleV3Result>;
   insertGeneration: (row: GenerationRow) => Promise<number | null>;
+  /** B-3: the run ledger (migration 024). Absent or unavailable → the in-process lock only. */
+  runs?: RunsStore;
+  /** B-3: the whole request's budget; below the plugin's 600 s timeout. Default 480 s. */
+  deadlineMs?: number;
   /**
    * A3 (decision 14 Nov): the niche and profile keys that have a disclaimer text. A Regulated
    * business whose niche has none stays on v2 (409 v3_regulated_disabled, before any charge).
@@ -91,6 +99,21 @@ export interface ContentV3ArticleDeps {
   env?: NodeJS.ProcessEnv;
   log?: (line: string) => void;
   now?: () => number;
+}
+
+export const DEFAULT_ARTICLE_DEADLINE_MS = 480_000;
+/** A running ledger row older than the deadline plus this is from a dead process (B-3). */
+const STALE_GRACE_MS = 60_000;
+/** The generation promise gets this long past the deadline before the request gives up on it. */
+const DEADLINE_GRACE_MS = 15_000;
+
+/** Rejects with a "timed out" error (a plain timeout message for the user) when `ms` passes first. */
+export function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out: no article within ${Math.round(ms / 1000)} s`)), ms);
+  });
+  return Promise.race([p, late]).finally(() => clearTimeout(timer));
 }
 
 /** A3: true when a Regulated business may use v3 (its niche or profile has a disclaimer text). */
@@ -155,15 +178,41 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
       }
     }
 
+    // B-3: claim this request in the run ledger before any charge. A finished request with the same
+    // request_id is answered from the ledger (no second charge); another run of this session → 409.
+    const requestId = b.request_id ?? `srv_${randomUUID().replace(/-/g, '')}`;
+    const deadlineMs = deps.deadlineMs ?? DEFAULT_ARTICLE_DEADLINE_MS;
+    let ledgerId: number | null = null;
+    if (deps.runs) {
+      try {
+        const claim = await deps.runs.claim({ user_id: userId, website_id: websiteId, session_key: b.session_key, request_id: requestId, stale_after_ms: deadlineMs + STALE_GRACE_MS });
+        if (claim.kind === 'replay') {
+          log(`[content-v3] article replayed run=${b.session_key} request=${requestId} (no charge)`);
+          return res.json(claim.response);
+        }
+        if (claim.kind === 'busy') return res.status(409).json(v3ErrorBody(v3Error('already_generating')));
+        ledgerId = claim.id;
+      } catch (err) {
+        log(`[content-v3] runs ledger unavailable — using the in-process lock: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+      }
+    }
+    const ledgerWrite = async (what: string, fn: (runs: RunsStore, id: number) => Promise<void>) => {
+      if (ledgerId === null || !deps.runs) return;
+      await fn(deps.runs, ledgerId).catch((err) => log(`[content-v3] runs ledger ${what} failed id=${ledgerId}: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`));
+    };
+
     inFlight.add(lockKey);
     const variant = b.post_size;
     let charged = 0;
+    const startedAt = now();
+    const deadlineAt = startedAt + deadlineMs;
     try {
       const regen = await deps.billing.isRegeneration(userId, b.session_key);
       const action = regen ? 'content_regen' : 'content';
       const cost = deps.billing.price(action, variant);
       const reservation = await deps.billing.reserve(userId, cost, `Content v3 (${regen ? 'regen' : 'new'}, ${variant}): ${a.seed_keyword.substring(0, 180)}`, websiteId ?? undefined);
       if (!reservation.ok) {
+        await ledgerWrite('failed', (runs, id) => runs.failed(id, { error: 'insufficient_credits', refund_pending: false }));
         const s = await deps.billing.shortfall(userId, cost);
         return res.status(402).json({
           success: false,
@@ -178,10 +227,11 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
         });
       }
       charged = cost;
+      await ledgerWrite('charged', (runs, id) => runs.charged(id, { cost, action, variant }));
 
       const history = historyFor(await store.recentPosts(userId, websiteId ?? 0, 20));
       const started = now();
-      const r = await deps.generate(
+      const generation = deps.generate(
         {
           title: a.title,
           seed_keyword: a.seed_keyword,
@@ -212,8 +262,10 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
           anything_else: b.anything_else,
           history,
         },
-        { runId: b.session_key },
+        { runId: b.session_key, deadlineAt },
       );
+      // B-3: the model calls stop at the deadline; this bounds anything else that could hang.
+      const r = await withDeadline(generation, Math.max(1_000, deadlineAt - now()) + DEADLINE_GRACE_MS);
       const processing = now() - started;
 
       const generationId = await deps.insertGeneration({
@@ -260,7 +312,7 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
         last_article: { generation_id: generationId, fingerprint: r.fingerprint, proof_level: r.proof_level, needs_review: r.needs_review },
       });
 
-      return res.json({
+      const body = {
         success: true,
         data: {
           generation_id: generationId,
@@ -287,14 +339,30 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
           cost_usd: ledger.total(),
           credits: { charged: cost, action, variant, balance_after: reservation.balance_after ?? null },
         },
-      });
+      };
+      // B-3: the answer is kept, so a retry of this click replays it instead of buying it again.
+      await ledgerWrite('succeeded', (runs, id) =>
+        runs.succeeded(id, {
+          generation_id: generationId,
+          response: body,
+          step_costs: { ...(session.cost ?? {}), writer: r.cost.writer ?? 0, meta: r.cost.meta ?? 0 },
+          timings: { total_ms: now() - startedAt, writer_ms: r.timings.writer_ms, meta_ms: r.timings.meta_ms },
+        }),
+      );
+      return res.json(body);
     } catch (err) {
+      let refundFailed = false;
       if (charged > 0) {
         await deps.billing
           .refund(userId, charged, `Refund — content v3 generation failed: ${a.seed_keyword.substring(0, 160)}`, websiteId ?? undefined)
-          .catch((e) => log(`[content-v3] REFUND FAILED user=${userId} amount=${charged}: ${e instanceof Error ? e.message : String(e)}`));
+          .catch((e) => {
+            refundFailed = true;
+            log(`[content-v3] REFUND FAILED user=${userId} amount=${charged} (${ledgerId !== null ? 'queued for retry' : 'no ledger: refund by hand'}): ${e instanceof Error ? e.message : String(e)}`);
+          });
       }
-      log(`[content-v3] article failed run=${b.session_key} refunded=${charged}: ${err instanceof Error ? err.message : String(err)}`);
+      const message = err instanceof Error ? err.message : String(err);
+      await ledgerWrite('failed', (runs, id) => runs.failed(id, { error: message, refund_pending: refundFailed }));
+      log(`[content-v3] article failed run=${b.session_key} refunded=${refundFailed ? 0 : charged}: ${message}`);
       const e = toV3UserError(err);
       return res.status(e.status).json(v3ErrorBody(e));
     } finally {

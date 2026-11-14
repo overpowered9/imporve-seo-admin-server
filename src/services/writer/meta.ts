@@ -51,6 +51,8 @@ export interface MetaDeps {
   timeoutMs: number;
   runId?: string;
   log?: (line: string) => void;
+  /** The article request's deadline (B-3): meta calls never run past it. */
+  deadlineAt?: number;
 }
 
 export interface MetaResult {
@@ -82,6 +84,7 @@ export async function generateMetaV3(seedKeyword: string, html: string, deps: Me
         return { meta_title: String(o?.meta_title ?? '').trim(), meta_description: String(o?.meta_description ?? '').trim() };
       },
       runId: deps.runId,
+      deadlineAt: deps.deadlineAt,
       log: deps.log,
     });
     first = r.value;
@@ -108,6 +111,7 @@ export async function generateMetaV3(seedKeyword: string, html: string, deps: Me
           call: deps.call,
           parse: (t) => String((parseJsonLoose(t) as Record<string, unknown>)?.[kind] ?? '').trim(),
           runId: deps.runId,
+      deadlineAt: deps.deadlineAt,
           log: deps.log,
         });
         usage.push(...r.usage);

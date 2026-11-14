@@ -38,6 +38,7 @@ const migrations = [
   ['020 — website_limit for Grow (3) and Optimize (5)', '../migrations/020-plan-website-limits-v2.js'],
   ['022 — keyword data cache (DataForSEO Labs metrics + related keywords)', '../migrations/022-keyword-data-cache.js'],
   ['023 — Content v3 session store + per-post history', '../migrations/023-content-v3-store.js'],
+  ['024 — Content v3 run ledger (credits once), daily quotas, schema_migrations', '../migrations/024-content-v3-runs.js'],
 ] as const;
 // NOTE: 009–013 are absent from this list and were before 014 was added. Left
 // alone deliberately rather than fixed in passing — whoever added them either
@@ -57,8 +58,15 @@ async function main() {
     '',
   ];
 
-  for (const [title, path] of migrations) {
+  // --down prints the reversal of every migration that ships one (022 onward), newest first.
+  const down = process.argv.includes('--down');
+  if (down) out.splice(0, 1, '-- ImproveSEO — ROLLBACK of the migrations that ship DOWN statements, newest first.', '-- Drops tables and their data. Run only to roll a migration back.');
+  for (const [title, path] of down ? [...migrations].reverse() : migrations) {
     const mod = await import(path);
+    if (down) {
+      if (typeof mod.DOWN_SQL === 'string') out.push(rule, `-- DOWN ${title}`, rule, mod.DOWN_SQL.trim(), '');
+      continue;
+    }
     if (typeof mod.MIGRATION_SQL !== 'string') {
       throw new Error(`${path} does not export MIGRATION_SQL`);
     }

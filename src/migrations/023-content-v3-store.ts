@@ -66,6 +66,20 @@ CREATE TABLE IF NOT EXISTS content_v3_posts (
 CREATE INDEX IF NOT EXISTS content_v3_posts_site_idx ON content_v3_posts (user_id, website_id, created_at DESC);
 
 ALTER TABLE content_v3_posts ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  id          TEXT        PRIMARY KEY,
+  applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE schema_migrations ENABLE ROW LEVEL SECURITY;
+INSERT INTO schema_migrations (id) VALUES ('023-content-v3-store') ON CONFLICT (id) DO NOTHING;
+`;
+
+/** Reverses 023: drops the wizard sessions and the per-post history (the blueprint loses its memory). */
+export const DOWN_SQL = `
+DROP TABLE IF EXISTS content_v3_posts;
+DROP TABLE IF EXISTS content_v3_sessions;
+DELETE FROM schema_migrations WHERE id = '023-content-v3-store';
 `;
 
 export async function up(): Promise<void> {

@@ -42,6 +42,8 @@ export interface ContentV3Config {
    * the BODY line is the doc's. CONTENT_V3_TARGET_CALIBRATION_JSON, e.g. {"medium":1.3}.
    */
   targetCalibration: Record<'small' | 'medium' | 'large', number>;
+  /** B-3: the paid article request's whole budget; kept below the plugin's 600 s HTTP timeout. */
+  articleDeadlineMs: number;
 }
 
 export const DEFAULT_TARGET_CALIBRATION = { small: 1.0, medium: 1.3, large: 1.6 } as const;
@@ -77,5 +79,6 @@ export function contentV3Config(env: NodeJS.ProcessEnv = process.env): ContentV3
     },
     sessionTtlDays: intEnv(env, 'CONTENT_V3_SESSION_TTL_DAYS', 7, 1, 90),
     targetCalibration: targetCalibration(env),
+    articleDeadlineMs: intEnv(env, 'CONTENT_V3_ARTICLE_DEADLINE_MS', 480_000, 60_000, 570_000),
   };
 }

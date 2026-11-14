@@ -156,6 +156,11 @@ export interface ModelCallSpec<T> {
   log?: (line: string) => void;
   now?: () => number;
   env?: NodeJS.ProcessEnv;
+  /** The request's deadline (epoch ms, B-3): no attempt starts after it; each gets at most what is left. */
+  deadlineAt?: number;
+  /** Retry waits (B-6); default from CONTENT_V3_RETRY_BASE_MS. */
+  backoff?: { baseMs: number; maxMs: number };
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface ModelCallResult<T> extends AttemptsResult<T> {
@@ -193,9 +198,15 @@ export async function runModelCall<T>(spec: ModelCallSpec<T>): Promise<ModelCall
     // The [v3-step] lines stay quiet here; the [model-call] line below carries the same facts.
     log: () => {},
     now,
+    deadlineAt: spec.deadlineAt,
+    backoff: spec.backoff,
+    sleep: spec.sleep,
     call: async (attempt) => {
-      const res = await withTimeout(spec.timeoutMs, (signal) =>
-        call({ system: spec.system, user: spec.user, model, maxTokens: spec.maxTokens, signal, timeoutMs: spec.timeoutMs }),
+      // Never let one attempt run past the request's deadline (B-3).
+      const left = spec.deadlineAt !== undefined ? spec.deadlineAt - now() : Infinity;
+      const timeoutMs = Math.max(1_000, Math.min(spec.timeoutMs, left));
+      const res = await withTimeout(timeoutMs, (signal) =>
+        call({ system: spec.system, user: spec.user, model, maxTokens: spec.maxTokens, signal, timeoutMs }),
       );
       stopReasons.set(attempt, res.stop_reason);
       reportedCost.set(attempt, res.cost_usd);

@@ -74,7 +74,7 @@ export async function liveBlueprintPieces(svc = new PromptManagementService()): 
   }
 }
 
-export async function liveGenerateArticle(input: ArticleV3Input, opts: { runId: string }): Promise<ArticleV3Result> {
+export async function liveGenerateArticle(input: ArticleV3Input, opts: { runId: string; deadlineAt?: number }): Promise<ArticleV3Result> {
   const cfg = contentV3Config();
   const svc = new PromptManagementService();
   const [writerParts, blueprintPieces, niche] = await Promise.all([liveWriterParts(svc), liveBlueprintPieces(svc), liveNicheSettings(svc)]);
@@ -89,6 +89,7 @@ export async function liveGenerateArticle(input: ArticleV3Input, opts: { runId: 
     blueprintPieces,
     niche,
     targetCalibration: cfg.targetCalibration,
+    deadlineAt: opts.deadlineAt,
     runId: opts.runId,
   });
 }

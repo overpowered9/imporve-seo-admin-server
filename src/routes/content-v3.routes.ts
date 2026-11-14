@@ -59,7 +59,9 @@ import keywordDataRoutes from './content-v3-keyword-data.routes.js';
 import stepsRoutes from './content-v3-steps.routes.js';
 import { createContentV3PluginRouter } from './content-v3-plugin.handler.js';
 import { validateApiAccessWithoutStamp } from '../middleware/apiAuth.middleware.js';
-import { getContentV3Store } from '../services/content-v3/store.default.js';
+import { getContentV3Store, getContentV3Runs, startRunsHousekeeping } from '../services/content-v3/store.default.js';
+import type { RunsStore } from '../services/content-v3/runs.js';
+import { contentV3Config, contentV3Enabled } from '../config/content-v3.config.js';
 import { checkV3Prompts, v3DocPromptDefs } from '../services/prompt-seed.v3.js';
 import { PromptManagementService } from '../services/prompt-management.service.js';
 import { createSearchDataRouter } from './content-v3-search-data.handler.js';
@@ -121,6 +123,23 @@ async function liveDisclaimerKeys(): Promise<string[]> {
   return keys;
 }
 
+// B-3: the run ledger, loaded on first use (the database module is imported lazily).
+const lazyRuns: RunsStore = {
+  claim: async (p) => (await getContentV3Runs()).claim(p),
+  charged: async (id, p) => (await getContentV3Runs()).charged(id, p),
+  succeeded: async (id, p) => (await getContentV3Runs()).succeeded(id, p),
+  failed: async (id, p) => (await getContentV3Runs()).failed(id, p),
+  takePendingRefunds: async (n) => (await getContentV3Runs()).takePendingRefunds(n),
+  refundDone: async (id, ok) => (await getContentV3Runs()).refundDone(id, ok),
+  bySession: async (k, n) => (await getContentV3Runs()).bySession(k, n),
+  purge: async (d) => (await getContentV3Runs()).purge(d),
+};
+const refundV3 = async (userId: number, cost: number, reason: string, websiteId?: number) => {
+  await refundCredits(userId, ISEO_CREDIT_TYPE, cost, reason, websiteId);
+};
+// Refunds that failed are retried every 10 minutes while v3 is on.
+if (contentV3Enabled()) startRunsHousekeeping(refundV3);
+
 // The paid v3 article (plugin auth). Same price and reserve/refund path as v2's /content-v2/article.
 router.use(
   '/',
@@ -134,9 +153,7 @@ router.use(
         const r = await reserveCredits(userId, ISEO_CREDIT_TYPE, cost, reason, websiteId);
         return { ok: r.ok, balance_after: r.ok ? r.included_remaining + r.purchased_remaining : undefined };
       },
-      refund: async (userId, cost, reason, websiteId) => {
-        await refundCredits(userId, ISEO_CREDIT_TYPE, cost, reason, websiteId);
-      },
+      refund: refundV3,
       shortfall: async (userId) => {
         const balance = await getLiveBalance(userId);
         return { available: balance.total, also_affords: affordableWith(balance.total) };
@@ -153,6 +170,8 @@ router.use(
       return rows[0]?.id ?? null;
     },
     disclaimerKeys: liveDisclaimerKeys,
+    runs: lazyRuns,
+    deadlineMs: contentV3Config().articleDeadlineMs,
   }),
 );
 

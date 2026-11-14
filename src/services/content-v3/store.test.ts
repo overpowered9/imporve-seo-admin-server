@@ -109,9 +109,16 @@ describe('migration 023', () => {
   test('idempotent DDL with RLS on both tables and cascade on user and website delete', () => {
     assert.match(src, /CREATE TABLE IF NOT EXISTS content_v3_sessions/);
     assert.match(src, /CREATE TABLE IF NOT EXISTS content_v3_posts/);
-    assert.equal((src.match(/ENABLE ROW LEVEL SECURITY/g) || []).length, 2);
+    for (const t of ['content_v3_sessions', 'content_v3_posts', 'schema_migrations']) {
+      assert.match(src, new RegExp(`ALTER TABLE ${t} ENABLE ROW LEVEL SECURITY;`), t);
+    }
     assert.equal((src.match(/REFERENCES users\(id\) ON DELETE CASCADE/g) || []).length, 2);
     assert.equal((src.match(/REFERENCES websites\(id\) ON DELETE CASCADE/g) || []).length, 2);
     assert.match(src, /PRIMARY KEY \(user_id, website_id, session_key\)/);
+  });
+
+  test('records itself in schema_migrations and ships its reversal (DOWN_SQL)', () => {
+    assert.match(src, /INSERT INTO schema_migrations \(id\) VALUES \('023-content-v3-store'\) ON CONFLICT \(id\) DO NOTHING;/);
+    assert.match(src, /export const DOWN_SQL = `\nDROP TABLE IF EXISTS content_v3_posts;\nDROP TABLE IF EXISTS content_v3_sessions;/);
   });
 });
