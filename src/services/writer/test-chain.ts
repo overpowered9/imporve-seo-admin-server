@@ -38,6 +38,8 @@ export interface TestChainParams {
   anything_else?: string;
   pins?: BlueprintPins;
   seed?: number;
+  /** Ask the Title and Planner steps for keyword data (used only when ISEO_V3_KEYWORD_DATA is on). */
+  use_keyword_data?: boolean;
 }
 
 export interface TestChainDeps {
@@ -63,7 +65,7 @@ export async function runTestChain(p: TestChainParams, deps: TestChainDeps) {
   let titleStep: TitleStepResult | null = null;
   if (!title) {
     s = t();
-    titleStep = await deps.title({ seed_keyword: p.seed_keyword, language: p.language, niche: p.niche, reach: p.reach, proof_level: p.proof_level, ideal_client: p.ideal_client, target_town: town, featured_service: p.featured_service, search_data: sd.block ?? undefined, max_list_items: 15, previous_titles: [] });
+    titleStep = await deps.title({ seed_keyword: p.seed_keyword, language: p.language, niche: p.niche, reach: p.reach, proof_level: p.proof_level, ideal_client: p.ideal_client, target_town: town, featured_service: p.featured_service, search_data: sd.block ?? undefined, max_list_items: 15, previous_titles: [], use_keyword_data: p.use_keyword_data });
     title = titleStep.output.title;
     timings.title = t() - s;
   }
@@ -96,6 +98,7 @@ export async function runTestChain(p: TestChainParams, deps: TestChainDeps) {
       research: research.research ? toResearchInput(research.research) : undefined,
       size_options: DEFAULT_SIZE_OPTIONS,
       minimum_size,
+      use_keyword_data: p.use_keyword_data,
     });
     plan = planner.output;
   } catch (err) {
@@ -142,6 +145,10 @@ export async function runTestChain(p: TestChainParams, deps: TestChainDeps) {
     title,
     /** Title and Planner cost (USD); the Writer's and meta's are on `article.cost`. */
     step_cost: { title: titleStep?.cost_usd ?? 0, planner: planner?.cost_usd ?? 0 },
+    /** Whether each step asked for, and got, keyword data (null: the step did not run). */
+    keyword_data: { title: titleStep?.keyword_data ?? null, planner: planner?.keyword_data ?? null },
+    /** Which prompt variant each step ran (v1 / v2_keyword_data) and its version label. */
+    step_prompts: { title: titleStep?.prompt ?? null, planner: planner?.prompt ?? null },
     search_data: { block: sd.block, meta: sd.meta },
     research: { status: research.status, facts: research.research?.facts.length ?? 0, local_conditions: research.research?.local_conditions.length ?? 0, cost_usd: research.cost_usd },
     plan,

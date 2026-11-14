@@ -4,7 +4,12 @@
  * — with the same code as the admin route POST /content-v3/article/test. No credits move and nothing
  * is published; model and DataForSEO costs are real (about $0.25 per keyword without research).
  *
- *   npm run v3:ten-keywords [-- --only <case id>,<case id>] [-- --seed 7]
+ *   npm run v3:ten-keywords [-- --only <case id>,<case id>] [-- --seed 7] [-- --keyword-data]
+ *
+ * --keyword-data: the same run with keyword data on (the brief: "keyword data off and then on"):
+ * ISEO_V3_KEYWORD_DATA=true for this process and use_keyword_data on the Title and Planner, which then
+ * run their keyword-data prompt variants. The Writer never sees keyword data (K4). The output folder
+ * name ends in "-kd".
  *
  * Output (git-ignored, not served): data/v3-runs/<timestamp>/results.jsonl and review.html — the
  * review sheet: a summary table, then per keyword the inputs, search data, title, plan, blueprint
@@ -65,13 +70,14 @@ export function testingChecklists(md: string): Array<{ section: string; items: s
 const esc = (s: unknown) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 async function main() {
-  // --render <run dir> [--findings <html file>]: rebuild review.html from a run's results.jsonl.
-  const renderDir = arg('render');
-  if (renderDir) {
-    const rows = fs.readFileSync(path.join(renderDir, 'results.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  // --render <run dir>[,<run dir>] [--findings <html file>]: rebuild review.html from one run's
+  // results.jsonl, or one sheet from two runs (keyword data off and on), written to the first dir.
+  const renderDirs = arg('render')?.split(',');
+  if (renderDirs) {
+    const rows = renderDirs.flatMap((d) => fs.readFileSync(path.join(d, 'results.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)));
     const findings = arg('findings') ? fs.readFileSync(String(arg('findings')), 'utf8') : '';
-    fs.writeFileSync(path.join(renderDir, 'review.html'), reviewSheet(rows, testingChecklists(fs.readFileSync(DOC_PATH, 'utf8')), findings));
-    console.log(`Wrote ${renderDir}/review.html`);
+    fs.writeFileSync(path.join(renderDirs[0], 'review.html'), reviewSheet(rows, testingChecklists(fs.readFileSync(DOC_PATH, 'utf8')), findings));
+    console.log(`Wrote ${renderDirs[0]}/review.html`);
     process.exit(0);
   }
   const file = path.join(process.cwd(), 'docs', 'content-v3-test-keywords.json');
@@ -79,11 +85,13 @@ async function main() {
   const only = arg('only')?.split(',');
   const cases = only ? all.filter((c) => only.includes(c.id)) : all;
   const seed = arg('seed') ? Number(arg('seed')) : undefined;
+  const keywordData = process.argv.includes('--keyword-data');
+  if (keywordData) process.env.ISEO_V3_KEYWORD_DATA = 'true';
   if (process.env.MONGODB_URI) {
     await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10_000 }).catch(() => console.warn('Mongo unavailable: in-code prompt texts are used'));
   }
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const outDir = path.join(process.cwd(), 'data', 'v3-runs', stamp);
+  const outDir = path.join(process.cwd(), 'data', 'v3-runs', keywordData ? `${stamp}-kd` : stamp);
   fs.mkdirSync(outDir, { recursive: true });
   const results: Array<Record<string, unknown>> = [];
 
@@ -107,6 +115,7 @@ async function main() {
       point_of_view: 'we',
       cta: c.cta,
       seed,
+      use_keyword_data: keywordData || undefined,
     };
     try {
       const r = await runTestChain(params, {
@@ -121,6 +130,9 @@ async function main() {
         id: c.id,
         case: c,
         ok: true,
+        keyword_data_mode: keywordData ? 'on' : 'off',
+        keyword_data: r.keyword_data,
+        step_prompts: { title: r.step_prompts.title?.label ?? null, planner: r.step_prompts.planner?.label ?? null },
         title: r.title,
         search_data: { mode: r.search_data.meta.mode, location: r.search_data.meta.location_used, national_fallback: r.search_data.meta.national_fallback, counts: r.search_data.meta.counts, calls: r.search_data.meta.calls, cost_usd: r.search_data.meta.cost_usd },
         research: r.research,
@@ -168,29 +180,44 @@ export function scopeIds(html: string, prefix: string): string {
 
 const sum = (cost: Record<string, unknown>) => Object.values(cost).reduce((x: number, v) => x + (typeof v === 'number' ? v : 0), 0);
 
-export function reviewSheet(rows: Array<Record<string, any>>, checklists: Array<{ section: string; items: string[] }>, findingsHtml = ''): string {
+/** A row's anchor and id prefix: the case id, plus "-kd" for the keyword-data-on run. */
+const rowKey = (r: Record<string, any>) => (r.keyword_data_mode === 'on' ? `${r.id}-kd` : String(r.id));
+
+function keywordDataLine(r: Record<string, any>): string {
+  if (r.keyword_data_mode !== 'on') return 'off';
+  const step = (name: string, k: any) =>
+    !k ? `${name}: did not run` : `${name}: ${k.used ? `used${k.related_count != null ? `, ${esc(k.related_count)} related` : ''}` : `not used (${esc(k.reason || (k.effective ? 'unavailable' : 'not effective'))})`}`;
+  const prompts = [r.step_prompts?.title, r.step_prompts?.planner].filter(Boolean).map((l: string) => `<code>${esc(l)}</code>`).join(' · ');
+  return `${step('title', r.keyword_data?.title)} · ${step('planner', r.keyword_data?.planner)}${prompts ? `<br><span class="muted">${prompts}</span>` : ''}`;
+}
+
+export function reviewSheet(inputRows: Array<Record<string, any>>, checklists: Array<{ section: string; items: string[] }>, findingsHtml = ''): string {
+  // Each keyword's runs side by side: case order as listed, keyword data off before on.
+  const order = [...new Set(inputRows.map((r) => String(r.id)))];
+  const rows = [...inputRows].sort((a, b) => order.indexOf(String(a.id)) - order.indexOf(String(b.id)) || (a.keyword_data_mode === 'on' ? 1 : 0) - (b.keyword_data_mode === 'on' ? 1 : 0));
   const okRows = rows.filter((r) => r.ok);
   const total = okRows.reduce((s, r) => s + sum(r.cost), 0);
-  const passed = okRows.filter((r) => r.validator.passed).length;
+  const modes = new Set(rows.map((r) => (r.keyword_data_mode === 'on' ? 'on' : 'off')));
   const repaired = okRows.filter((r) => r.repaired).length;
   const summary = rows
     .map((r) =>
       r.ok
-        ? `<tr><td><a href="#${esc(r.id)}">${esc(r.id)}</a></td><td>${esc(r.case.seed_keyword)}</td><td class="title-cell">${esc(r.title)}</td><td>${esc(r.picks.article_type)}</td><td>${esc(r.case.post_size)}</td><td class="num">${esc(r.validator.word_count)}</td><td>${r.validator.passed ? '<span class="chip ok">pass</span>' : `<span class="chip bad">needs review</span> <span class="codes">${esc(r.validator.issues.filter((i: any) => i.severity === 'error').map((i: any) => i.code).join(', '))}</span>`}</td><td>${r.repaired ? 'yes' : '—'}</td><td>${esc(r.proof_level)}</td><td class="num">${money(sum(r.cost))}</td><td class="num">${Math.round(r.timings.total_ms / 1000)} s</td></tr>`
-        : `<tr><td>${esc(r.id)}</td><td>${esc(r.case.seed_keyword)}</td><td colspan="9"><span class="chip bad">failed</span> ${esc(r.error)}</td></tr>`,
+        ? `<tr><td><a href="#${esc(rowKey(r))}">${esc(r.id)}</a></td><td>${r.keyword_data_mode === 'on' ? 'on' : 'off'}</td><td>${esc(r.case.seed_keyword)}</td><td class="title-cell">${esc(r.title)}</td><td>${esc(r.picks.article_type)}</td><td>${esc(r.case.post_size)}</td><td class="num">${esc(r.validator.word_count)}</td><td>${r.validator.passed ? '<span class="chip ok">pass</span>' : `<span class="chip bad">needs review</span> <span class="codes">${esc(r.validator.issues.filter((i: any) => i.severity === 'error').map((i: any) => i.code).join(', '))}</span>`}</td><td>${r.repaired ? 'yes' : '—'}</td><td>${esc(r.proof_level)}</td><td class="num">${money(sum(r.cost))}</td><td class="num">${Math.round(r.timings.total_ms / 1000)} s</td></tr>`
+        : `<tr><td>${esc(r.id)}</td><td>${r.keyword_data_mode === 'on' ? 'on' : 'off'}</td><td>${esc(r.case.seed_keyword)}</td><td colspan="9"><span class="chip bad">failed</span> ${esc(r.error)}</td></tr>`,
     )
     .join('');
   const details = okRows
     .map(
       (r) => `
-<section class="case" id="${esc(r.id)}">
+<section class="case" id="${esc(rowKey(r))}">
   <header class="case-head">
-    <p class="eyebrow">${esc(r.case.niche)} · ${esc(r.case.reach)}${r.case.target_town ? ` · ${esc(r.case.target_town)}` : ''} · ${esc(r.case.post_size)} · ${esc(r.proof_level)}</p>
+    <p class="eyebrow">${esc(r.case.niche)} · ${esc(r.case.reach)}${r.case.target_town ? ` · ${esc(r.case.target_town)}` : ''} · ${esc(r.case.post_size)} · ${esc(r.proof_level)} · keyword data ${r.keyword_data_mode === 'on' ? 'on' : 'off'}</p>
     <h2>${esc(r.case.seed_keyword)}</h2>
     <p class="case-title">${esc(r.title)} <span class="muted">(${esc(r.title.length)} characters)</span></p>
   </header>
   <div class="case-grid">
     <dl class="facts">
+      <dt>Keyword data</dt><dd>${keywordDataLine(r)}</dd>
       <dt>Search data</dt><dd>${esc(r.search_data.mode)} · ${esc(r.search_data.location)} · national call ${r.search_data.national_fallback ? 'yes' : 'no'} · ${esc(r.search_data.counts.titles)} titles, ${esc(r.search_data.counts.questions)} questions, ${esc(r.search_data.counts.related)} related</dd>
       <dt>Research</dt><dd>${esc(r.research.status)} · ${esc(r.research.facts)} facts · ${esc(r.research.local_conditions)} local conditions</dd>
       <dt>Plan${r.plan_fallback ? ' (fallback)' : ''}</dt><dd>${esc(r.plan.article_type)}, suggested ${esc(r.plan.post_size)}. ${esc(r.plan.size_reason)}</dd>
@@ -205,7 +232,7 @@ export function reviewSheet(rows: Array<Record<string, any>>, checklists: Array<
       <dt>Meta</dt><dd><strong>${esc(r.meta_title)}</strong> <span class="muted">(${esc(r.meta_title.length)})</span><br>${esc(r.meta_description)} <span class="muted">(${esc(r.meta_description.length)})</span></dd>
       <dt>Cost and time</dt><dd>search ${money(r.cost.search_data)} · title ${money(r.cost.title)} · research ${money(r.cost.research)} · planner ${money(r.cost.planner)} · writer ${money(r.cost.writer)} · meta ${money(r.cost.meta)} · ${Math.round(r.timings.total_ms / 1000)} s</dd>
     </dl>
-    <article class="article">${scopeIds(r.content, r.id)}</article>
+    <article class="article">${scopeIds(r.content, rowKey(r))}</article>
   </div>
 </section>`,
     )
@@ -278,11 +305,11 @@ a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outli
 <div class="wrap">
   <header>
     <h1>Content v3 keyword review</h1>
-    <p class="lede">Each keyword went through the full chain (search data, title, research, plan, blueprint, writer, checks, meta) with the same code as the admin test route. No credits were charged and nothing was published. The keyword list is a working list; the real ten are not written down yet.</p>
+    <p class="lede">Each keyword went through the full chain (search data, title, research, plan, blueprint, writer, checks, meta) with the same code as the admin test route${modes.has('on') ? ', once with keyword data off and once with it on (keyword data reaches only the Title and Planner, never the Writer)' : ''}. No credits were charged and nothing was published. The keyword list is a working list; the real ten are not written down yet.</p>
   </header>
-  <div class="stats"><span>run <b>${esc(new Date().toISOString().slice(0, 16).replace('T', ' '))} UTC</b></span><span>keywords <b>${rows.length}</b></span><span>passed checks <b>${passed}</b></span><span>needed a second writer run <b>${repaired}</b></span><span>model + data cost <b>${money(total)}</b></span></div>
+  <div class="stats"><span>sheet built <b>${esc(new Date().toISOString().slice(0, 16).replace('T', ' '))} UTC</b></span><span>keywords <b>${order.length}</b></span><span>articles <b>${rows.length}</b></span>${[...modes].map((m) => `<span>passed checks${modes.size > 1 ? `, keyword data ${m}` : ''} <b>${okRows.filter((r) => (r.keyword_data_mode ?? 'off') === m && r.validator.passed).length} of ${rows.filter((r) => (r.keyword_data_mode ?? 'off') === m).length}</b></span>`).join('')}<span>needed a second writer run <b>${repaired}</b></span><span>model + data cost <b>${money(total)}</b></span></div>
   ${findingsHtml ? `<section class="findings">${findingsHtml}</section>` : ''}
-  <div class="table-box"><table><thead><tr><th>Case</th><th>Keyword</th><th>Title</th><th>Type</th><th>Size</th><th>Words</th><th>Checks</th><th>Second run</th><th>Proof</th><th>Cost</th><th>Time</th></tr></thead><tbody>${summary}</tbody></table></div>
+  <div class="table-box"><table><thead><tr><th>Case</th><th>Keyword data</th><th>Keyword</th><th>Title</th><th>Type</th><th>Size</th><th>Words</th><th>Checks</th><th>Second run</th><th>Proof</th><th>Cost</th><th>Time</th></tr></thead><tbody>${summary}</tbody></table></div>
   <details><summary>What to check in testing (from the prompt drafts)</summary>${lists}</details>
   ${details}
 </div>`;
