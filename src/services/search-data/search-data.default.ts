@@ -47,7 +47,7 @@ export async function sessionSearchData(
     const session = await store.getSession(ids.userId, ids.websiteId, ids.sessionKey);
     const hit = session?.search_data as { key?: string; result?: SearchDataResult } | undefined;
     if (hit?.key === key && hit.result) {
-      console.log(`[search-data] session hit seed="${req.seed_keyword}" key="${key}"`);
+      console.log(`[search-data] session hit run=${ids.sessionKey} seed="${req.seed_keyword}" key="${key}"`);
       return { ...hit.result, cached: true };
     }
   }

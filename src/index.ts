@@ -20,6 +20,7 @@ import { startNotificationScheduler } from './services/billing/notification-jobs
 import { startLedgerMonitor } from './services/billing/ledger-monitor.js';
 import { startEmailWorker } from './services/billing/email-worker.js';
 import sql from './data/db.js';
+import { requestLogBody } from './middleware/request-log.js';
 
 dotenv.config();
 
@@ -52,50 +53,10 @@ app.use(express.urlencoded({ extended: true }));
 // Serve uploaded files
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
-// Debug middleware to log requests.
-//
-// Bodies are redacted before logging. This previously printed req.body verbatim, which wrote
-// every customer's plaintext password to the logs on each /auth/login and /auth/signup, and
-// would now do the same for the admin password. Anyone with log access had the credentials.
-const REDACTED_KEYS = new Set([
-  'password',
-  'newPassword',
-  'currentPassword',
-  'token',
-  'access_token',
-  'refresh_token',
-  'api_key',
-  'apiKey',
-  // Business contact details. The v3 content route carries a full business profile, so without
-  // these a customer's phone number, street address and geo coordinates would be printed to the
-  // application log on every generation.
-  'phone',
-  'telephone',
-  'address',
-  'latitude',
-  'longitude',
-]);
-
-/**
- * Redact sensitive keys at any depth.
- *
- * This used to be top-level only, which was enough when bodies were flat. A nested profile object
- * walked straight past it, so the redaction has to follow the nesting. Depth is capped so a
- * pathological body cannot turn logging into a traversal.
- */
-function redactBody(body: unknown, depth = 0): unknown {
-  if (depth > 4) return '[deep]';
-  if (Array.isArray(body)) return body.map((v) => redactBody(v, depth + 1));
-  if (!body || typeof body !== 'object') return body;
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
-    out[key] = REDACTED_KEYS.has(key) ? '[redacted]' : redactBody(value, depth + 1);
-  }
-  return out;
-}
-
+// Debug middleware to log requests. Bodies are redacted, and Content v3 bodies are reduced to
+// their field names (middleware/request-log.ts).
 app.use((req, res, next) => {
-  console.log(`${req.method} ${req.path}`, redactBody(req.body));
+  console.log(`${req.method} ${req.path}`, requestLogBody(req.path, req.body));
   next();
 });
 

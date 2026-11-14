@@ -233,7 +233,26 @@ router.use('/', createSearchDataRouter({ auth: requireAdmin, lookup: (req) => lo
 
 // Plugin-facing status and session housekeeping (content-v3-plugin.handler.ts). The status check
 // does not stamp the website's last connection: it is a capability probe, not a generation.
-router.use('/', createContentV3PluginRouter({ auth: validateApiAccessWithoutStamp, store: getContentV3Store, disclaimerKeys: liveDisclaimerKeys }));
+router.use(
+  '/',
+  createContentV3PluginRouter({
+    auth: validateApiAccessWithoutStamp,
+    store: getContentV3Store,
+    disclaimerKeys: liveDisclaimerKeys,
+    // Leave (W10): the unsubmitted article's text goes; the row, its billing and its status stay
+    // (so a later regeneration in the same slot is still priced as one). Written exactly as the
+    // insert above writes `result` (same parameter, no cast), so readers see the same encoding.
+    forgetArticles: async (userId, sessionKey) => {
+      const rows = await sql`
+        UPDATE user_generations
+           SET result = ${JSON.stringify({ content: '', removed: 'left_unsubmitted' })}
+         WHERE user_id = ${userId} AND target_key = ${sessionKey} AND type = 'content_v3'
+        RETURNING id
+      `;
+      return rows.length;
+    },
+  }),
+);
 
 // Keyword data (Option A/B plumbing). Auth is applied INSIDE the sub-router: prefetch is
 // plugin-authenticated, everything else on it is requireAdmin.

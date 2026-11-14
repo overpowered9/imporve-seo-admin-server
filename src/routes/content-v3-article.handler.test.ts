@@ -247,6 +247,19 @@ describe('POST /content-v3/article', () => {
     assert.match(logs.join('\n'), /runs ledger unavailable — using the in-process lock/);
   });
 
+  test('D: an article that cost more than its size\'s ceiling logs a warning (billing unchanged)', async () => {
+    const pricey = await start({ session: { ...SESSION, cost: { search_data: 0.01, title: 0.02, research: 0.2, planner: 0.05 } } });
+    assert.equal((await pricey.app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS)).status, 200);
+    assert.match(pricey.logs.join('\n'), /\[content-v3\] cost over ceiling run=iseo_tk_\w+ size=medium total=0\.5\d{3} ceiling=0\.35 credits=10/);
+    assert.match(pricey.logs.join('\n'), /\[content-v3\] latency run=iseo_tk_\w+ route=article ms=\d+/);
+    assert.deepEqual(pricey.events, ['reserve:10', 'generate']);
+    await pricey.app.close();
+    app = null;
+    const cheap = await start({ session: { ...SESSION, cost: { title: 0.01 } } });
+    await cheap.app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);
+    assert.doesNotMatch(cheap.logs.join('\n'), /cost over ceiling/);
+  });
+
   test('W8: a size below the numbered title\'s minimum is refused on the server, before any charge', async () => {
     const { app, events } = await start({ session: { ...SESSION, plan_meta: { minimum_size: 'large' } } });
     const r = await app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);

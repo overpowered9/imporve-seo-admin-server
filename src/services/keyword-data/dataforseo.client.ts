@@ -31,6 +31,7 @@
  *
  * Dependency-injected (`fetchImpl`, `sleep`, `log`, `now`) so the unit tests run with no network.
  */
+import { runTag } from '../run-context.js';
 
 // ---------- public types ----------
 
@@ -529,7 +530,7 @@ export function createDataForSeoClient(options: DataForSeoClientOptions): DataFo
         const r = await attemptOnce<R>(key, url, body, callTimeoutMs);
         const latencyMs = now() - started;
         log(
-          `[dataforseo] endpoint=${key} http=${r.httpStatus} status=${r.statusCode} ` +
+          `[dataforseo]${runTag()} endpoint=${key} http=${r.httpStatus} status=${r.statusCode} ` +
             `latency_ms=${latencyMs} cost=${r.cost} attempt=${attempt}`,
         );
         return { result: r.result, cost: r.cost, latencyMs, taskId: r.taskId, attempts: attempt };
@@ -547,7 +548,7 @@ export function createDataForSeoClient(options: DataForSeoClientOptions): DataFo
               });
         const willRetry = dfsErr.retryable && attempt <= maxRetries;
         log(
-          `[dataforseo] endpoint=${key} error kind=${dfsErr.kind} level=${dfsErr.level} ` +
+          `[dataforseo]${runTag()} endpoint=${key} error kind=${dfsErr.kind} level=${dfsErr.level} ` +
             `http=${dfsErr.httpStatus ?? '-'} status=${dfsErr.statusCode ?? '-'} ` +
             `latency_ms=${latencyMs} attempt=${attempt} retry=${willRetry ? 'yes' : 'no'}`,
         );

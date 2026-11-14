@@ -48,6 +48,8 @@ export interface ContentV3Store {
   mergeSession(userId: number, websiteId: number, sessionKey: string, patch: SessionData): Promise<boolean>;
   deleteSession(userId: number, websiteId: number, sessionKey: string): Promise<boolean>;
   recordPost(rec: ContentV3PostRecord): Promise<boolean>;
+  /** Leave (W10): the post history row of an unsubmitted wizard session goes with it. */
+  deletePosts(userId: number, websiteId: number, sessionKey: string): Promise<boolean>;
   /** The site's newest posts first. */
   recentPosts(userId: number, websiteId: number, limit: number): Promise<ContentV3PostRow[]>;
   /** Deletes expired sessions and post rows older than the post retention. Returns rows removed. */
@@ -147,6 +149,20 @@ export function createContentV3Store(deps: ContentV3StoreDeps): ContentV3Store {
       }
     },
 
+    async deletePosts(userId, websiteId, sessionKey) {
+      if (!validIds(userId, websiteId) || !validKey(sessionKey)) return false;
+      try {
+        await sql`
+          DELETE FROM content_v3_posts
+          WHERE user_id = ${userId} AND website_id = ${websiteId} AND session_key = ${sessionKey}
+        `;
+        return true;
+      } catch (err) {
+        unavailable('deletePosts', err);
+        return false;
+      }
+    },
+
     async recordPost(rec) {
       if (!validIds(rec.user_id, rec.website_id)) return false;
       try {
@@ -242,6 +258,12 @@ export function createMemoryContentV3Store(): ContentV3Store & { sessions: Map<s
     },
     async deleteSession(u, w, s) {
       sessions.delete(k(u, w, s));
+      return true;
+    },
+    async deletePosts(u, w, s) {
+      for (let i = posts.length - 1; i >= 0; i--) {
+        if (posts[i].user_id === u && posts[i].website_id === w && posts[i].session_key === s) posts.splice(i, 1);
+      }
       return true;
     },
     async recordPost(rec) {

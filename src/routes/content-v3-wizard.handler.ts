@@ -44,6 +44,7 @@ import { numberedFromTitle } from '../services/blueprint/blueprint.js';
 import { regulatedSuggestion, DEFAULT_REGULATED_TOPICS, type RegulatedTopicsList } from '../services/content-v3/regulated-topics.js';
 import { DEFAULT_SIZE_OPTIONS } from '../services/content-v3-steps/types.js';
 import { DEFAULT_NICHE_SETTINGS, nicheList, resolveNiche, type NicheSettings } from '../services/niche-profile/niche-profile.js';
+import { runContext } from '../services/run-context.js';
 
 /** The doc: <max_list_items> is what the largest size can hold, never more than 15. */
 export const MAX_LIST_ITEMS = 15;
@@ -153,6 +154,8 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
     if (!contentV3Enabled(env)) return res.status(409).json(v3ErrorBody(v3Error('v3_disabled')));
     next();
   };
+  // D: every log line of a wizard request (search data, DataForSEO, keyword data) carries run=<key>.
+  router.use(runContext);
   const pass: RequestHandler = (_req, _res, next) => next();
   const allowance = (step: 'title' | 'town_check' | 'approve') => (deps.freeStepGuard ? deps.freeStepGuard(step) : pass);
 
@@ -237,7 +240,7 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
       log(
         `[content-v3] title run=${b.session_key} form=${o.form} items=${o.items ?? '-'} page_kind="${o.page_kind.slice(0, 120)}" ` +
           `main_concern="${o.main_concern.slice(0, 120)}" previous=${previous_titles.length} search_data=${sd.cached ? 'session' : 'fresh'} ` +
-          `keyword_data=${result.keyword_data.used ? 'used' : 'off'} attempts=${result.attempts.length} cost_usd=${result.cost_usd ?? 'null'}`,
+          `keyword_data=${result.keyword_data.used ? 'used' : 'off'} attempts=${result.attempts.length} cost_usd=${result.cost_usd ?? 'null'} ms=${now() - (deadlineAt - titleMs)}`,
       );
 
       return res.json({
@@ -400,7 +403,8 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
       log(
         `[content-v3] approve run=${b.session_key} niche=${nicheRow?.key ?? 'unknown'} proof=${b.proof_level ?? '-'} type=${plan.article_type} size=${plan.post_size} min=${minimum_size} ` +
           `body=${plan.body_questions.length} faq=${plan.faq_questions.length} owner=${plan.owner_questions.length} ` +
-          `regulated=${regulated.suggested ? regulated.by : 'no'} research=${research.status}${research.cached ? '(session)' : ''} fallback=${fallback ? 'yes' : 'no'}`,
+          `regulated=${regulated.suggested ? regulated.by : 'no'} research=${research.status}${research.cached ? '(session)' : ''} fallback=${fallback ? 'yes' : 'no'} ` +
+          `research_ms=${research.ms} ms=${now() - (deadlineAt - approveMs)}`,
       );
 
       return res.json({

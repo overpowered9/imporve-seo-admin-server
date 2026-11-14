@@ -25,6 +25,7 @@ import type { KeywordDataCache } from './keyword-data-cache.js';
 import { buildKeywordDataBlock, selectRelated } from './keyword-data-block.js';
 import { normalizeKeyword, normalizeLanguageCode, type KeywordMetricsItem } from './keyword-data.types.js';
 import { emptyItem, normalizeOverview, normalizeRelated } from './normalize.js';
+import { runTag } from '../run-context.js';
 
 export class KeywordDataNotConfiguredError extends Error {
   readonly kind = 'not_configured' as const;
@@ -196,7 +197,7 @@ export function createKeywordDataService(deps: KeywordDataServiceDeps): KeywordD
     try {
       ({ seedHit, relatedHit } = await withBudget(lookup, budgetMs));
     } catch (err) {
-      log(`[keyword-data] fallback step=cache seed="${key}" reason=${reasonOf(err)}`);
+      log(`[keyword-data] fallback${runTag()} step=cache seed="${key}" reason=${reasonOf(err)}`);
       return { status: 'unavailable', seed: null, related: [], cost_usd: 0, source: 'none', reason: reasonOf(err) };
     }
 
@@ -243,7 +244,7 @@ export function createKeywordDataService(deps: KeywordDataServiceDeps): KeywordD
         relatedHit ? Promise.resolve() : cache.putRelated(key, loc, lang, related, fetchedAt.toISOString()),
       ]);
       if (callerGaveUp) {
-        log(`[keyword-data] late fetch cached seed="${key}" after_ms=${now().getTime() - startedAt}`);
+        log(`[keyword-data] late fetch cached${runTag()} seed="${key}" after_ms=${now().getTime() - startedAt}`);
       }
       return { status: 'ready', seed: seedItem, related, cost_usd: cost, source: 'dataforseo' };
     })();
@@ -253,7 +254,7 @@ export function createKeywordDataService(deps: KeywordDataServiceDeps): KeywordD
     } catch (err) {
       callerGaveUp = true;
       const reason = reasonOf(err);
-      log(`[keyword-data] fallback step=fetch seed="${key}" reason=${reason}`);
+      log(`[keyword-data] fallback${runTag()} step=fetch seed="${key}" reason=${reason}`);
       return partial(reason);
     }
   }
@@ -269,12 +270,12 @@ export function createKeywordDataService(deps: KeywordDataServiceDeps): KeywordD
     try {
       const r = await getSeedWithRelated(seed, location_code, language_code, { budgetMs });
       if (r.status !== 'ready' || !r.seed) {
-        log(`[keyword-data] fallback step=prompt seed="${key}" reason=${r.reason ?? 'unavailable'}`);
+        log(`[keyword-data] fallback${runTag()} step=prompt seed="${key}" reason=${r.reason ?? 'unavailable'}`);
         return null;
       }
       const related = selectRelated(r.seed, r.related, limit);
       if (!related.length && isEmpty(r.seed)) {
-        log(`[keyword-data] fallback step=prompt seed="${key}" reason=no_data`);
+        log(`[keyword-data] fallback${runTag()} step=prompt seed="${key}" reason=no_data`);
         return null;
       }
       return {
@@ -284,7 +285,7 @@ export function createKeywordDataService(deps: KeywordDataServiceDeps): KeywordD
         source: r.source,
       };
     } catch (err) {
-      log(`[keyword-data] fallback step=prompt seed="${key}" reason=${reasonOf(err)}`);
+      log(`[keyword-data] fallback${runTag()} step=prompt seed="${key}" reason=${reasonOf(err)}`);
       return null;
     }
   }

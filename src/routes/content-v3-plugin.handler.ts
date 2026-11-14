@@ -8,9 +8,12 @@
  *        (CONTENT_V3_ENABLED). The plugin caches the answer for a few minutes and uses v2 otherwise,
  *        so turning the env flag off is the rollback.
  *
- *   POST /api/v1/content-v3/session/clear   { session_key }  →  { success, cleared }
- *        The wizard's Leave button (W10): deletes everything stored for that wizard session. Works
- *        even when v3 is switched off, so a Leave after a rollback still cleans up.
+ *   POST /api/v1/content-v3/session/clear   { session_key, left? }  →  { success, cleared }
+ *        Submit and the wizard's Leave button (W10) both end the wizard session and delete what
+ *        was stored for it. On Leave (`left: true`) the unsubmitted post goes too: its post history
+ *        row (so it does not shape later blueprints) and the article text of its generation rows
+ *        (the rows and what was billed stay). Works even when v3 is switched off, so a Leave after
+ *        a rollback still cleans up.
  *
  * Pure handler; content-v3.routes.ts does the live wiring.
  */
@@ -32,6 +35,8 @@ export interface ContentV3PluginDeps {
   store: () => Promise<ContentV3Store>;
   /** A3: niche and profile keys with a disclaimer text (a Regulated business needs one for v3). */
   disclaimerKeys?: () => Promise<string[]>;
+  /** Leave: blanks the article text of this session's content_v3 generation rows; returns how many. */
+  forgetArticles?: (userId: number, sessionKey: string) => Promise<number>;
   env?: NodeJS.ProcessEnv;
   log?: (line: string) => void;
 }
@@ -54,15 +59,22 @@ export function createContentV3PluginRouter(deps: ContentV3PluginDeps): Router {
   });
 
   router.post('/session/clear', deps.auth, async (req: AuthenticatedRequest, res: Response) => {
-    const parsed = z.object({ session_key: sessionKeySchema }).safeParse(req.body);
+    const parsed = z.object({ session_key: sessionKeySchema, left: z.boolean().optional() }).safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json(v3ErrorBody(v3Error('invalid_request', 'The wizard session could not be identified.')));
     }
     const userId = Number(req.user?.id);
     const websiteId = Number(req.website?.id);
+    const key = parsed.data.session_key;
     const store = await deps.store();
-    const cleared = await store.deleteSession(userId, websiteId, parsed.data.session_key);
-    log(`[content-v3] session cleared user=${userId} website=${websiteId} ok=${cleared}`);
+    const cleared = await store.deleteSession(userId, websiteId, key);
+    let left = '';
+    if (parsed.data.left) {
+      const posts = await store.deletePosts(userId, websiteId, key);
+      const blanked = deps.forgetArticles ? await deps.forgetArticles(userId, key).catch(() => -1) : 0;
+      left = ` left=1 post_rows=${posts ? 'deleted' : 'kept'} articles_blanked=${blanked}`;
+    }
+    log(`[content-v3] session cleared run=${key} user=${userId} website=${websiteId} ok=${cleared}${left}`);
     return res.json({ success: true, cleared });
   });
 

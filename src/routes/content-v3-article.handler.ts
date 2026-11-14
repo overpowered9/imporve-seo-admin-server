@@ -24,7 +24,7 @@ import { z } from 'zod';
 import { REQUEST_ID_RE, type RunsStore } from '../services/content-v3/runs.js';
 import type { QuotaStore } from '../services/content-v3/quota.js';
 import type { AuthenticatedRequest } from '../middleware/apiAuth.middleware.js';
-import { contentV3Enabled } from '../config/content-v3.config.js';
+import { contentV3Enabled, costCeilingUsd } from '../config/content-v3.config.js';
 import type { ContentV3Store, ContentV3PostRow } from '../services/content-v3/store.js';
 import { toV3UserError, v3Error, v3ErrorBody } from '../services/content-v3/user-errors.js';
 import { sessionKeySchema } from './content-v3-plugin.handler.js';
@@ -33,6 +33,7 @@ import type { PlannerStepOutput } from '../services/content-v3-steps/planner.ste
 import type { ResearchResult } from '../services/research/research.service.js';
 import type { BlueprintPins } from '../services/blueprint/blueprint.js';
 import { createCostLedger } from '../services/model-call.js';
+import { runContext } from '../services/run-context.js';
 
 const SIZES = ['small', 'medium', 'large'] as const;
 export const SIZE_WORDS: Record<(typeof SIZES)[number], string> = { small: '600 to 1200 words', medium: '1200 to 2400 words', large: '2400 to 3600 words' };
@@ -161,6 +162,7 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
   const inFlight = new Set<string>();
 
   const pass: RequestHandler = (_req, _res, next) => next();
+  router.use(runContext);
   router.post('/article', deps.auth, deps.rateLimit ?? pass, async (req: AuthenticatedRequest, res: Response) => {
     if (!contentV3Enabled(env)) return res.status(409).json(v3ErrorBody(v3Error('v3_disabled')));
     const parsed = articleRequestSchema.safeParse(req.body);
@@ -323,6 +325,13 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
       ledger.add('writer', r.cost.writer, r.usage.writer as never);
       ledger.add('meta', r.cost.meta, r.usage.meta as never);
       log(ledger.line(b.session_key));
+      // D: a warning when one article cost us more than its size's ceiling (billing unchanged).
+      const ceiling = costCeilingUsd(env)[variant];
+      const spent = ledger.total();
+      if (spent !== null && spent > ceiling) {
+        log(`[content-v3] cost over ceiling run=${b.session_key} size=${variant} total=${spent.toFixed(4)} ceiling=${ceiling.toFixed(2)} credits=${cost}`);
+      }
+      log(`[content-v3] latency run=${b.session_key} route=article ms=${now() - startedAt} writer_ms=${r.timings.writer_ms} meta_ms=${r.timings.meta_ms} writer_attempts=${r.writer_attempts}`);
       await store.mergeSession(userId, websiteId ?? 0, b.session_key, {
         last_article: { generation_id: generationId, fingerprint: r.fingerprint, proof_level: r.proof_level, needs_review: r.needs_review },
       });

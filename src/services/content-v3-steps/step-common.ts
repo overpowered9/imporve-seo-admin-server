@@ -17,6 +17,7 @@ import type { KeywordDataService, PromptKeywordData } from '../keyword-data/keyw
 import { normalizeKeyword } from '../keyword-data/keyword-data.types.js';
 import type { AttemptRecord } from './attempts.js';
 import type { StepPromptResolver } from './prompts.js';
+import { runTag } from '../run-context.js';
 
 export interface ModelCallOptions {
   system: string;
@@ -107,7 +108,7 @@ export async function resolveStepKeywordData(
   let data: PromptKeywordData | null = null;
   if (!deps.keywordData) {
     info.reason = 'not_configured';
-    log(`[keyword-data] fallback step=${step} seed="${normalizeKeyword(input.seed_keyword)}" reason=not_configured`);
+    log(`[keyword-data] fallback${runTag()} step=${step} seed="${normalizeKeyword(input.seed_keyword)}" reason=not_configured`);
   } else {
     // tryGetForPrompt never throws and logs the specific reason for a null itself.
     data = await deps.keywordData.tryGetForPrompt(

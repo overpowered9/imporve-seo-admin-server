@@ -69,6 +69,28 @@ export function targetCalibration(env: NodeJS.ProcessEnv = process.env): Record<
   return out;
 }
 
+/**
+ * D: what one article may cost us before a warning is logged, per size (USD, all steps). Only a
+ * warning: billing does not change. CONTENT_V3_COST_CEILING_USD_JSON, e.g. {"large":0.6}.
+ */
+export const DEFAULT_COST_CEILING_USD = { small: 0.25, medium: 0.35, large: 0.5 } as const;
+
+export function costCeilingUsd(env: NodeJS.ProcessEnv = process.env): Record<'small' | 'medium' | 'large', number> {
+  const out: Record<'small' | 'medium' | 'large', number> = { ...DEFAULT_COST_CEILING_USD };
+  const raw = env.CONTENT_V3_COST_CEILING_USD_JSON;
+  if (!raw || !raw.trim()) return out;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    for (const size of ['small', 'medium', 'large'] as const) {
+      const v = Number(parsed?.[size]);
+      if (Number.isFinite(v) && v > 0 && v <= 10) out[size] = v;
+    }
+  } catch {
+    // keep the defaults
+  }
+  return out;
+}
+
 export function contentV3Config(env: NodeJS.ProcessEnv = process.env): ContentV3Config {
   return {
     enabled: contentV3Enabled(env),

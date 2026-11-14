@@ -79,6 +79,29 @@ describe('POST /session/clear', () => {
     assert.deepEqual(await store.getSession(5, 10, KEY), { title: 'other site' });
   });
 
+  test('Leave (left: true) also drops the post history row and blanks the article text; Submit keeps them', async () => {
+    const store = createMemoryContentV3Store();
+    const forgotten: Array<[number, string]> = [];
+    if (app) {
+      const prev = app;
+      app = null;
+      await prev.close();
+    }
+    app = await startTestApp([['/api/v1/content-v3', createContentV3PluginRouter({
+      auth: fakeAuth, store: async () => store, env: {}, log: () => {},
+      forgetArticles: async (u, k) => { forgotten.push([u, k]); return 1; },
+    })]]);
+    const post = { user_id: 5, website_id: 9, session_key: KEY, picks: {}, headings: [] };
+    await store.recordPost(post);
+    await app.post('/api/v1/content-v3/session/clear', { session_key: KEY }, { 'x-api-key': 'good' });
+    assert.equal((await store.recentPosts(5, 9, 10)).length, 1, 'Submit keeps the post row');
+    assert.deepEqual(forgotten, []);
+    const r = await app.post('/api/v1/content-v3/session/clear', { session_key: KEY, left: true }, { 'x-api-key': 'good' });
+    assert.equal(r.status, 200);
+    assert.equal((await store.recentPosts(5, 9, 10)).length, 0);
+    assert.deepEqual(forgotten, [[5, KEY]]);
+  });
+
   test('a malformed key is a plain 400', async () => {
     const { app } = await start({});
     const r = await app.post('/api/v1/content-v3/session/clear', { session_key: '../x' }, { 'x-api-key': 'good' });
