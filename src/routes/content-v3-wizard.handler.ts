@@ -46,6 +46,7 @@ import { DEFAULT_NICHE_SETTINGS, nicheList, resolveNiche, type NicheSettings } f
 
 /** The doc: <max_list_items> is what the largest size can hold, never more than 15. */
 export const MAX_LIST_ITEMS = 15;
+const MAX_LIST_ITEMS_CAP = 15;
 /** Titles kept per session for <previous_titles>. */
 export const MAX_PREVIOUS_TITLES = 10;
 
@@ -65,6 +66,8 @@ export const wizardTitleSchema = z.object({
   state_hint: z.string().trim().max(40).nullable().optional(),
   use_keyword_data: z.boolean().optional(),
   regenerate: z.boolean().optional(),
+  /** Bulk sends the most items the CHOSEN size holds, so a title never needs a larger size. */
+  max_list_items: z.number().int().min(1).max(MAX_LIST_ITEMS_CAP).optional(),
 });
 
 export type WizardTitleRequest = z.infer<typeof wizardTitleSchema>;
@@ -95,6 +98,8 @@ export const approveSchema = z.object({
     .array(z.object({ post_id: z.number().int().positive(), title: z.string().max(300), seed_keyword: z.string().max(200).optional() }))
     .max(50)
     .optional(),
+  /** Bulk: the project this article belongs to, stored with its post history row (B5). */
+  bulk_batch: z.string().trim().regex(/^[A-Za-z0-9_-]{1,40}$/).optional(),
 });
 
 type Ids = { userId: number; websiteId: number; sessionKey: string | null };
@@ -176,7 +181,7 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
         target_town: local ? parseTown(b.target_town ?? '').town || undefined : undefined,
         featured_service: b.featured_service,
         search_data: sd.block ?? undefined,
-        max_list_items: MAX_LIST_ITEMS,
+        max_list_items: b.max_list_items ?? MAX_LIST_ITEMS,
         previous_titles,
         use_keyword_data: b.use_keyword_data,
       };
@@ -356,6 +361,7 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
         },
         plan,
         plan_meta: { fallback, minimum_size, prompt: plannerPrompt, research_status: research.status },
+        ...(b.bulk_batch ? { bulk_batch: b.bulk_batch } : {}),
         regulated,
         cost,
       });

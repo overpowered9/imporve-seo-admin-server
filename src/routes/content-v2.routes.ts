@@ -34,6 +34,7 @@ import {
 } from '../services/generation-history.js';
 import { variantFromWords } from '../services/content-blueprint.js';
 import sql from '../data/db.js';
+import { config } from '../config/config.js';
 
 const router = Router();
 
@@ -216,7 +217,9 @@ router.post('/article', validateApiAccess, async (req: AuthenticatedRequest, res
         })},
         ${JSON.stringify({
           method: 'claude-v2',
-          model: process.env.ANTHROPIC_MODEL,
+          // BUG3: the article is written by the writing model (claude-content-generator.service.ts
+          // calls config.anthropicWriteModel); this used to record ANTHROPIC_MODEL instead.
+          model: config.anthropicWriteModel,
           blueprintSeed: result.blueprint.seed,
           billed: { action, variant, cost },
         })},

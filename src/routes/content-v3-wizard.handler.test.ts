@@ -311,3 +311,19 @@ describe('GET /niches', () => {
     assert.equal(r.body.data.profiles.length, 8);
   });
 });
+
+describe('bulk additions (phase 10)', () => {
+  test('a bulk title request can lower <max_list_items> to what the chosen size holds', async () => {
+    const { app, inputs } = await start();
+    await app.post('/api/v1/content-v3/wizard/title', { ...BODY, max_list_items: 8 }, PLUGIN_HEADERS);
+    assert.equal(inputs[0].max_list_items, 8);
+    const bad = await app.post('/api/v1/content-v3/wizard/title', { ...BODY, max_list_items: 40 }, PLUGIN_HEADERS);
+    assert.equal(bad.status, 400);
+  });
+
+  test('approve stores the bulk batch in the session (for the post history row)', async () => {
+    const { app, store } = await startApprove();
+    await app.post('/api/v1/content-v3/wizard/approve', { ...APPROVE, bulk_batch: 'bulk_42' }, PLUGIN_HEADERS);
+    assert.equal((await store.getSession(5, 9, KEY))!.bulk_batch, 'bulk_42');
+  });
+});
