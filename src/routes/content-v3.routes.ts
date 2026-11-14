@@ -20,7 +20,8 @@
  *                                            after a search data lookup.
  *   POST /api/v1/content-v3/wizard/title   — validateApiAccess (plugin). Search data → Title (W2, W12, W15).
  *   POST /api/v1/content-v3/wizard/town-check — validateApiAccess (plugin). W6 town line.
- *   GET  /api/v1/content-v3/niches         — validateApiAccess (plugin). The niche list (N1 settings).
+ *   GET  /api/v1/content-v3/niches         — validateApiAccess (plugin). The niche list (N1 settings);
+ *                                            409 while CONTENT_V3_ENABLED is off.
  *   POST /api/v1/content-v3/article        — validateApiAccess (plugin), PAID like v2: the Writer
  *                                            draft 2 article from the session's plan (phase 8).
  *   POST /api/v1/content-v3/wizard/approve — validateApiAccess (plugin). Title check → Research →
@@ -28,14 +29,13 @@
  *   GET  /api/v1/content-v3/status         — validateApiAccess (plugin). Is CONTENT_V3_ENABLED on?
  *   POST /api/v1/content-v3/session/clear  — validateApiAccess (plugin). The wizard's Leave (W10).
  *   POST /api/v1/content-v3/keyword-data/prefetch — validateApiAccess (plugin). Warms the keyword
- *                                            data cache; see content-v3-keyword-data.handler.ts.
- *                                            The one plugin-facing route on this router (decided
- *                                            2026-11-11): it only reads a cache and costs no credits.
+ *                                            data cache (no credits); does nothing unless
+ *                                            CONTENT_V3_ENABLED and ISEO_V3_KEYWORD_DATA are on.
  *
- * There is deliberately no credit-gated endpoint yet. Nothing writes a `user_generations` row with
- * a `content_v3` type, so the live table's constraint on that column (which no tracked migration
- * creates, and which is therefore unverified) stays untested until a paid endpoint actually needs
- * it. The plugin continues to call /api/v1/content-v2/article throughout.
+ * Billing: /article is the one paid route (v2's price per size, reserve then refund, charged once
+ * per request_id through the content_v3_runs ledger). It writes `user_generations` rows of type
+ * `content_v3` (verified on production 14 Nov). The free wizard steps have a daily allowance per
+ * account tied to the articles delivered that day (services/content-v3/quota.ts).
  */
 
 import { Router, Request, Response } from 'express';

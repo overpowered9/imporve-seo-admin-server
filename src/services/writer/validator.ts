@@ -61,9 +61,31 @@ export const FIXED_LABELS = [
   'contact us', 'conclusion', 'final thoughts', 'key takeaways', 'introduction', 'overview', 'in summary', 'wrapping up',
 ];
 
+/**
+ * V9: a heading that is a fixed label, alone or followed only by a separator or "about/on/for …"
+ * ("FAQ", "What's next", "Conclusion: …", "Final thoughts on …"). "Key takeaways: <topic>" is the
+ * one allowed prefix. Apostrophes are read either way ("What's" / "Whats" / "What’s").
+ */
+export function isFixedLabel(heading: string): boolean {
+  const h = String(heading ?? '').replace(/[‘’ʼ`]/g, "'").replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!h) return false;
+  if (/^key takeaways:\s*\S/.test(h)) return false;
+  const labels = [...new Set(FIXED_LABELS.map((l) => l.replace(/'/g, "'?")))];
+  const re = new RegExp(`^(?:${labels.join('|')})(?:\\s*[:\\-\u2013\u2014|.!?]|\\s+(?:about|on|for|regarding)\\b|\\s*$)`);
+  return re.test(h);
+}
+
+/** V8: vague pointers to another part of the article (named cross-references are fine). */
 export const BACK_REFERENCES = [
-  'as mentioned above', 'as mentioned earlier', 'as discussed above', 'as discussed earlier', 'as noted above', 'as noted earlier',
-  'see below', 'see above', 'as stated above', 'mentioned above', 'discussed above', 'as we discussed', 'as we mentioned',
+  'as mentioned above', 'as mentioned earlier', 'as mentioned before', 'as mentioned previously', 'as discussed above',
+  'as discussed earlier', 'as discussed before', 'as noted above', 'as noted earlier', 'as noted before', 'as explained above',
+  'as explained earlier', 'as described above', 'as described earlier', 'as outlined above', 'as outlined earlier',
+  'as shown above', 'as shown below', 'as stated above', 'as stated earlier', 'as covered above', 'as covered earlier',
+  'see below', 'see above', 'mentioned above', 'discussed above', 'covered above', 'outlined above', 'listed above',
+  'listed below', 'as we discussed', 'as we mentioned', 'as we noted', 'as we saw', 'as we covered', 'as we explained',
+  'more on this below', 'more on that below', 'more on this later', 'more on that later', 'later in this article',
+  'earlier in this article', 'later in this post', 'earlier in this post', 'in the next section', 'in the previous section',
+  'in the section above', 'in the section below', 'the section above', 'the section below',
 ];
 
 // V7: block boundaries become spaces before the text is read, so "a</p><p>b" (compact HTML) counts
@@ -205,24 +227,29 @@ export function validateArticle(i: ValidateInput): ValidatorReport {
       i.picks.numbered.grouping === 'h2_items'
         ? body.length
         : body.reduce((sum, s) => sum + load(s.html, null, false)('h3').length, 0);
-    if (delivered !== n && !(i.picks.numbered.grouping === 'h2_items' && delivered === n + 1)) {
-      err('items_delivered', `The title promises ${n} items, but the article has ${delivered}.`);
+    // V6: as H2 sections the items may be followed by the selection guide and one short section
+    // for the type's remaining content (the numbered piece), so N to N + 2 body sections.
+    const ok = i.picks.numbered.grouping === 'h2_items' ? delivered >= n && delivered <= n + 2 : delivered === n;
+    if (!ok) err('items_delivered', `The title promises ${n} items, but the article has ${delivered}.`);
+    if (i.itemsDelivered !== n) {
+      err('items_delivered', typeof i.itemsDelivered === 'number'
+        ? `The writer reported ${i.itemsDelivered} items for a title that promises ${n}.`
+        : `The writer did not report how many of the ${n} items it delivered.`);
     }
-    if (typeof i.itemsDelivered === 'number' && i.itemsDelivered !== n) err('items_delivered', `The writer reported ${i.itemsDelivered} items for a title that promises ${n}.`);
   }
 
   // Headings.
   const bodyHeadings = body.map((s) => s.heading);
-  const questions = bodyHeadings.filter((h) => /\?\s*$/.test(h));
+  // V4: a "questions" list delivers questions as its items, so its item headings are not counted.
+  const questionItems = !!i.picks.numbered && /^question/.test(i.picks.numbered.kind) && i.picks.numbered.grouping === 'h2_items';
+  const questions = questionItems ? [] : bodyHeadings.filter((h) => /\?\s*$/.test(h));
   if (bodyHeadings.length && questions.length > Math.floor(bodyHeadings.length / 3)) {
     err('question_headings', 'Too many body headings are questions (at most one in three).', `${questions.length} of ${bodyHeadings.length}`);
   }
   const $all = load(i.html, null, false);
   const allHeadings = $all('h2, h3').toArray().map((h) => $all(h).text().replace(/\s+/g, ' ').trim());
-  for (const h of allHeadings) {
-    const n = norm(h);
-    if (FIXED_LABELS.includes(n)) err('fixed_label', 'Headings must name what the section covers, not a fixed label.', h);
-  }
+  const labelled = allHeadings.filter(isFixedLabel);
+  if (labelled.length) err('fixed_label', 'Headings must name what the section covers, not a fixed label.', labelled.join(' | '));
   const firstWords = new Map<string, string[]>();
   for (const h of $all('h2').toArray().map((x) => $all(x).text().trim())) {
     const w = norm(h).split(' ')[0];

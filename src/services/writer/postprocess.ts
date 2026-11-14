@@ -23,12 +23,12 @@ import type { ResearchSource } from '../research/research.service.js';
 
 export const WRITER_MARKER = '===WRITER_JSON===';
 
+// WR4: the doc's JSON has all three keys ("facts_used", "claims_to_check", "items_delivered": a
+// number or null); a missing key or `{}` is a bad format, so a failed attempt.
 const writerJsonSchema = z.object({
-  facts_used: z
-    .array(z.object({ claim: z.string().default(''), from: z.string().default('') }).passthrough())
-    .default([]),
-  claims_to_check: z.array(z.string()).default([]),
-  items_delivered: z.union([z.number().int(), z.null()]).default(null),
+  facts_used: z.array(z.object({ claim: z.string().default(''), from: z.string().default('') }).passthrough()),
+  claims_to_check: z.array(z.string()),
+  items_delivered: z.union([z.number().int(), z.null()]),
 });
 export type WriterJson = z.infer<typeof writerJsonSchema>;
 
@@ -37,12 +37,16 @@ export interface WriterOutput {
   json: WriterJson;
 }
 
-/** Throws on a missing marker, an empty article or unreadable JSON — each counts as a failed attempt. */
+/**
+ * Throws on a missing marker, text before the article ("Nothing before the article"), an empty
+ * article, or unreadable or incomplete JSON — each counts as a failed attempt (WR4).
+ */
 export function parseWriterOutput(text: string): WriterOutput {
   const raw = String(text ?? '');
   const at = raw.lastIndexOf(WRITER_MARKER);
   if (at < 0) throw new Error('missing ===WRITER_JSON=== marker');
   const html = raw.slice(0, at).trim();
+  if (html && !html.startsWith('<')) throw new Error('text before the article');
   if (html.replace(/<[^>]+>/g, '').trim().length < 200) throw new Error('article is empty or too short');
   let jsonText = raw.slice(at + WRITER_MARKER.length).trim();
   jsonText = jsonText.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
@@ -55,7 +59,9 @@ export function parseWriterOutput(text: string): WriterOutput {
   } catch {
     throw new Error('unreadable writer JSON');
   }
-  return { html, json: writerJsonSchema.parse(parsed) };
+  const json = writerJsonSchema.safeParse(parsed);
+  if (!json.success) throw new Error(`incomplete writer JSON: ${json.error.issues.map((i) => i.path.join('.') || i.message).join(', ')}`);
+  return { html, json: json.data };
 }
 
 // ---------------------------------------------------------------- sanitizer (WR10)
@@ -399,13 +405,19 @@ export function addTableOfContents(html: string, opts: { include: boolean; label
 
 // ---------------------------------------------------------------- disclaimer (WR8, G4)
 
-/** Before the last two sections (FAQ and closing, in whatever order). Never with an empty text. */
+/**
+ * Before the last two sections, FAQ and closing in whatever order (doc: "before the last two
+ * sections"), found by their data-iseo: with no FAQ section it goes before the closing alone,
+ * never before the last body section (WR5). Never with an empty text.
+ */
 export function insertDisclaimer(html: string, text: string | null | undefined): string {
   const t = String(text ?? '').trim();
   if (!t) return html;
   const { introHtml, sections } = splitSections(html);
   if (sections.length < 2) return `${html}\n<p class="iseo-disclaimer"><em>${escText(t)}</em></p>`;
-  const at = sections.length - 2;
+  let at = sections.length;
+  while (at > 0 && at > sections.length - 2 && (sections[at - 1].kind === 'faq' || sections[at - 1].kind === 'closing')) at--;
+  if (at === sections.length) at = sections.length - 2;
   const block = `<p class="iseo-disclaimer"><em>${escText(t)}</em></p>\n`;
   return [introHtml, ...sections.slice(0, at).map((s) => s.html), block, ...sections.slice(at).map((s) => s.html)].join('').trim();
 }
@@ -441,11 +453,22 @@ export function faqSchema(faq: FaqPair[]): Record<string, unknown> | null {
   };
 }
 
-/** Every h2 and h3 heading text, for <recent_headings> on later posts (B9). */
+/**
+ * The headings stored for <recent_headings> on later posts (B9): every h2, and the h3s inside body
+ * sections. FAQ questions are not headings to avoid (they repeat by design), so they are left out.
+ */
 export function headingsOf(html: string): string[] {
-  const $ = load(html, null, false);
-  return $('h2, h3')
-    .toArray()
-    .map((h) => $(h).text().replace(/\s+/g, ' ').trim())
-    .filter(Boolean);
+  const { sections } = splitSections(html);
+  const out: string[] = [];
+  for (const s of sections) {
+    const $ = load(s.html, null, false);
+    const h2 = $('h2').first().text().replace(/\s+/g, ' ').trim();
+    if (h2) out.push(h2);
+    if (s.kind !== 'body') continue;
+    $('h3').each((_, h) => {
+      const t = $(h).text().replace(/\s+/g, ' ').trim();
+      if (t) out.push(t);
+    });
+  }
+  return out;
 }

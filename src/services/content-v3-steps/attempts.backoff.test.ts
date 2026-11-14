@@ -78,3 +78,28 @@ test('the default wait reads CONTENT_V3_RETRY_BASE_MS (the test runner sets 0)',
   assert.deepEqual(defaultBackoff({}), { baseMs: 1000, maxMs: 8000 });
   assert.deepEqual(defaultBackoff({ CONTENT_V3_RETRY_BASE_MS: '0' }), { baseMs: 0, maxMs: 0 });
 });
+
+test('R7: runModelCall puts the spend of attempts that all failed on the StepFailedError', async () => {
+  const { runModelCall } = await import('../model-call.js');
+  const { StepFailedError } = await import('./attempts.js');
+  let n = 0;
+  const err = await runModelCall<{ ok: true }>({
+    step: 'planner',
+    model: 'claude-sonnet-5',
+    promptVersion: 'p',
+    system: 's',
+    user: 'u',
+    maxTokens: 10,
+    timeoutMs: 1000,
+    maxAttempts: 2,
+    call: async () => {
+      n++;
+      return { text: 'not json', usage: { input_tokens: 1000, output_tokens: 100 }, cost_usd: 0.02 };
+    },
+    parse: (t) => JSON.parse(t),
+    log: () => {},
+  }).catch((e) => e);
+  assert.ok(err instanceof StepFailedError);
+  assert.equal(n, 2);
+  assert.equal(err.cost_usd, 0.04);
+});

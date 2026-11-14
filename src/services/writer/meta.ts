@@ -6,7 +6,7 @@
  * model-call.ts, so they have a timeout, attempts and a [model-call] cost line.
  */
 import { META_BOUNDS, enforceMetaLength, type MetaKind } from '../meta-length.js';
-import { runModelCall, type ProviderCall } from '../model-call.js';
+import { promptVersionLabel, runModelCall, type ProviderCall } from '../model-call.js';
 import { parseJsonLoose } from '../claude.service.js';
 
 const META_SYSTEM = 'You write SEO metadata. Return ONLY valid JSON, no prose, no fences.';
@@ -45,6 +45,15 @@ Article:
 ${articlePlain(html)}`;
 }
 
+/**
+ * OPS2: the interim wording is code, not a registry template (it is replaced by the Meta prompt
+ * #13 once drafted), so its version is a hash of the exact template text: a wording change
+ * changes the label every run records.
+ */
+export const META_PROMPT_VERSION = promptVersionLabel({ templateType: 'content_v3_meta_interim', source: 'fallback', text: `${META_SYSTEM}\n${metaUserMessage('{{keyword}}', '')}` });
+export const metaFieldPromptVersion = (kind: MetaKind) =>
+  promptVersionLabel({ templateType: `content_v3_meta_interim_${kind}`, source: 'fallback', text: `${META_FIELD_SYSTEM}\n${metaFieldUserMessage(kind, '{{keyword}}', '')}` });
+
 export interface MetaDeps {
   call: ProviderCall;
   model: string;
@@ -73,7 +82,7 @@ export async function generateMetaV3(seedKeyword: string, html: string, deps: Me
     const r = await runModelCall<{ meta_title: string; meta_description: string }>({
       step: 'meta',
       model: deps.model,
-      promptVersion: 'meta_v3_interim@code',
+      promptVersion: META_PROMPT_VERSION,
       system: META_SYSTEM,
       user: metaUserMessage(seedKeyword, html),
       maxTokens: 4000,
@@ -102,7 +111,7 @@ export async function generateMetaV3(seedKeyword: string, html: string, deps: Me
         const r = await runModelCall<string>({
           step: 'meta',
           model: deps.model,
-          promptVersion: `meta_v3_interim_${kind}@code`,
+          promptVersion: metaFieldPromptVersion(kind),
           system: META_FIELD_SYSTEM,
           user: metaFieldUserMessage(kind, seedKeyword, html),
           maxTokens: 3000,

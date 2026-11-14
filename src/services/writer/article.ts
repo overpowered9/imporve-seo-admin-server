@@ -37,7 +37,7 @@ import {
   type WriterOutput,
 } from './postprocess.js';
 import { validateArticle, SIZE_RANGE, type ValidatorReport } from './validator.js';
-import { generateMetaV3 } from './meta.js';
+import { generateMetaV3, META_PROMPT_VERSION } from './meta.js';
 
 export type ArticleType = 'cost' | 'decision' | 'question' | 'topic';
 
@@ -148,6 +148,9 @@ export interface ArticleV3Result {
   cost: { writer: number | null; meta: number | null };
   usage: { writer: unknown[]; meta: unknown[] };
   prompt_version: string;
+  /** OPS2: every text the article was built from, by version (the Writer system prompt, the niche
+   *  profile block with its type adjustment lines, the blueprint pieces, the interim meta prompt). */
+  prompt_versions: { writer: string; niche_profile: string; blueprint: string; meta: string };
   model: string;
   messages: { system: string; user: string; blueprint: string; niche_profile: string };
   timings: { writer_ms: number; meta_ms: number; total_ms: number };
@@ -217,7 +220,7 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
     log,
   );
   const recentHeadings = recentHeadingsBlock(input.history, article_type);
-  const recentList = input.history.filter((h) => (h.article_type ?? '') === article_type).flatMap((h) => h.headings ?? []);
+  const recentList = input.history.filter((h) => (h.article_type ?? '') === article_type).slice(0, 20).flatMap((h) => h.headings ?? []);
 
   const partsText = Object.fromEntries(Object.entries(deps.writerParts ?? {}).map(([k, v]) => [k, v?.text])) as Partial<Record<WriterPart, string>>;
   const system = buildWriterSystem(partsText);
@@ -369,6 +372,12 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
     cost: { writer: writerCost, meta: meta.cost_usd },
     usage: { writer: writerUsage, meta: meta.usage },
     prompt_version: promptVersion,
+    prompt_versions: {
+      writer: promptVersion,
+      niche_profile: promptVersionLabel({ templateType: 'content_v3_niche_profile', source: 'fallback', text: niche.block }),
+      blueprint: promptVersionLabel({ templateType: 'content_v3_blueprint_pieces', source: 'fallback', text: JSON.stringify(pieces) }),
+      meta: META_PROMPT_VERSION,
+    },
     model: deps.writerModel,
     messages: { system, user: best.user, blueprint: bp.block, niche_profile: niche.block },
     timings: { writer_ms: writerMs, meta_ms: metaMs, total_ms: now() - started },

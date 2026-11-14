@@ -283,6 +283,22 @@ describe('POST /wizard/approve (W3, P1–P5, G2)', () => {
     assert.equal(b.body.data.regulated.by, 'business');
   });
 
+  test('W5: a local post needs a town or "Not about a specific location" before the plan', async () => {
+    const { app, plannerInputs } = await startApprove();
+    const r = await app.post('/api/v1/content-v3/wizard/approve', { ...APPROVE, target_town: '' }, PLUGIN_HEADERS);
+    assert.equal(r.status, 400);
+    assert.match(r.body.message, /Choose the town this post is about/);
+    assert.equal(plannerInputs.length, 0);
+    assert.equal((await app.post('/api/v1/content-v3/wizard/approve', { ...APPROVE, target_town: '', not_about_location: true }, PLUGIN_HEADERS)).status, 200);
+    assert.equal((await app.post('/api/v1/content-v3/wizard/approve', { ...APPROVE, target_town: '', reach: 'nationwide' }, PLUGIN_HEADERS)).status, 200);
+  });
+
+  test('B6: a typed title with a number that is not a list ("24 hour …") does not raise the minimum size', async () => {
+    const { app, plannerInputs } = await startApprove();
+    await app.post('/api/v1/content-v3/wizard/approve', { ...APPROVE, title: '24 hour emergency plumber cost in Española', seed_keyword: '24 hour emergency plumber cost' }, PLUGIN_HEADERS);
+    assert.equal(plannerInputs[0].minimum_size, 'small');
+  });
+
   test('minimum size from a numbered title; a typed title runs the lookup here (W2)', async () => {
     const { app, plannerInputs, sdReqs } = await startApprove();
     await app.post('/api/v1/content-v3/wizard/approve', { ...APPROVE, title: '12 signs your water heater is failing' }, PLUGIN_HEADERS);

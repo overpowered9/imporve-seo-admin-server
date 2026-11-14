@@ -40,6 +40,7 @@ import type { ResearchRequest } from '../services/research/research.service.js';
 import { toResearchInput } from '../services/research/research.service.js';
 import type { SessionResearch } from '../services/research/research.default.js';
 import { checkApprovedTitle, fallbackPlan, minimumSizeFor } from '../services/content-v3/planner-fallback.js';
+import { numberedFromTitle } from '../services/blueprint/blueprint.js';
 import { regulatedSuggestion, DEFAULT_REGULATED_TOPICS, type RegulatedTopicsList } from '../services/content-v3/regulated-topics.js';
 import { DEFAULT_SIZE_OPTIONS } from '../services/content-v3-steps/types.js';
 import { DEFAULT_NICHE_SETTINGS, nicheList, resolveNiche, type NicheSettings } from '../services/niche-profile/niche-profile.js';
@@ -208,8 +209,10 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
         result = await deps.runTitle(input, { runId: b.session_key, deadlineAt });
       } catch (err) {
         if (err instanceof StepFailedError) {
-          log(`[content-v3] title failed run=${b.session_key} attempts=${err.attempts.length}`);
-          await store.mergeSession(userId, websiteId, b.session_key, { cost: addCost(session.cost, 'search_data', sd.cached ? 0 : sd.meta.cost_usd) });
+          log(`[content-v3] title failed run=${b.session_key} attempts=${err.attempts.length} cost_usd=${err.cost_usd ?? 'null'}`);
+          await store.mergeSession(userId, websiteId, b.session_key, {
+            cost: addCost(addCost(session.cost, 'search_data', sd.cached ? 0 : sd.meta.cost_usd), 'title', err.cost_usd),
+          });
           return res.json({
             success: true,
             data: {
@@ -266,6 +269,12 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
     const check = checkApprovedTitle(b.title, b.seed_keyword);
     if (!check.ok) return res.status(400).json(v3ErrorBody(v3Error('invalid_request', check.error)));
 
+    // W5: a local business chooses the post's town or "Not about a specific location" before the
+    // plan is made (the wizard asks first; this holds for any caller).
+    const nationwide = String(b.reach ?? '').toLowerCase().startsWith('nation');
+    if (!nationwide && String(b.reach ?? '').trim() && !b.not_about_location && !String(b.target_town ?? '').trim()) {
+      return res.status(400).json(v3ErrorBody(v3Error('invalid_request', 'Choose the town this post is about, or "Not about a specific location".')));
+    }
     const userId = Number(req.user?.id);
     const websiteId = Number(req.website?.id);
     const ids = { userId, websiteId, sessionKey: b.session_key };
@@ -307,13 +316,13 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
       cost = addCost(cost, 'research', research.cached ? 0 : research.cost_usd);
       const researchInput = research.research ? toResearchInput(research.research) : undefined;
 
-      // <minimum_size>: from the title's own item count (the Title step's form/items when this is
-      // the generated title, else a leading number in a typed title).
+      // <minimum_size>: from the title's own item count (B6, the same rule as the blueprint): the
+      // Title step's form/items when this is the generated title, else a number before a known
+      // item kind in a typed title ("7 signs …"; "24 hour plumber" is not a list).
       const ts = session.title_step as { title?: string; form?: string; items?: number | null } | undefined;
-      const lead = /^\s*(\d{1,2})\s+\S/.exec(check.title);
-      const form = ts?.title === check.title ? ts.form : lead ? 'numbered' : undefined;
-      const items = ts?.title === check.title ? ts.items ?? null : lead ? Number(lead[1]) : null;
-      const minimum_size = minimumSizeFor(form, items);
+      const fromStep = ts?.title === check.title;
+      const nb = numberedFromTitle(check.title, fromStep ? ts?.form ?? null : null, fromStep ? ts?.items ?? null : null);
+      const minimum_size = minimumSizeFor(nb ? 'numbered' : undefined, nb?.items ?? null);
 
       const plannerNiche = deps.nicheSettings ? resolveNiche(b.niche, await deps.nicheSettings().catch(() => DEFAULT_NICHE_SETTINGS)) : resolveNiche(b.niche);
       const plannerInput: PlannerStepInput = {
@@ -345,7 +354,8 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
         cost = addCost(cost, 'planner', r.cost_usd);
       } catch (err) {
         if (!(err instanceof StepFailedError)) throw err;
-        // P4: the article can still be generated.
+        // P4: the article can still be generated. R7: the failed attempts' spend still counts.
+        cost = addCost(cost, 'planner', err.cost_usd);
         fallback = true;
         plan = fallbackPlan({ seedKeyword: b.seed_keyword, title: check.title, minimumSize: minimum_size, searchData: sd.block });
         log(`[content-v3] planner fallback run=${b.session_key} attempts=${err.attempts.length} type=${plan.article_type} size=${plan.post_size}`);

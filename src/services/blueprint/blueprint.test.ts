@@ -208,6 +208,24 @@ describe('numbered titles (B6)', () => {
     assert.equal(numberedFromTitle('25 tips for homeowners', 'numbered', 25)!.items, 15);
   });
 
+  test('B6: the Title step\'s form decides; a typed title needs a number before a known item kind', () => {
+    // 10-keyword run: "24 hour emergency plumber cost" became a 15-item "hour" list.
+    assert.equal(numberedFromTitle('24 hour emergency plumber cost', 'statement', null), null);
+    assert.equal(numberedFromTitle('24 hour emergency plumber cost'), null);
+    assert.equal(numberedFromTitle('24 hour plumber tips'), null);
+    assert.equal(numberedFromTitle('What a 2 car garage door costs'), null);
+    assert.equal(numberedFromTitle('How to save 20 percent on heating'), null);
+    assert.deepEqual(numberedFromTitle('7 Common Signs Your Water Heater Is Failing'), { items: 7, kind: 'signs', min_words: 60 });
+    assert.deepEqual(numberedFromTitle('Top 5 roofing mistakes in Santa Fe'), { items: 5, kind: 'mistakes', min_words: 60 });
+    assert.deepEqual(numberedFromTitle('6 signs your water heater is failing', 'numbered', 6), { items: 6, kind: 'signs', min_words: 60 });
+    assert.equal(numberedFromTitle('7 signs your water heater is failing', 'question', null), null, 'the Title step said not numbered');
+  });
+
+  test('B8: a price is a currency amount, before or after the number; a weight is not', () => {
+    for (const t of ['$300 to $450', 'about € 90', 'USD 300', '300 €', '1,200 dollars', '90 euros', '120 GBP', '£85 call-out']) assert.equal(priceAvailable([t]), true, t);
+    for (const t of ['a 50 pounds bag of salt', 'takes 2 hours', '15 years', null]) assert.equal(priceAvailable([t]), false, String(t));
+  });
+
   test('items replace the body count; no optional elements; no extra list; table only on Medium/Large', () => {
     for (let s = 1; s <= 20; s++) {
       const small = buildBlueprint({ ...BASE, postSize: 'small', suggestedSize: 'small', title: '6 signs your water heater is failing', titleForm: 'numbered', titleItems: 6, rng: mulberry32(s) });
@@ -254,23 +272,55 @@ describe('history checks (B4, B5)', () => {
     assert.ok(again.redraws >= 1);
   });
 
-  test('no single pick in more than 40% of the last 20', () => {
-    const history = hist(20, (i) => ({ accent: i < 10 ? 'one_table' : 'prose_only', opening: 'myth_correction' }), 'topic');
+  test('no single pick in more than 40% of the last 20 of the same type', () => {
+    const history = hist(20, (i) => ({ accent: i < 10 ? 'one_table' : 'prose_only', opening: 'myth_correction' }), 'cost');
     for (let s = 1; s <= 30; s++) {
       const r = buildBlueprint({ ...BASE, history, rng: mulberry32(s) });
       assert.ok(!['one_table', 'prose_only'].includes(r.picks.accent), r.picks.accent);
       assert.notEqual(r.picks.opening, 'myth_correction');
     }
+    // C9: posts of another type do not count.
+    const other = hist(20, () => ({ opening: 'myth_correction' }), 'topic');
+    const seen = new Set<string>();
+    for (let s = 1; s <= 60; s++) seen.add(buildBlueprint({ ...BASE, history: other, rng: mulberry32(s) }).picks.opening);
+    assert.ok(seen.has('myth_correction'));
+  });
+
+  test('C8: two-option dimensions are not limited (one value is always in half the posts)', () => {
+    const split = hist(20, (i) => ({ summary_form: i % 2 ? 'quick_answer' : 'takeaways', order: i % 2 ? 'faq_first' : 'closing_first', closing_format: i % 2 ? 'one_paragraph' : 'cta_own_line' }), 'cost');
+    const logs: string[] = [];
+    const r = buildBlueprint({ ...BASE, history: split, rng: mulberry32(5) }, (l) => logs.push(l));
+    assert.equal(r.redraws, 0);
+    assert.equal(r.accepted_after_max, false);
+    assert.deepEqual(logs, []);
+  });
+
+  test('a spread problem redraws only that dimension; the other picks stay', () => {
+    for (let s = 1; s <= 20; s++) {
+      const first = buildBlueprint({ ...BASE, rng: mulberry32(s) }).picks;
+      // 9 of the last 20 posts used this opening (45%); the newest two have no opening or closing,
+      // so the first draw is the same as without history.
+      const history = hist(20, (i) => (i >= 2 && i < 11 ? { opening: first.opening } : {}), 'cost');
+      const r = buildBlueprint({ ...BASE, history, rng: mulberry32(s) });
+      assert.notEqual(r.picks.opening, first.opening);
+      assert.ok(r.redraws >= 1);
+      for (const k of ['summary_form', 'takeaway_points', 'takeaway_list', 'length_pattern', 'accent', 'order', 'closing_move', 'closing_format', 'sections', 'optional_elements', 'word_targets'] as const) {
+        assert.deepEqual(r.picks[k], first[k], `${k} (seed ${s})`);
+      }
+    }
   });
 
   test('after 5 redraws the result is accepted and logged', () => {
-    // Every value of three dimensions already sits in 50% of the last 20: no draw can clear it.
-    const forced = hist(20, (i) => ({ summary_form: i % 2 ? 'quick_answer' : 'takeaways', order: i % 2 ? 'faq_first' : 'closing_first', closing_format: i % 2 ? 'one_paragraph' : 'cta_own_line' }), 'topic');
+    // Small, one body question and every pinnable pick pinned: every draw is the same structure,
+    // and it repeats one of the last 10, so no redraw can clear it.
+    const pins = { opening: 'direct_question', summary: { form: 'quick_answer' }, length_pattern: 'anchor', accent: 'prose_only', order: 'faq_first', closing_move: 'next_step', closing_format: 'one_paragraph', optional_elements: [], toc: false, firmness: 'soft' } as const;
+    const input = { ...BASE, postSize: 'small' as const, suggestedSize: 'small' as const, bodyQuestions: ['What does it cost?'], pins: pins as any };
+    const first = buildBlueprint(input);
     const logs: string[] = [];
-    const r = buildBlueprint({ ...BASE, history: forced, rng: mulberry32(5) }, (l) => logs.push(l));
+    const r = buildBlueprint({ ...input, history: [{ article_type: 'cost', picks: first.picks as any, fingerprint: first.fingerprint }] }, (l) => logs.push(l));
     assert.equal(r.accepted_after_max, true);
     assert.equal(r.redraws, 5);
-    assert.match(logs[0], /\[blueprint\] accepted after 5 redraws \(spread:/);
+    assert.match(logs[0], /\[blueprint\] accepted after 5 redraws \(exact_repeat\)/);
   });
 
   test('a stored row with incomplete picks does not break the draw', () => {

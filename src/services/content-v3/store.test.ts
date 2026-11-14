@@ -84,6 +84,26 @@ describe('posts', () => {
     assert.match(sql.matching(/FROM content_v3_posts/)[0].text, /ORDER BY created_at DESC, id DESC LIMIT \?/);
   });
 
+  test('C9: one row per post — a regeneration of the same session replaces its row', async () => {
+    const sql = createFakeSql();
+    const store = createContentV3Store({ sql, ttlDays: 7, log: () => {} });
+    await store.recordPost({ user_id: 5, website_id: 9, session_key: KEY, picks: {}, headings: [], article_type: 'cost' });
+    const texts = sql.queries.map((q) => q.text);
+    const del = texts.findIndex((t) => /DELETE FROM content_v3_posts WHERE user_id = \? AND website_id = \? AND session_key = \?/.test(t));
+    const ins = texts.findIndex((t) => /INSERT INTO content_v3_posts/.test(t));
+    assert.ok(del >= 0 && ins > del, texts.join('\n'));
+    assert.deepEqual(sql.queries[del].params, [5, 9, KEY]);
+    // Without a session key nothing is replaced.
+    const sql2 = createFakeSql();
+    await createContentV3Store({ sql: sql2, ttlDays: 7, log: () => {} }).recordPost({ user_id: 5, website_id: 9, picks: {}, headings: [] });
+    assert.equal(sql2.matching(/DELETE FROM content_v3_posts/).length, 0);
+    const m = createMemoryContentV3Store();
+    await m.recordPost({ user_id: 1, website_id: 2, session_key: KEY, picks: { opening: 'a' }, headings: [] });
+    await m.recordPost({ user_id: 1, website_id: 2, session_key: KEY, picks: { opening: 'b' }, headings: [] });
+    await m.recordPost({ user_id: 1, website_id: 2, session_key: 'iseo_tk_other', picks: { opening: 'c' }, headings: [] });
+    assert.deepEqual((await m.recentPosts(1, 2, 20)).map((p) => p.picks.opening), ['c', 'b']);
+  });
+
   test('purge deletes expired sessions and old post rows', async () => {
     const sql = createFakeSql().when(/DELETE FROM content_v3_sessions/, [{}, {}]).when(/DELETE FROM content_v3_posts/, [{}]);
     const store = createContentV3Store({ sql, ttlDays: 7, log: () => {} });

@@ -206,14 +206,38 @@ export function optionalPool(typePiece: string): PoolElement[] {
     }));
 }
 
-/** Items in a numbered title: the number, the item kind, the minimum words (B6). */
+/** Item kinds a typed title can promise ("7 signs …", "10 common mistakes …"); B6. */
+export const ITEM_KINDS = [
+  'ways', 'tips', 'signs', 'steps', 'reasons', 'mistakes', 'ideas', 'questions', 'things', 'examples', 'stages',
+  'benefits', 'types', 'options', 'factors', 'causes', 'myths', 'facts', 'checks', 'rules', 'features', 'tricks',
+  'hacks', 'secrets', 'habits', 'warnings', 'problems', 'issues', 'symptoms', 'alternatives', 'questions to ask',
+] as const;
+// "N [up to two words] <kind>", the number not followed by a unit ("24 hour plumber tips" is no list).
+const TYPED_NUMBERED_RE = new RegExp(
+  String.raw`\b(\d{1,2})\s+(?!(?:hours?|days?|weeks?|months?|years?|minutes?|seconds?|inch(?:es)?|feet|foot|ft|yards?|miles?|gallons?|liters?|litres?|percent|degrees?|mph|psi|amps?|volts?|watts?|kw|btu|sq|square)\b)(?:[a-z][a-z'-]*\s+){0,2}?(${ITEM_KINDS.filter((k) => !k.includes(' ')).join('|')})\b`,
+  'i',
+);
+
+/**
+ * Items in a numbered title: the number, the item kind, the minimum words (B6).
+ * The Title step's form decides for its own titles: "numbered" uses its item count; any other
+ * form is never numbered, whatever digits the title holds ("24 hour emergency plumber cost").
+ * A typed title (no form) is numbered only when a number comes before a known item kind.
+ */
 export function numberedFromTitle(title: string, form?: string | null, items?: number | null): { items: number; kind: string; min_words: number } | null {
-  const m = /\b(\d{1,2})\s+([A-Za-z][A-Za-z'-]*)/.exec(title);
-  const n = form === 'numbered' && items ? items : m ? Number(m[1]) : null;
-  if (!n || n < 1 || (form && form !== 'numbered' && !m)) return null;
-  if (form !== 'numbered' && !/^\s*\d/.test(title) && !/\b\d{1,2}\s+(ways|tips|signs|steps|reasons|mistakes|ideas|questions|things|examples|stages|benefits|types|options)\b/i.test(title)) return null;
-  const word = (m?.[2] ?? 'items').toLowerCase();
-  const kind = word.replace(/[^a-z-]/g, '') || 'items';
+  const typed = TYPED_NUMBERED_RE.exec(title);
+  let n: number | null = null;
+  let kind = 'items';
+  if (form) {
+    if (form !== 'numbered') return null;
+    const lead = /\b(\d{1,2})\s+([A-Za-z][A-Za-z'-]*)/.exec(title);
+    n = items && items > 0 ? items : typed ? Number(typed[1]) : lead ? Number(lead[1]) : null;
+    kind = (typed?.[2] ?? lead?.[2] ?? 'items').toLowerCase().replace(/[^a-z-]/g, '') || 'items';
+  } else if (typed) {
+    n = Number(typed[1]);
+    kind = typed[2].toLowerCase();
+  }
+  if (!n || n < 1) return null;
   const t = title.toLowerCase();
   let min = 60;
   if (/\b(steps?|stages?)\b/.test(t)) min = 40;
@@ -305,8 +329,58 @@ export function structureFingerprint(raw: Partial<BlueprintPicks>): string {
 
 // ---------------------------------------------------------------- draw
 
+/** Steps 3l + 3m: the word target per body section; one section fewer while any is under 120. */
+function sectionTargets(size: PostSize, larger: boolean, sections: number, pattern: LengthPattern): { sections: number; word_targets: number[] } {
+  const aim = larger ? AIM_BOTTOM[size] : AIM_MIDDLE[size];
+  const body = aim - FIXED_PARTS[size];
+  const floor = SECTION_RANGE[size][0];
+  let n = sections;
+  let targets = wordTargets(body, pattern, n);
+  while (n > floor && targets.some((w) => w < MIN_SECTION_WORDS)) {
+    n -= 1;
+    targets = wordTargets(body, pattern, n);
+  }
+  return { sections: n, word_targets: liftToFloor(targets) };
+}
+
 const SPREAD_DIMS = ['summary_form', 'opening', 'length_pattern', 'accent', 'order', 'closing_move', 'closing_format'] as const;
 type SpreadDim = (typeof SPREAD_DIMS)[number];
+/**
+ * C8 (working value, flagged for the team lead): the 40% limit applies to dimensions with 3 or more
+ * options. With two options one value is always in at least half of the last 20, so the rule could
+ * never pass and every draw ended "accepted after 5 redraws".
+ */
+const SPREAD_OPTIONS: Record<SpreadDim, number> = {
+  summary_form: 2,
+  opening: OPENINGS.length,
+  length_pattern: LENGTH_PATTERNS.length,
+  accent: ACCENTS.length,
+  order: 2,
+  closing_move: CLOSING_MOVES.length,
+  closing_format: CLOSING_FORMATS.length,
+};
+
+/** "Redraw that dimension": the offending dimensions take the fresh draw's values, the rest stay. */
+function withRedrawn(picks: BlueprintPicks, fresh: BlueprintPicks, dims: SpreadDim[], input: BlueprintInput): BlueprintPicks {
+  const out: BlueprintPicks = { ...picks };
+  for (const dim of dims) {
+    if (dim === 'summary_form') {
+      out.summary_form = fresh.summary_form;
+      out.takeaway_points = fresh.takeaway_points;
+      out.takeaway_list = fresh.takeaway_list;
+    } else {
+      (out as unknown as Record<string, unknown>)[dim] = fresh[dim];
+    }
+  }
+  if (dims.includes('length_pattern') && !out.numbered) {
+    const larger = out.larger_than_suggested;
+    const t = sectionTargets(input.postSize, larger, picks.sections, out.length_pattern);
+    out.sections = t.sections;
+    out.word_targets = t.word_targets;
+    out.writer_targets = scaleTargets(t.word_targets, input.targetScale ?? 1);
+  }
+  return out;
+}
 
 interface DrawState {
   excluded: Partial<Record<SpreadDim, Set<string>>>;
@@ -422,17 +496,7 @@ function drawPicks(input: BlueprintInput, rng: () => number, pieces: Readonly<Re
 
   // l + m. Word targets (never random).
   let word_targets: number[] = [];
-  if (!numbered) {
-    const aim = larger ? AIM_BOTTOM[size] : AIM_MIDDLE[size];
-    const body = aim - FIXED_PARTS[size];
-    const floor = SECTION_RANGE[size][0];
-    word_targets = wordTargets(body, length_pattern, sections);
-    while (sections > floor && word_targets.some((w) => w < MIN_SECTION_WORDS)) {
-      sections -= 1;
-      word_targets = wordTargets(body, length_pattern, sections);
-    }
-    word_targets = liftToFloor(word_targets);
-  }
+  if (!numbered) ({ sections, word_targets } = sectionTargets(size, larger, sections, length_pattern));
 
   return {
     article_type: type,
@@ -574,7 +638,9 @@ export function assembleBlueprint(p: BlueprintPicks, input: Pick<BlueprintInput,
 export function buildBlueprint(input: BlueprintInput, log: (line: string) => void = () => {}): BlueprintResult {
   const rng = input.rng ?? Math.random;
   const pieces = input.pieces ?? BLUEPRINT_PIECES_V1;
-  const history = input.history ?? [];
+  // C9: the history is the site's posts of the same article type (one row per post).
+  const type: ArticleType = input.pins?.article_type ?? input.articleType;
+  const history = (input.history ?? []).filter((h) => (h.article_type ?? h.picks?.article_type) === type);
   const last10 = new Set(history.slice(0, 10).map((h) => h.fingerprint || (h.picks?.article_type ? structureFingerprint(h.picks as Partial<BlueprintPicks>) : '')).filter(Boolean));
   const last20 = history.slice(0, 20);
   const pinned = new Set(Object.keys(input.pins ?? {}));
@@ -586,11 +652,14 @@ export function buildBlueprint(input: BlueprintInput, log: (line: string) => voi
   let accepted_after_max = false;
   for (;;) {
     const problems: string[] = [];
-    if (last10.has(structureFingerprint(picks))) problems.push('exact_repeat');
+    const repeat = last10.has(structureFingerprint(picks));
+    if (repeat) problems.push('exact_repeat');
     const over: SpreadDim[] = [];
     if (last20.length >= 5) {
       for (const dim of SPREAD_DIMS) {
         if (pinned.has(pinOf[dim])) continue;
+        // C8: two-option dimensions (and a numbered title's accent: two at most) are not limited.
+        if ((dim === 'accent' && picks.numbered ? 2 : SPREAD_OPTIONS[dim]) < 3) continue;
         const v = String(picks[dim]);
         const n = last20.filter((h) => String(h.picks[dim] ?? '') === v).length;
         if (n / last20.length > 0.4) over.push(dim);
@@ -605,7 +674,9 @@ export function buildBlueprint(input: BlueprintInput, log: (line: string) => voi
     }
     redraws++;
     for (const dim of over) (state.excluded[dim] ||= new Set()).add(String(picks[dim]));
-    picks = drawPicks(input, rng, pieces, state);
+    const fresh = drawPicks(input, rng, pieces, state);
+    // An exact repeat is redrawn whole; a spread problem redraws only that dimension (doc step 4).
+    picks = repeat ? fresh : withRedrawn(picks, fresh, over, input);
   }
 
   return { block: assembleBlueprint(picks, input, pieces), picks, fingerprint: structureFingerprint(picks), redraws, accepted_after_max };
@@ -615,8 +686,7 @@ export function buildBlueprint(input: BlueprintInput, log: (line: string) => voi
 export function recentHeadingsBlock(history: Array<{ article_type?: string | null; headings?: string[] }>, type: ArticleType, max = 40): string {
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const h of history.slice(0, 20)) {
-    if ((h.article_type ?? '') !== type) continue;
+  for (const h of history.filter((x) => (x.article_type ?? '') === type).slice(0, 20)) {
     for (const heading of h.headings ?? []) {
       const k = heading.trim().toLowerCase();
       if (!k || seen.has(k)) continue;
@@ -632,5 +702,8 @@ export function recentHeadingsBlock(history: Array<{ article_type?: string | nul
 
 /** B8: is a price available? A currency amount in the research facts or the Business details pricing. */
 export function priceAvailable(texts: Array<string | null | undefined>): boolean {
-  return texts.some((t) => !!t && /(?:[$€£¥]\s?\d|\b\d[\d,.]*\s?(?:dollars|usd|eur|euros|gbp|pounds)\b)/i.test(t));
+  // A symbol or code before the amount ($300, € 90, USD 300), or a currency after it (300 €,
+  // 300 dollars, 90 euros, 120 GBP). "pounds" is left out: "a 50 pounds bag" is a weight.
+  const re = /(?:[$€£¥]\s?\d|\b(?:usd|eur|gbp|us\$)\s?\d|\d[\d,.]*\s?(?:[€£]|(?:dollars?|usd|eur|euros?|gbp)\b))/i;
+  return texts.some((t) => !!t && re.test(t));
 }

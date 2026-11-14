@@ -150,6 +150,13 @@ export function createContentV3Store(deps: ContentV3StoreDeps): ContentV3Store {
     async recordPost(rec) {
       if (!validIds(rec.user_id, rec.website_id)) return false;
       try {
+        // C9: one row per post; a regeneration of the same wizard session replaces its row.
+        if (rec.session_key) {
+          await sql`
+            DELETE FROM content_v3_posts
+            WHERE user_id = ${rec.user_id} AND website_id = ${rec.website_id} AND session_key = ${rec.session_key}
+          `;
+        }
         await sql`
           INSERT INTO content_v3_posts
             (user_id, website_id, session_key, bulk_batch, article_type, post_size, proof_level, picks, fingerprint, headings, validator)
@@ -238,6 +245,12 @@ export function createMemoryContentV3Store(): ContentV3Store & { sessions: Map<s
       return true;
     },
     async recordPost(rec) {
+      // C9: one row per post; a regeneration of the same wizard session replaces it.
+      if (rec.session_key) {
+        for (let i = posts.length - 1; i >= 0; i--) {
+          if (posts[i].user_id === rec.user_id && posts[i].website_id === rec.website_id && posts[i].session_key === rec.session_key) posts.splice(i, 1);
+        }
+      }
       posts.unshift({ ...structuredClone(rec), created_at: new Date().toISOString() });
       return true;
     },

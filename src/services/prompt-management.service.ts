@@ -51,11 +51,13 @@ export class PromptManagementService {
       throw new Error(`Template '${templateType}' not found`);
     }
 
-    // Get the active version for this template
+    // Get the active version for this template. While a version is being activated two are briefly
+    // active (the target is switched on before the others are switched off); the highest version
+    // wins, as in the other active-version reads in this file.
     const activeVersion = await PromptVersion.findOne({
       templateId: template._id,
       isActive: true
-    });
+    }).sort({ version: -1 });
 
     if (!activeVersion) {
       throw new Error(`No active version found for template '${templateType}'`);
@@ -82,7 +84,7 @@ export class PromptManagementService {
    * Get active version for a template
    */
   async getActiveVersion(templateId: string): Promise<IPromptVersion | null> {
-    return await PromptVersion.findOne({ templateId, isActive: true });
+    return await PromptVersion.findOne({ templateId, isActive: true }).sort({ version: -1 });
   }
 
   /**

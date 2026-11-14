@@ -22,7 +22,7 @@
 import { createHash } from 'node:crypto';
 import { getAnthropic, type ClaudeUsage } from './claude.service.js';
 import { modelCostUsd, usageTokens } from './model-pricing.js';
-import { DEFAULT_MAX_ATTEMPTS, runWithAttempts, type AttemptRecord, type AttemptsResult } from './content-v3-steps/attempts.js';
+import { DEFAULT_MAX_ATTEMPTS, runWithAttempts, StepFailedError, type AttemptRecord, type AttemptsResult } from './content-v3-steps/attempts.js';
 
 export class ModelCallTimeoutError extends Error {
   constructor(readonly timeoutMs: number) {
@@ -192,7 +192,8 @@ export async function runModelCall<T>(spec: ModelCallSpec<T>): Promise<ModelCall
   const stopReasons = new Map<number, string | null | undefined>();
   const reportedCost = new Map<number, number | null | undefined>();
 
-  const r = await runWithAttempts<T>({
+  const rounded = () => (costTotal === null ? null : Math.round((costTotal as number) * 1_000_000) / 1_000_000);
+  const attemptsRun = runWithAttempts<T>({
     step,
     maxAttempts,
     // The [v3-step] lines stay quiet here; the [model-call] line below carries the same facts.
@@ -236,8 +237,16 @@ export async function runModelCall<T>(spec: ModelCallSpec<T>): Promise<ModelCall
       );
     },
   });
+  let r: Awaited<typeof attemptsRun>;
+  try {
+    r = await attemptsRun;
+  } catch (err) {
+    // R7: the spend of attempts that all failed still counts; it rides on the error.
+    if (err instanceof StepFailedError) err.cost_usd = rounded();
+    throw err;
+  }
 
-  return { ...r, cost_usd: costTotal === null ? null : Math.round((costTotal as number) * 1_000_000) / 1_000_000, prompt_version: promptVersion, model };
+  return { ...r, cost_usd: rounded(), prompt_version: promptVersion, model };
 }
 
 /**

@@ -224,6 +224,22 @@ describe('runResearch', () => {
     assert.doesNotMatch(logs.join('\n'), /secret provider detail/);
   });
 
+  test('R7: the spend of failed attempts is recorded, not zero', async () => {
+    const bad = { output: [{ type: 'message', content: [{ type: 'output_text', text: 'not json' }] }], usage: { input_tokens: 3000, output_tokens: 600, cost: { total_cost: 0.03 } } } as PplxAgentResponse;
+    const f = fakeFetch([bad, bad, bad]);
+    const logs: string[] = [];
+    const r = await runResearch(REQ, { config: CFG, fetchImpl: f.impl, log: (l) => logs.push(l) });
+    assert.equal(r.status, 'failed');
+    assert.equal(r.cost_usd, 0.09);
+    assert.match(logs.join('\n'), /\[research\] failed run=- attempts=3 cost_usd=0\.09 /);
+  });
+
+  test('R3: the town\'s country follows the search data country (SEARCH_DATA_COUNTRY_ISO)', async () => {
+    const f = fakeFetch([response(ANSWER)]);
+    await runResearch(REQ, { config: CFG, fetchImpl: f.impl, log: () => {}, countryIso: 'ca' });
+    assert.equal(f.calls[0].body.tools[0].user_location.country, 'CA');
+  });
+
   test('a retry succeeds on the second attempt', async () => {
     const f = fakeFetch([500, response(ANSWER)]);
     const r = await runResearch(REQ, { config: CFG, fetchImpl: f.impl, log: () => {} });

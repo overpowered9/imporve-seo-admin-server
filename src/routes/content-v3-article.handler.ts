@@ -142,6 +142,7 @@ interface SessionShape {
     ideal_client?: string | null;
   };
   plan?: PlannerStepOutput;
+  plan_meta?: { minimum_size?: (typeof SIZES)[number] | null };
   regulated?: { suggested?: boolean; by?: string | null };
   research?: { result?: ResearchResult };
   title_step?: { title?: string; form?: string; items?: number | null };
@@ -176,6 +177,12 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
     const session = ((await store.getSession(userId, websiteId ?? 0, b.session_key)) ?? {}) as SessionShape;
     if (!session.approved?.title || !session.plan) return res.status(409).json(v3ErrorBody(v3Error('session_expired')));
     const a = session.approved;
+    // W8: a numbered title's minimum size holds on the server too (the wizard greys smaller sizes out).
+    const minimum = session.plan_meta?.minimum_size;
+    if (minimum && SIZES.indexOf(minimum) > SIZES.indexOf(b.post_size)) {
+      const name = { small: 'Small', medium: 'Medium', large: 'Large' }[minimum];
+      return res.status(400).json(v3ErrorBody(v3Error('invalid_request', `This title needs at least a ${name} post to deliver every item. Choose ${name} or larger.`)));
+    }
     if (a.proof_level === 'regulated' && deps.disclaimerKeys) {
       const keys = await deps.disclaimerKeys().catch(() => [] as string[]);
       if (!regulatedV3Allowed(keys, a.niche_key, a.niche_profile)) {
@@ -235,7 +242,8 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
       charged = cost;
       await ledgerWrite('charged', (runs, id) => runs.charged(id, { cost, action, variant }));
 
-      const history = historyFor(await store.recentPosts(userId, websiteId ?? 0, 20));
+      // C9: the blueprint keeps the last 20 posts of the article's type, so read enough rows to find them.
+      const history = historyFor(await store.recentPosts(userId, websiteId ?? 0, 100));
       const started = now();
       const generation = deps.generate(
         {
@@ -283,6 +291,7 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
           method: 'claude-v3',
           model: r.model,
           prompt_version: r.prompt_version,
+          prompt_versions: r.prompt_versions,
           picks: r.picks,
           fingerprint: r.fingerprint,
           validator: r.validator,

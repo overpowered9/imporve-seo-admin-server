@@ -247,6 +247,15 @@ describe('POST /content-v3/article', () => {
     assert.match(logs.join('\n'), /runs ledger unavailable — using the in-process lock/);
   });
 
+  test('W8: a size below the numbered title\'s minimum is refused on the server, before any charge', async () => {
+    const { app, events } = await start({ session: { ...SESSION, plan_meta: { minimum_size: 'large' } } });
+    const r = await app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);
+    assert.equal(r.status, 400);
+    assert.match(r.body.message, /at least a Large post/);
+    assert.deepEqual(events, []);
+    assert.equal((await app.post('/api/v1/content-v3/article', { ...BODY, post_size: 'large' }, PLUGIN_HEADERS)).status, 200);
+  });
+
   test('B-5: a delivered article is counted for the free steps\' allowance; a replay or a failure is not', async () => {
     const quota = createMemoryQuotaStore();
     const runs = createMemoryRunsStore();

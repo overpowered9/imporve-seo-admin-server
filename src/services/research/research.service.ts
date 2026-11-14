@@ -28,6 +28,7 @@ import { StepFailedError } from '../content-v3-steps/attempts.js';
 import type { ResearchInput, ScopedItem } from '../content-v3-steps/types.js';
 import { parseJsonLoose } from '../claude.service.js';
 import { parseTown, stateName } from '../search-data/towns.js';
+import { searchDataConfig } from '../../config/search-data.config.js';
 import { buildResearchInput, RESEARCH_OUTPUT_SCHEMA, RESEARCH_PROMPT_DEF, type ResearchInputData } from './prompt.js';
 
 // ---------- Perplexity response shapes (the subset read here) ----------
@@ -246,6 +247,8 @@ export interface ResearchDeps {
   runId?: string;
   /** B-3: epoch ms by which research must give up, so the Planner keeps its share of the request. */
   deadlineAt?: number;
+  /** R3: ISO country of the town (default SEARCH_DATA_COUNTRY_ISO, else us). */
+  countryIso?: string;
 }
 
 export function perplexityProviderCall(cfg: ResearchConfig, body: Record<string, unknown>, fetchImpl: typeof fetch = fetch): ProviderCall {
@@ -286,7 +289,8 @@ export async function runResearch(req: ResearchRequest, deps: ResearchDeps = {})
   const started = now();
   const nationwide = String(req.reach ?? '').toLowerCase().startsWith('nation');
   const town = nationwide ? undefined : req.target_town?.trim() || undefined;
-  const location = town ? userLocation(town, req.state_hint) : null;
+  // R3: the country of the search data lookup (SEARCH_DATA_COUNTRY_ISO), not a fixed US.
+  const location = town ? userLocation(town, req.state_hint, (deps.countryIso ?? searchDataConfig().countryIso).toUpperCase()) : null;
   const domainFilter = competitorDenylist(req.local_domains ?? [], cfg.skipDomains);
   const instr = deps.resolveInstructions ? await deps.resolveInstructions() : { text: RESEARCH_PROMPT_DEF.fallback, source: 'fallback' as const };
   const promptVersion = promptVersionLabel({ templateType: RESEARCH_PROMPT_DEF.templateType, source: instr.source, dbVersion: instr.dbVersion, text: instr.text });
@@ -340,8 +344,10 @@ export async function runResearch(req: ResearchRequest, deps: ResearchDeps = {})
     return { research, status: 'ok', attempts: r.attempts.length, cost_usd: r.cost_usd, ms: now() - started, prompt_version: promptVersion, request_meta: meta };
   } catch (err) {
     const attempts = err instanceof StepFailedError ? err.attempts.length : 0;
-    log(`[research] failed run=${deps.runId ?? '-'} attempts=${attempts} — continuing without research`);
-    return { research: null, status: 'failed', attempts, cost_usd: null, ms: now() - started, prompt_version: promptVersion, request_meta: meta };
+    // R7: what the failed attempts cost is still spent; recorded, not zero.
+    const spent = err instanceof StepFailedError ? err.cost_usd ?? null : null;
+    log(`[research] failed run=${deps.runId ?? '-'} attempts=${attempts} cost_usd=${spent ?? 'null'} — continuing without research`);
+    return { research: null, status: 'failed', attempts, cost_usd: spent, ms: now() - started, prompt_version: promptVersion, request_meta: meta };
   }
 }
 

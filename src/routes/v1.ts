@@ -140,8 +140,10 @@ router.post('/generate', async (req: Request, res: Response, next: NextFunction)
 // Mount generation routes
 router.use('/generate', generationRoutes);
 router.use('/content-v2', contentV2Routes);
-// v3 is the prompt-experimentation route. Every endpoint on it is requireAdmin and charges no
-// credits; the plugin keeps calling /content-v2 above.
+// Content v3 (content-v3.routes.ts lists every route and its auth). Admin tools are requireAdmin;
+// the plugin's wizard steps, status, session clear and keyword prefetch use plugin auth, and
+// POST /content-v3/article is paid like /content-v2. All of it answers 409 v3_disabled (the plugin
+// then uses /content-v2) unless CONTENT_V3_ENABLED is "true".
 router.use('/content-v3', contentV3Routes);
 router.use('/auth', authRoutes);
 router.use('/websites', websitesRoutes);

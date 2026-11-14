@@ -15,6 +15,7 @@ import { buildWriterUserMessage } from './user-message.js';
 import {
   addTableOfContents,
   extractFaq,
+  headingsOf,
   insertDisclaimer,
   linkSourceTokens,
   parseWriterOutput,
@@ -23,7 +24,7 @@ import {
   splitSections,
   WRITER_MARKER,
 } from './postprocess.js';
-import { countWords, keywordInFirstWords, validateArticle } from './validator.js';
+import { countWords, isFixedLabel, keywordInFirstWords, validateArticle } from './validator.js';
 import { finalProofLevel, generateArticleV3, rangeDistance, repairTargetFactor, skipSecondRun, writerPromptLabel, type ArticleV3Input } from './article.js';
 import { buildBlueprint, mulberry32, type BlueprintPicks } from '../blueprint/blueprint.js';
 import type { ProviderCall } from '../model-call.js';
@@ -154,7 +155,16 @@ describe('parse, sanitize, link, TOC, disclaimer, FAQ', () => {
     assert.throws(() => parseWriterOutput(body), /marker/);
     assert.throws(() => parseWriterOutput(`<p>short</p>\n${WRITER_MARKER}\n{}`), /too short/);
     assert.throws(() => parseWriterOutput(`${body}\n${WRITER_MARKER}\nnot json`), /unreadable/);
-    assert.equal(parseWriterOutput(`${body}\n${WRITER_MARKER}\n\`\`\`json\n{"items_delivered":7}\n\`\`\``).json.items_delivered, 7);
+    assert.equal(parseWriterOutput(`${body}\n${WRITER_MARKER}\n\`\`\`json\n{"facts_used":[],"claims_to_check":[],"items_delivered":7}\n\`\`\``).json.items_delivered, 7);
+  });
+
+  test('WR4 strict: text before the article, `{}` or a missing key is a failed attempt', () => {
+    const body = `<p>${words(80)}</p>`;
+    const json = '{"facts_used":[],"claims_to_check":[],"items_delivered":null}';
+    assert.throws(() => parseWriterOutput(`Here is your article:\n${body}\n${WRITER_MARKER}\n${json}`), /text before the article/);
+    assert.throws(() => parseWriterOutput(`${body}\n${WRITER_MARKER}\n{}`), /incomplete writer JSON: facts_used, claims_to_check, items_delivered/);
+    assert.throws(() => parseWriterOutput(`${body}\n${WRITER_MARKER}\n{"facts_used":[],"claims_to_check":[]}`), /items_delivered/);
+    assert.equal(parseWriterOutput(`\n  ${body}\n${WRITER_MARKER}\n${json}`).html, body, 'leading whitespace is not text');
   });
 
   test('sanitizer keeps only the allowlist (WR10); the only link kept is the CTA (B-4)', () => {
@@ -236,6 +246,16 @@ describe('parse, sanitize, link, TOC, disclaimer, FAQ', () => {
     assert.equal(insertDisclaimer(html, ''), html);
     const out = insertDisclaimer(html, 'This is general information, not advice for your case.');
     assert.ok(out.indexOf('iseo-disclaimer') < out.indexOf('data-iseo="faq"') && out.indexOf('iseo-disclaimer') > out.indexOf('data-iseo="body"'));
+    // WR5: with no FAQ section it goes before the closing, never before the last body section.
+    const noFaq = '<p>i</p><h2 data-iseo="body">B1</h2><p>b</p><h2 data-iseo="body">B2</h2><p>b</p><h2 data-iseo="closing">C</h2><p>c</p>';
+    const out2 = insertDisclaimer(noFaq, 'General information.');
+    assert.ok(out2.indexOf('iseo-disclaimer') > out2.indexOf('>B2<') && out2.indexOf('iseo-disclaimer') < out2.indexOf('data-iseo="closing"'), out2);
+  });
+
+  test('B9: stored headings are the h2s and the body h3s; FAQ questions are not kept', () => {
+    const html = '<p>i</p><h2 data-iseo="takeaways">Key takeaways: heaters</h2><ul><li>a</li></ul><h2 data-iseo="body">Signs</h2><h3>Rust</h3><p>x</p>' +
+      '<h2 data-iseo="faq">Questions about heaters</h2><h3>How long?</h3><p>A day.</p><h2 data-iseo="closing">Book a visit</h2><p>c</p>';
+    assert.deepEqual(headingsOf(html), ['Key takeaways: heaters', 'Signs', 'Rust', 'Questions about heaters', 'Book a visit']);
   });
 
   test('FAQ from the HTML (WR6, BUG2 server side)', () => {
@@ -290,13 +310,49 @@ describe('validator (V1–V9, V11)', () => {
     assert.ok(base(p, html).issues.some((i) => i.code === 'question_headings'));
   });
 
-  test('numbered titles: exactly N items (or N + one leftover section)', () => {
+  test('numbered titles: N items; as H2s up to N + 2 (guide + leftover, V6); the writer must report N', () => {
     const p = picksFor({ title: '6 signs your water heater is failing', titleForm: 'numbered', titleItems: 6 });
     const html = article(p, { faq: PLAN.faq_questions.slice(0, p.faq_count), keyword: 'water heater repair cost' });
-    assert.equal(base(p, html).issues.filter((i) => i.code === 'items_delivered').length, 0);
+    const itemIssues = (h: string, extra = {}) => base(p, h, { itemsDelivered: 6, ...extra }).issues.filter((i) => i.code === 'items_delivered');
+    assert.equal(itemIssues(html).length, 0);
     assert.ok(base(p, html, { itemsDelivered: 5 }).issues.some((i) => i.code === 'items_delivered'));
+    assert.match(base(p, html, { itemsDelivered: null }).issues.find((i) => i.code === 'items_delivered')!.message, /did not report/);
     const fewer = html.replace(/<h2 data-iseo="body">Thermostat[\s\S]*?(?=<h2 data-iseo="body">)/, '').replace(/<h2 data-iseo="body">Element[\s\S]*?(?=<h2 data-iseo="body">)/, '');
-    assert.ok(base(p, fewer).issues.some((i) => i.code === 'items_delivered'));
+    assert.ok(itemIssues(fewer).length > 0);
+    const extra = (n: number) => Array.from({ length: n }, (_, k) => `<h2 data-iseo="body">Extra part ${k}</h2><p>${words(40)}</p>`).join('');
+    const closingAt = html.search(/<h2 data-iseo="(?:faq|closing)"/);
+    const plus = (n: number) => html.slice(0, closingAt) + extra(n) + html.slice(closingAt);
+    assert.equal(itemIssues(plus(2)).length, 0, 'the selection guide and one leftover section are allowed');
+    assert.ok(itemIssues(plus(3)).length > 0);
+  });
+
+  test('V4: a "questions to ask" list may use questions as its item headings', () => {
+    const p = picksFor({ title: '6 questions to ask a plumber', titleForm: 'numbered', titleItems: 6 });
+    assert.equal(p.numbered!.kind, 'questions');
+    const html = article(p, { faq: PLAN.faq_questions.slice(0, p.faq_count), keyword: 'water heater repair cost' }).replace(/(<h2 data-iseo="body">[^<]*)(<\/h2>)/g, '$1?$2');
+    assert.equal(base(p, html, { itemsDelivered: 6 }).issues.filter((i) => i.code === 'question_headings').length, 0);
+    const signs = picksFor({ title: '6 signs your water heater is failing', titleForm: 'numbered', titleItems: 6 });
+    const html2 = article(signs, { faq: PLAN.faq_questions.slice(0, signs.faq_count), keyword: 'water heater repair cost' }).replace(/(<h2 data-iseo="body">[^<]*)(<\/h2>)/g, '$1?$2');
+    assert.ok(base(signs, html2, { itemsDelivered: 6 }).issues.some((i) => i.code === 'question_headings'));
+  });
+
+  test('V9: fixed labels caught with apostrophes and extra words; "Key takeaways: …" allowed', () => {
+    for (const h of ["What's next", 'What’s Next?', 'Whats next', 'FAQs', 'Frequently asked questions about tankless heaters', 'Conclusion: is it worth it?', 'Final thoughts on repair vs replace', 'Key takeaways']) {
+      assert.equal(isFixedLabel(h), true, h);
+    }
+    for (const h of ['Key takeaways: water heater repair costs', 'Summary of costs by region', 'What next for your roof', 'Questions homeowners ask about water heaters']) {
+      assert.equal(isFixedLabel(h), false, h);
+    }
+  });
+
+  test('V8: common vague back-references are caught; named cross-references are not', () => {
+    const p = picksFor();
+    const html = article(p, { faq: PLAN.faq_questions.slice(0, p.faq_count) });
+    const withPhrase = (phrase: string) => html.replace('</p>', ` ${phrase}, the tank matters.</p>`);
+    for (const phrase of ['As mentioned before', 'As explained earlier', 'More on this below', 'In the next section']) {
+      assert.ok(base(p, withPhrase(phrase)).issues.some((i) => i.code === 'back_reference'), phrase);
+    }
+    assert.equal(base(p, withPhrase('As the permit fee covered under Santa Fe permits shows')).issues.filter((i) => i.code === 'back_reference').length, 0);
   });
 
   test('keyword in the first 100 words: exact, or every content word (town optional)', () => {
@@ -374,6 +430,26 @@ function writerText(input: ArticleV3Input, mutate: (html: string) => string = (h
 }
 
 describe('generateArticleV3', () => {
+  test('K4: keyword data never reaches the live Writer (Planner demand notes, overlap, smuggled fields)', async () => {
+    const plan = { ...PLAN, demand_notes: 'seed volume 2400; related "tankless water heater cost" 1900', overlap: 'Covers post 12 "Tankless heater prices"' };
+    const smuggled = { keyword_data: '<keyword_data scope="national">seed | volume 2400</keyword_data>', search_volume: 2400, use_keyword_data: true, recent_posts: [{ post_id: 12, title: 'Tankless heater prices' }] };
+    const input = INPUT({ plan, ...(smuggled as Partial<ArticleV3Input>) });
+    const s = scripted([writerText(input)]);
+    await generateArticleV3(input, DEPS(s.call));
+    const sent = [...s.systems, ...s.users].join('\n');
+    assert.ok(s.users.length >= 1);
+    // (2400 alone is legitimate: the Medium range is "1200 to 2400 words".)
+    assert.doesNotMatch(sent, /keyword_data|search_volume|demand_notes|recent_posts|volume 2400|seed volume|\b1900\b|Covers post 12|Tankless heater prices/);
+    // And the Writer modules import nothing from keyword data or the Title/Planner steps' keyword code.
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const { fileURLToPath } = await import('node:url');
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.ts') && !x.endsWith('.test.ts'))) {
+      assert.doesNotMatch(fs.readFileSync(path.join(dir, f), 'utf8'), /from '\.\.\/keyword-data\/|keyword-data\.service|step-common\.js/, f);
+    }
+  });
+
   test('happy path: one Writer call, links, TOC, meta, FAQ, fingerprint; proof level standard', async () => {
     const input = INPUT();
     const s = scripted([writerText(input)]);
@@ -488,5 +564,20 @@ describe('generateArticleV3', () => {
     const s2 = scripted([writerText(input)]);
     const r2 = await generateArticleV3(INPUT({ business_proof_level: 'regulated', niche: 'dental' }), { ...DEPS(s2.call), niche: { settings: (await import('../niche-profile/niche-profile.js')).DEFAULT_NICHE_SETTINGS, disclaimers: { dental: 'This article is general information, not dental advice for your situation.' } } });
     assert.match(r2.content, /iseo-disclaimer/);
+  });
+});
+
+describe('OPS2: version labels for the code-held texts', () => {
+  test('the interim meta prompts and the niche profile carry a hash of their exact text', async () => {
+    const { META_PROMPT_VERSION, metaFieldPromptVersion } = await import('./meta.js');
+    assert.match(META_PROMPT_VERSION, /^content_v3_meta_interim@code#[0-9a-f]{8}$/);
+    assert.match(metaFieldPromptVersion('meta_title'), /^content_v3_meta_interim_meta_title@code#[0-9a-f]{8}$/);
+    const input = INPUT();
+    const s = scripted([writerText(input)]);
+    const r = await generateArticleV3(input, DEPS(s.call));
+    assert.equal(r.prompt_versions.writer, r.prompt_version);
+    assert.match(r.prompt_versions.niche_profile, /^content_v3_niche_profile@code#[0-9a-f]{8}$/);
+    assert.match(r.prompt_versions.blueprint, /^content_v3_blueprint_pieces@code#[0-9a-f]{8}$/);
+    assert.equal(r.prompt_versions.meta, META_PROMPT_VERSION);
   });
 });

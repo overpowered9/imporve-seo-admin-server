@@ -18,6 +18,8 @@ export interface AttemptRecord {
 }
 
 export class StepFailedError extends Error {
+  /** R7: what the failed attempts cost (set by runModelCall; null when a price was unknown). */
+  cost_usd?: number | null;
   constructor(
     readonly step: string,
     readonly attempts: AttemptRecord[],
