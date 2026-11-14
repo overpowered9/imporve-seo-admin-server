@@ -83,9 +83,43 @@ One line per model attempt, never content:
 
 `prompt=` is the template, the DB version (or `code` for the in-code fallback) and the first 8 hex of the sha256 of the exact text sent, so two runs with the same hash sent byte-identical system prompts. `cache_read > 0` on the second article proves prompt caching. Per article, one summary line: `[content-v3] cost run=… <step>=<usd> … total=<usd>`.
 
-## Rollout and rollback (filled in fully in phase 13)
+## Rollout and rollback (runbook)
 
-1. Deploy with `CONTENT_V3_ENABLED` unset. Apply migration 023. Run `POST /prompts/seed?mode=replace`, then `GET /prompts/check`.
-2. Staging: set `CONTENT_V3_ENABLED=true`, switch "Use Content v3" on in one test site.
-3. One production site, then all.
-4. Rollback: unset `CONTENT_V3_ENABLED` (sites fall back to v2 within 5 minutes). Prompt rollback: activate the "pre-v3" version in the admin panel.
+Content v3 is off until two switches are on: the server's `CONTENT_V3_ENABLED` and each site's "Use Content v3" (Settings → Content Features). With either off, every site generates exactly as before (v2). Nothing below changes v2.
+
+### Render environment
+
+| Variable | When | Value |
+|---|---|---|
+| `CONTENT_V3_ENABLED` | Step 4 (staging), later production | `true` to enable; unset = off (**the rollback**) |
+| `DATAFORSEO_LOGIN`, `DATAFORSEO_PASSWORD` | Before step 4 | Already set for keyword data; the search data lookup uses the same account |
+| `PERPLEXITY_API_KEY` | Before step 4 | **Missing.** Without it research is skipped: articles quote no figures, and every Regulated article fails the 3-source check and needs review |
+| `PERPLEXITY_EFFORT`, `PERPLEXITY_MODEL` | With the key | Zaid's choice; working value `low`, no model |
+| `ISEO_V3_KEYWORD_DATA` | Optional | `true` lets sites with the keyword-data beta setting use it in the v3 Title/Planner |
+| `CONTENT_V3_MAX_ATTEMPTS`, `CONTENT_V3_TIMEOUT_*_MS`, `CONTENT_V3_SESSION_TTL_DAYS`, `SEARCH_DATA_*`, `RESEARCH_FILTER_SKIP_DOMAINS`, `MODEL_PRICES_JSON` | Optional | Defaults are in `.env.example` |
+| `CONTENT_V3_STORE` | **Never on Render** | Local development only |
+
+### Steps
+
+1. **Deploy** the server with `CONTENT_V3_ENABLED` unset. `GET /api/v1/content-v3/status` answers `enabled: false`; every site stays on v2.
+2. **Migrations** (Supabase SQL editor, paste `npm run --silent migrations:print`, or `npm run migrate:keyword-data-cache` then `npm run migrate:content-v3-store`): 022 (keyword data cache) and 023 (wizard sessions, post history). Idempotent. Until 023 exists the store fails open: Regenerate recomputes and the blueprint has no history (`[content-v3] store unavailable`).
+3. **Prompts** (admin token): `POST /api/v1/content-v3/prompts/seed?mode=replace` — registers every v3 template and makes the doc text active for the doc-sourced ones, backing each old value up first as a version labelled `pre-v3` (nothing is deleted). Then `GET /api/v1/content-v3/prompts/check` must answer `all_equal: true`. Until this runs, the server uses the doc text from code for the three templates the Writer shares with the old chain and logs `still holds the pre-v3 text`.
+4. **Staging**: set `CONTENT_V3_ENABLED=true` on a staging server; on one test site switch "Use Content v3" on (the plugin re-checks the server within 5 minutes; saving the setting re-checks at once). Fill Business details: niche, local/nationwide, towns served, proof level, point of view.
+5. **Smoke test** on that site: Generate title → Approve (step 2 shows type, size, owner questions) → Generate AI Post → publish. Then a bulk project of 5 including a Regulated niche. Watch the logs (below).
+6. **Production**: set `CONTENT_V3_ENABLED=true`, switch one real site on, then the rest.
+
+### What to watch
+
+- `[model-call] … outcome=…` one line per model attempt; `cache_read` > 0 on the Writer after the first article (prompt caching works).
+- `[content-v3] cost run=… total=…` per article — compare with the expected cost per size (progress doc).
+- `[content-v3] validator … — writing once more (U2)` — how often the Writer needs its second run.
+- `[content-v3] article … validator=fail(…)` — articles that needed review.
+- `[search-data] … local=failed(…)` and `[research] failed` — provider trouble (the chain continues without them).
+- `REFUND FAILED` — must never appear; if it does, refund by hand with the logged user and amount.
+
+### Rollback
+
+- **Everything**: unset `CONTENT_V3_ENABLED`. The plugin answers v2 within 5 minutes (status cache); an in-flight v3 request gets `v3_disabled` and the wizard falls back to v2. No data is lost: sessions expire after 7 days, post history stays.
+- **One site**: switch "Use Content v3" off in its settings.
+- **One prompt**: in Prompts (V3), activate the version labelled `pre-v3` (or any earlier version). Activation now switches atomically (the new version is activated before the others are deactivated).
+- **Code**: redeploy the previous commit; the migrations are additive and can stay.

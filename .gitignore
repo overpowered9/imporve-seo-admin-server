@@ -104,6 +104,9 @@ add_stripe_price_id.sql
 !/src/scripts/backfill-credit-expiry.ts
 !/src/scripts/backfill-next-billing-date.ts
 !/src/scripts/refund-keyword-charges.ts
+# The Content v3 10-keyword run (production gate). Output goes to data/v3-runs/ (ignored below).
+!/src/scripts/content-v3-ten-keywords.ts
+!/src/scripts/content-v3-ten-keywords.test.ts
 # Ships despite being a development aid: package.json registers `seed:expiring`,
 # and an npm entry point pointing at a file that was silently dropped from the
 # deploy is the exact failure this whole block exists to prevent. It grants
@@ -121,3 +124,4 @@ email-previews/
 !/docs/KEYWORD_DATA_V3.md
 # A/B harness output (JSON + CSV per run). Local artefacts, never committed.
 data/ab-tests/
+data/v3-runs/

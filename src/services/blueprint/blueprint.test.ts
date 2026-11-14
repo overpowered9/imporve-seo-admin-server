@@ -101,7 +101,8 @@ describe('draw rules (B2–B7, B10, B11)', () => {
     assert.equal(r.picks.larger_than_suggested, true);
     assert.equal(r.picks.optional_elements.length, 3);
     const total = r.picks.word_targets.reduce((a, b) => a + b, 0);
-    assert.ok(Math.abs(total - (2400 - 540)) <= 10 * r.picks.sections, String(total));
+    // A quarter into the Large range (2,700), minus the fixed parts — never the 2,400 edge itself.
+    assert.ok(Math.abs(total - (2700 - 540)) <= 10 * r.picks.sections, String(total));
   });
 
   test('optional elements: count by size; nationwide never "local only"; supplied-only needs business details', () => {
@@ -281,4 +282,9 @@ describe('assembly (B9 and the fixed order)', () => {
     const r = buildBlueprint({ ...BASE, rng: mulberry32(9) });
     assert.equal(assembleBlueprint(r.picks, BASE), r.block);
   });
+});
+
+test('a quick-answer blueprint says it is the only summary (Writer added takeaways on top, 14 Nov run)', () => {
+  const r = buildBlueprint({ ...BASE, pins: { summary: { form: 'quick_answer' } } });
+  assert.match(r.block, /SUMMARY: a quick answer, directly after the introduction: one paragraph of 40 to 60 words\. Its first sentence answers the title\. This is the only summary: no key takeaways list\./);
 });

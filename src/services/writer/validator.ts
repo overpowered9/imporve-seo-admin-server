@@ -87,13 +87,23 @@ const norm = (s: string) =>
     .trim();
 
 const STOP = new Set(['a', 'an', 'the', 'and', 'or', 'of', 'for', 'to', 'in', 'on', 'at', 'my', 'your', 'is', 'are', 'how', 'what', 'near', 'me', 'with', 'vs']);
-const stem = (w: string) => w.replace(/(ies)$/, 'y').replace(/(es|s)$/, '');
+/** Light stemming: plurals and -ing / -ed forms ("turning" = "turn", "repaired" = "repair"). */
+const stem = (w: string) => {
+  let x = w.replace(/(ies)$/, 'y').replace(/(es|s)$/, '');
+  if (x.length > 5 && /(ing|ed)$/.test(x)) {
+    x = x.replace(/(ing|ed)$/, '');
+    if (/([b-df-hj-np-tv-z])\1$/.test(x)) x = x.slice(0, -1);
+  }
+  return x;
+};
+/** "won't", "doesn't", "isn't", "can't" all contain "not" (the keyword's closest natural wording). */
+const expandNegations = (t: string) => t.replace(/\b(\w+)n['’]t\b/gi, '$1 not').replace(/\bcannot\b/gi, 'can not');
 
 /** The keyword, or its closest natural wording: every content word (light stemming) in the window. */
 export function keywordInFirstWords(html: string, keyword: string, n = 100, town?: string | null): boolean {
-  const words = norm(text(html)).split(' ').slice(0, n);
+  const words = norm(expandNegations(text(html))).split(' ').slice(0, n);
   const window = ` ${words.join(' ')} `;
-  const kw = norm(keyword);
+  const kw = norm(expandNegations(keyword));
   if (kw && window.includes(` ${kw} `)) return true;
   const townWords = new Set(norm(town ?? '').split(' ').filter(Boolean));
   const content = kw.split(' ').filter((w) => w && !STOP.has(w));

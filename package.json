@@ -49,6 +49,7 @@
     "migrate:plan-stripe-products": "tsx src/migrations/021-plan-stripe-products.ts",
     "migrate:keyword-data-cache": "tsx src/migrations/022-keyword-data-cache.ts",
     "migrate:content-v3-store": "tsx src/migrations/023-content-v3-store.ts",
+    "v3:ten-keywords": "tsx src/scripts/content-v3-ten-keywords.ts",
     "email:preview": "tsx src/scripts/preview-emails.ts",
     "email:requeue": "tsx src/scripts/requeue-blocked-emails.ts",
     "email:test": "tsx src/scripts/send-test-email.ts"

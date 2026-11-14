@@ -256,6 +256,9 @@ describe('validator (V1–V9, V11)', () => {
     assert.equal(keywordInFirstWords('<p>Fixing a water heater? Repair costs vary.</p>', 'water heater repair cost'), true);
     assert.equal(keywordInFirstWords('<p>Fixing a water heater? Repair costs vary.</p>', 'water heater repair cost española', 100, 'Española'), true);
     assert.equal(keywordInFirstWords(`<p>${'filler '.repeat(120)} water heater repair cost</p>`, 'water heater repair cost'), false);
+    // 10-keyword run, 14 Nov: "If your furnace won't turn on" is the closest natural wording of "furnace not turning on".
+    assert.equal(keywordInFirstWords("<p>If your furnace won't turn on, start with the simplest checks.</p>", 'furnace not turning on'), true);
+    assert.equal(keywordInFirstWords('<p>A furnace that is not heating needs a look.</p>', 'furnace not turning on'), false);
   });
 
   test('word count within the size range; warnings never fail', () => {

@@ -13,6 +13,7 @@
  *    doc gives for alternating; a steeper split starved the last sections at the bottom-of-range aim);
  *  - "draw one section fewer" never goes below the size's range minimum; if a section is still under
  *    120 words there, it is raised to 120 and the difference taken from the longest sections;
+ *  - step 3m aims a quarter of the way into the chosen range (AIM_BOTTOM), not at its edge;
  *  - the 40% spread limit applies once the site has at least 5 earlier v3 posts;
  *  - numbered titles: items under 2–3 grouping H2s from 8 items up, else items as H2 sections;
  *  - an optional element marked "(supplied only)" is drawn only when the business details hold
@@ -46,8 +47,12 @@ export const OPTIONAL_RANGE: Record<PostSize, [number, number]> = { small: [0, 1
 export const FAQ_COUNT: Record<PostSize, number> = { small: 3, medium: 4, large: 5 };
 /** Step 3l: middle of each size's range, and the fixed parts (introduction, summary, FAQ, closing). */
 export const AIM_MIDDLE: Record<PostSize, number> = { small: 900, medium: 1800, large: 3000 };
-/** Step 3m: the bottom of the chosen size's range. */
-export const AIM_BOTTOM: Record<PostSize, number> = { small: 600, medium: 1200, large: 2400 };
+/**
+ * Step 3m: "aim at the bottom of the chosen size's range" — read as the lower quarter of the range,
+ * not its edge. Working value (14 Nov 10-keyword run): aimed at exactly 2,400, a Large article came
+ * out at 2,155 words twice (the Writer lands ~8% under its targets) and failed the size check.
+ */
+export const AIM_BOTTOM: Record<PostSize, number> = { small: 750, medium: 1500, large: 2700 };
 export const FIXED_PARTS: Record<PostSize, number> = { small: 380, medium: 450, large: 540 };
 export const MIN_SECTION_WORDS = 120;
 export const MAX_NUMBERED_ITEMS = 15;
@@ -473,7 +478,10 @@ function numberedPieceFor(n: NumberedPick, pieces: Readonly<Record<string, strin
 
 function summaryLine(p: BlueprintPicks): string {
   if (p.summary_form === 'quick_answer') {
-    return 'SUMMARY: a quick answer, directly after the introduction: one paragraph of 40 to 60 words. Its first sentence answers the title.';
+    // The type piece is sent whole and always mentions takeaways ("Takeaways carry …"); in the
+    // 14 Nov 10-keyword run the Writer then added a key takeaways list after every quick answer.
+    // So this line says which summary it is and that there is no second one.
+    return 'SUMMARY: a quick answer, directly after the introduction: one paragraph of 40 to 60 words. Its first sentence answers the title. This is the only summary: no key takeaways list.';
   }
   return `SUMMARY: key takeaways, directly after the introduction. ${p.takeaway_points} points, as a ${p.takeaway_list === 'numbered' ? 'numbered' : 'bulleted'} list. The first point answers the title.`;
 }
