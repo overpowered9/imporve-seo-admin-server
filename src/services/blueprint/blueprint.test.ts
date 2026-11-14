@@ -96,6 +96,18 @@ describe('draw rules (B2–B7, B10, B11)', () => {
     }
   });
 
+  test('section count never above the Planner\'s body questions, never below the size\'s minimum', () => {
+    for (let s = 1; s <= 40; s++) {
+      const four = buildBlueprint({ ...BASE, bodyQuestions: BASE.bodyQuestions.slice(0, 4), postSize: 'medium', suggestedSize: 'small', rng: mulberry32(s) });
+      assert.equal(four.picks.sections, 4, `3m over 4 questions: ${four.picks.sections}`);
+      assert.match(four.block, /Body questions, most important first:\n1\. .*\n2\. .*\n3\. .*\n4\. [^\n]*\nFORMAT:/);
+      const five = buildBlueprint({ ...BASE, bodyQuestions: BASE.bodyQuestions.slice(0, 5), postSize: 'medium', suggestedSize: 'medium', rng: mulberry32(s) });
+      assert.ok(five.picks.sections >= 4 && five.picks.sections <= 5, `medium over 5 questions: ${five.picks.sections}`);
+      const two = buildBlueprint({ ...BASE, bodyQuestions: BASE.bodyQuestions.slice(0, 2), postSize: 'large', suggestedSize: 'medium', rng: mulberry32(s) });
+      assert.equal(two.picks.sections, 6, `large keeps its minimum: ${two.picks.sections}`);
+    }
+  });
+
   test('3m: larger than suggested → top section count, top optional count, aim at the bottom of the range', () => {
     const r = buildBlueprint({ ...BASE, postSize: 'large', suggestedSize: 'small', rng: mulberry32(3) });
     assert.equal(r.picks.larger_than_suggested, true);
@@ -246,7 +258,7 @@ describe('history checks (B4, B5)', () => {
 describe('assembly (B9 and the fixed order)', () => {
   test('fixed order of the block, as in the doc example', () => {
     const r = buildBlueprint({ ...BASE, pins: { opening: 'reader_stakes', summary: { form: 'takeaways', points: 4, list: 'bullets' }, length_pattern: 'anchor', accent: 'one_table', order: 'faq_first', closing_move: 'forward_question', closing_format: 'one_paragraph', firmness: 'medium', optional_elements: ['extra or hidden costs', 'what a fair quote should include'] }, rng: mulberry32(1) });
-    const order = ['ARTICLE TYPE: Cost guide.', 'OPENING: Open with what this decision', 'SUMMARY: key takeaways, directly after the introduction. 4 points, as a bulleted list. The first point answers the title.', 'BODY: ', 'Also cover: extra or hidden costs; what a fair quote should include.', 'Body questions, most important first:\n1. What does it cost?', 'FORMAT: Use one table in the body', 'FAQ: these 4 questions, in this order:\n1. F1?\n2. F2?\n3. F3?\n4. F4?', 'ORDER OF THE LAST TWO SECTIONS: FAQ, then the closing.', 'CLOSING: End by turning the topic forward'];
+    const order = ['ARTICLE TYPE: Cost guide.', 'OPENING: Open with what this decision', 'SUMMARY: key takeaways, directly after the introduction. 4 points, as a bulleted list. The first point answers the title. This is the only summary: no separate quick answer.', 'BODY: ', 'Also cover: extra or hidden costs; what a fair quote should include.', 'Body questions, most important first:\n1. What does it cost?', 'FORMAT: Use one table in the body', 'FAQ: these 4 questions, in this order:\n1. F1?\n2. F2?\n3. F3?\n4. F4?', 'ORDER OF THE LAST TWO SECTIONS: FAQ, then the closing.', 'CLOSING: End by turning the topic forward'];
     let at = 0;
     for (const part of order) {
       const i = r.block.indexOf(part, at);

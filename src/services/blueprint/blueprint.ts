@@ -14,6 +14,9 @@
  *  - "draw one section fewer" never goes below the size's range minimum; if a section is still under
  *    120 words there, it is raised to 120 and the difference taken from the longest sections;
  *  - step 3m aims a quarter of the way into the chosen range (AIM_BOTTOM), not at its edge;
+ *  - the section count never goes above the number of Planner body questions (but never below the
+ *    size's minimum): in the 10-keyword run, 6 sections over 4 questions made the Writer drop a
+ *    section and fall under the size's word range; 3m "takes more" questions only while they last;
  *  - the 40% spread limit applies once the site has at least 5 earlier v3 posts;
  *  - numbered titles: items under 2–3 grouping H2s from 8 items up, else items as H2 sections;
  *  - an optional element marked "(supplied only)" is drawn only when the business details hold
@@ -346,7 +349,10 @@ function drawPicks(input: BlueprintInput, rng: () => number, pieces: Readonly<Re
     numberedPick = { ...numbered, grouping, order_by };
     sections = grouping === 'h2_items' ? numbered.items : intIn(rng, [2, 3]);
   } else {
-    sections = larger ? SECTION_RANGE[size][1] : intIn(rng, SECTION_RANGE[size]);
+    // Never more sections than the Planner has body questions, unless the size's minimum needs them.
+    const [lo, hi] = SECTION_RANGE[size];
+    const top = input.bodyQuestions.length ? Math.max(lo, Math.min(hi, input.bodyQuestions.length)) : hi;
+    sections = larger ? top : intIn(rng, [lo, top]);
   }
 
   // d. Optional elements: count by size, from the type's pool; none for a numbered title.
@@ -483,7 +489,10 @@ function summaryLine(p: BlueprintPicks): string {
     // So this line says which summary it is and that there is no second one.
     return 'SUMMARY: a quick answer, directly after the introduction: one paragraph of 40 to 60 words. Its first sentence answers the title. This is the only summary: no key takeaways list.';
   }
-  return `SUMMARY: key takeaways, directly after the introduction. ${p.takeaway_points} points, as a ${p.takeaway_list === 'numbered' ? 'numbered' : 'bulleted'} list. The first point answers the title.`;
+  // The doc's example line, plus the same closing sentence: every type piece also says "Quick answer
+  // states: …" (meant for the first point here), and in the 14 Nov run the Writer added a quick
+  // answer after the takeaways (2 of 10).
+  return `SUMMARY: key takeaways, directly after the introduction. ${p.takeaway_points} points, as a ${p.takeaway_list === 'numbered' ? 'numbered' : 'bulleted'} list. The first point answers the title. This is the only summary: no separate quick answer.`;
 }
 
 function targetsSentence(p: BlueprintPicks): string {

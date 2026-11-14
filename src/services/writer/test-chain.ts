@@ -140,6 +140,8 @@ export async function runTestChain(p: TestChainParams, deps: TestChainDeps) {
 
   return {
     title,
+    /** Title and Planner cost (USD); the Writer's and meta's are on `article.cost`. */
+    step_cost: { title: titleStep?.cost_usd ?? 0, planner: planner?.cost_usd ?? 0 },
     search_data: { block: sd.block, meta: sd.meta },
     research: { status: research.status, facts: research.research?.facts.length ?? 0, local_conditions: research.research?.local_conditions.length ?? 0, cost_usd: research.cost_usd },
     plan,

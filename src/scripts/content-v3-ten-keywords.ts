@@ -137,7 +137,7 @@ async function main() {
         meta_title: a.meta_title,
         meta_description: a.meta_description,
         content: a.content,
-        cost: { search_data: r.search_data.meta.cost_usd, research: r.research.cost_usd, writer: a.cost.writer, meta: a.cost.meta },
+        cost: { search_data: r.search_data.meta.cost_usd, title: r.step_cost.title, research: r.research.cost_usd, planner: r.step_cost.planner, writer: a.cost.writer, meta: a.cost.meta },
         timings: { ...r.timings, total_ms: Date.now() - started },
         prompt_version: a.prompt_version,
         model: a.model,
@@ -203,7 +203,7 @@ export function reviewSheet(rows: Array<Record<string, any>>, checklists: Array<
       <dt>Checks</dt><dd><ul class="checks">${(r.validator.issues as any[]).map((i) => `<li class="${esc(i.severity)}"><span class="chip ${i.severity === 'error' ? 'bad' : 'warn'}">${esc(i.severity)}</span> ${esc(i.message)}${i.detail ? ` <span class="muted">${esc(i.detail)}</span>` : ''}</li>`).join('') || '<li><span class="chip ok">all passed</span></li>'}</ul></dd>
       <dt>Writer flagged</dt><dd><ul>${(r.writer_json.claims_to_check as string[]).map((c) => `<li>${esc(c)}</li>`).join('') || '<li>nothing</li>'}</ul></dd>
       <dt>Meta</dt><dd><strong>${esc(r.meta_title)}</strong> <span class="muted">(${esc(r.meta_title.length)})</span><br>${esc(r.meta_description)} <span class="muted">(${esc(r.meta_description.length)})</span></dd>
-      <dt>Cost and time</dt><dd>search ${money(r.cost.search_data)} · research ${money(r.cost.research)} · writer ${money(r.cost.writer)} · meta ${money(r.cost.meta)} · ${Math.round(r.timings.total_ms / 1000)} s</dd>
+      <dt>Cost and time</dt><dd>search ${money(r.cost.search_data)} · title ${money(r.cost.title)} · research ${money(r.cost.research)} · planner ${money(r.cost.planner)} · writer ${money(r.cost.writer)} · meta ${money(r.cost.meta)} · ${Math.round(r.timings.total_ms / 1000)} s</dd>
     </dl>
     <article class="article">${scopeIds(r.content, r.id)}</article>
   </div>
