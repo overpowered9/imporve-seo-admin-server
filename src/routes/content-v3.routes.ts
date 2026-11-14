@@ -27,6 +27,8 @@
  *   POST /api/v1/content-v3/wizard/approve — validateApiAccess (plugin). Title check → Research →
  *                                            Planner (W3, P1–P6, G2).
  *   GET  /api/v1/content-v3/status         — validateApiAccess (plugin). Is CONTENT_V3_ENABLED on?
+ *   GET  /api/v1/content-v3/admin/trail?run= — requireAdmin. One run's ledger, generation and post
+ *                                            rows (no article text); see content-v3-trail.handler.ts.
  *   POST /api/v1/content-v3/session/clear  — validateApiAccess (plugin). The wizard's Leave (W10).
  *   POST /api/v1/content-v3/keyword-data/prefetch — validateApiAccess (plugin). Warms the keyword
  *                                            data cache (no credits); does nothing unless
@@ -82,6 +84,7 @@ import { livePlannerDeps } from '../services/content-v3-steps/steps.default.js';
 import { liveRegulatedTopics, REGULATED_TOPICS_DEF } from '../services/content-v3/regulated-topics.js';
 import { liveNicheSettings } from '../services/niche-profile/niche-profile.default.js';
 import { createBlueprintRouter } from './content-v3-blueprint.handler.js';
+import { createTrailRouter } from './content-v3-trail.handler.js';
 import { createContentV3ArticleRouter } from './content-v3-article.handler.js';
 import { liveGenerateArticle } from '../services/writer/article.default.js';
 import { isContentV3Regeneration } from '../services/generation-history.js';
@@ -181,6 +184,23 @@ router.use(
 
 // Blueprint preview for the tester panel (admin, no model call).
 router.use('/', createBlueprintRouter({ auth: requireAdmin }));
+
+// D: one run's trail for support (admin): ledger rows, generation rows, post history row.
+router.use(
+  '/',
+  createTrailRouter({
+    auth: requireAdmin,
+    runs: (run) => lazyRuns.bySession(run, 50),
+    generations: async (run) => [...(await sql`
+      SELECT id, user_id, website_id, type, status, created_at, processing_time_ms, metadata
+      FROM user_generations WHERE target_key = ${run} ORDER BY id LIMIT 50
+    `)],
+    posts: async (run) => [...(await sql`
+      SELECT id, user_id, website_id, session_key, bulk_batch, article_type, post_size, proof_level, fingerprint, validator, created_at
+      FROM content_v3_posts WHERE session_key = ${run} ORDER BY id LIMIT 20
+    `)],
+  }),
+);
 
 // Research alone (admin: tester panel, 10-keyword run). Spends Perplexity money when configured.
 router.post('/research', requireAdmin, async (req: Request, res: Response) => {
