@@ -38,6 +38,11 @@ export interface KeywordDataPrefetchDeps {
   service: () => KeywordDataService;
   auth: RequestHandler;
   rateLimit: RequestHandler;
+  /**
+   * B-5: whether a lookup may spend money. Live: CONTENT_V3_ENABLED and ISEO_V3_KEYWORD_DATA both
+   * on. When off the route answers 200 "unavailable" (reason "disabled") without a lookup.
+   */
+  enabled?: () => boolean;
   budgetMs?: number;
   log?: (line: string) => void;
   now?: () => number;
@@ -51,6 +56,9 @@ export function createKeywordDataPrefetchRouter(deps: KeywordDataPrefetchDeps): 
     const parsed = prefetchRequestSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json(validationErrorBody(parsed.error));
 
+    if (deps.enabled && !deps.enabled()) {
+      return res.json({ success: true, status: 'unavailable', seed: null, related_count: 0, reason: 'disabled' });
+    }
     const { keyword, location_code, language_code } = parsed.data;
     const userId = req.user?.id ?? '-';
     const started = now();

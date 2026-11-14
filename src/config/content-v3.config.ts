@@ -44,6 +44,10 @@ export interface ContentV3Config {
   targetCalibration: Record<'small' | 'medium' | 'large', number>;
   /** B-3: the paid article request's whole budget; kept below the plugin's 600 s HTTP timeout. */
   articleDeadlineMs: number;
+  /** B-3: the title request's budget (plugin waits 240 s). CONTENT_V3_TITLE_DEADLINE_MS. */
+  titleDeadlineMs: number;
+  /** B-3: the approve request's budget (plugin waits 420 s). CONTENT_V3_APPROVE_DEADLINE_MS. */
+  approveDeadlineMs: number;
 }
 
 export const DEFAULT_TARGET_CALIBRATION = { small: 1.0, medium: 1.3, large: 1.6 } as const;
@@ -80,5 +84,7 @@ export function contentV3Config(env: NodeJS.ProcessEnv = process.env): ContentV3
     sessionTtlDays: intEnv(env, 'CONTENT_V3_SESSION_TTL_DAYS', 7, 1, 90),
     targetCalibration: targetCalibration(env),
     articleDeadlineMs: intEnv(env, 'CONTENT_V3_ARTICLE_DEADLINE_MS', 480_000, 60_000, 570_000),
+    titleDeadlineMs: intEnv(env, 'CONTENT_V3_TITLE_DEADLINE_MS', 200_000, 30_000, 230_000),
+    approveDeadlineMs: intEnv(env, 'CONTENT_V3_APPROVE_DEADLINE_MS', 360_000, 60_000, 400_000),
   };
 }

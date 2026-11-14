@@ -59,7 +59,8 @@ import keywordDataRoutes from './content-v3-keyword-data.routes.js';
 import stepsRoutes from './content-v3-steps.routes.js';
 import { createContentV3PluginRouter } from './content-v3-plugin.handler.js';
 import { validateApiAccessWithoutStamp } from '../middleware/apiAuth.middleware.js';
-import { getContentV3Store, getContentV3Runs, startRunsHousekeeping } from '../services/content-v3/store.default.js';
+import { getContentV3Store, getContentV3Runs, getContentV3Quota, startRunsHousekeeping } from '../services/content-v3/store.default.js';
+import { freeStepGuard, freeStepLimits } from '../services/content-v3/quota.js';
 import type { RunsStore } from '../services/content-v3/runs.js';
 import { contentV3Config, contentV3Enabled } from '../config/content-v3.config.js';
 import { checkV3Prompts, v3DocPromptDefs } from '../services/prompt-seed.v3.js';
@@ -172,6 +173,9 @@ router.use(
     disclaimerKeys: liveDisclaimerKeys,
     runs: lazyRuns,
     deadlineMs: contentV3Config().articleDeadlineMs,
+    // B-5: credits already bound the article; this stops a client hammering the route.
+    rateLimit: rateLimitPerUser({ limit: 30, windowMs: 60_000, keyPrefix: 'content-v3-article', message: 'Too many requests in a short time. Please wait a minute and try again.' }),
+    quota: getContentV3Quota,
   }),
 );
 
@@ -199,7 +203,7 @@ router.post('/research', requireAdmin, async (req: Request, res: Response) => {
   return res.json({ success: true, data: { ...r, xml: r.research ? researchBlock(toResearchInput(r.research)) : '' } });
 });
 
-// The single wizard's v3 steps (plugin auth). Free, rate-limited per account; 409 while
+// The single wizard's v3 steps (plugin auth). Free, rate-limited per account and capped per day; 409 while
 // CONTENT_V3_ENABLED is off so the plugin falls back to v2.
 router.use(
   '/',
@@ -208,15 +212,19 @@ router.use(
     rateLimit: rateLimitPerUser({ limit: 30, windowMs: 60_000, keyPrefix: 'content-v3-wizard', message: 'Too many requests in a short time. Please wait a minute and try again.' }),
     store: getContentV3Store,
     searchData: (store, ids, req) => sessionSearchData(store, ids, req),
-    runTitle: (input, { runId }) => runTitleStep(input, { ...liveTitleDeps(), runId }),
-    research: (store, ids, req) => sessionResearch(store, ids, req),
-    runPlanner: (input, { runId }) => runPlannerStep(input, { ...livePlannerDeps(), runId }),
+    runTitle: (input, { runId, deadlineAt }) => runTitleStep(input, { ...liveTitleDeps(), runId, deadlineAt }),
+    research: (store, ids, req, opts) => sessionResearch(store, ids, req, { deadlineAt: opts?.deadlineAt }),
+    runPlanner: (input, { runId, deadlineAt }) => runPlannerStep(input, { ...livePlannerDeps(), runId, deadlineAt }),
     regulatedList: () => liveRegulatedTopics(() => new PromptManagementService().getPrompt(REGULATED_TOPICS_DEF.templateType)),
     nicheSettings: async () => (await liveNicheSettings()).settings,
     get locations() {
       return liveSearchDataDeps().locations;
     },
     countryIso: searchDataConfig().countryIso,
+    // B-5: daily allowance per free step, tied to the articles generated that day.
+    freeStepGuard: (step) => freeStepGuard(step, getContentV3Quota, { limits: freeStepLimits() }),
+    titleDeadlineMs: contentV3Config().titleDeadlineMs,
+    approveDeadlineMs: contentV3Config().approveDeadlineMs,
   }),
 );
 

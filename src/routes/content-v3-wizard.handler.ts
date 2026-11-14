@@ -109,18 +109,29 @@ export interface ContentV3WizardDeps {
   rateLimit: RequestHandler;
   store: () => Promise<ContentV3Store>;
   searchData: (store: ContentV3Store, ids: Ids, req: SearchDataRequest) => Promise<CachedSearchData>;
-  runTitle: (input: TitleStepInput, opts: { runId: string }) => Promise<TitleStepResult>;
-  research?: (store: ContentV3Store, ids: Ids, req: ResearchRequest) => Promise<SessionResearch>;
-  runPlanner?: (input: PlannerStepInput, opts: { runId: string }) => Promise<PlannerStepResult>;
+  runTitle: (input: TitleStepInput, opts: { runId: string; deadlineAt?: number }) => Promise<TitleStepResult>;
+  research?: (store: ContentV3Store, ids: Ids, req: ResearchRequest, opts?: { deadlineAt?: number }) => Promise<SessionResearch>;
+  runPlanner?: (input: PlannerStepInput, opts: { runId: string; deadlineAt?: number }) => Promise<PlannerStepResult>;
   /** The editable regulated topics list (registry template), default when unset or invalid. */
   regulatedList?: () => Promise<RegulatedTopicsList>;
   /** The niche settings (registry JSON); for the niche's watch terms in the regulated check. */
   nicheSettings?: () => Promise<NicheSettings>;
   locations: LocationIndexProvider;
   countryIso?: string;
+  /** B-5: the daily allowance guard per free step (none = no allowance check). */
+  freeStepGuard?: (step: 'title' | 'town_check' | 'approve') => RequestHandler;
+  /** B-3: request budgets below the plugin's waits (240 s title, 420 s approve). */
+  titleDeadlineMs?: number;
+  approveDeadlineMs?: number;
   env?: NodeJS.ProcessEnv;
   log?: (line: string) => void;
+  now?: () => number;
 }
+
+export const DEFAULT_TITLE_DEADLINE_MS = 200_000;
+export const DEFAULT_APPROVE_DEADLINE_MS = 360_000;
+/** Research stops this long before the approve deadline (at most half of it), leaving it to the Planner. */
+export const PLANNER_RESERVE_MS = 150_000;
 
 const normKey = (s: string) => s.trim().toLowerCase().replace(/\s+/g, ' ');
 
@@ -132,15 +143,19 @@ export function addCost(prev: unknown, step: string, usd: number | null | undefi
 }
 
 export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
-  const { env = process.env, log = (line) => console.log(line), countryIso = 'us' } = deps;
+  const { env = process.env, log = (line) => console.log(line), countryIso = 'us', now = () => Date.now() } = deps;
+  const titleMs = deps.titleDeadlineMs ?? DEFAULT_TITLE_DEADLINE_MS;
+  const approveMs = deps.approveDeadlineMs ?? DEFAULT_APPROVE_DEADLINE_MS;
   const router = Router();
 
   const requireV3: RequestHandler = (_req, res, next) => {
     if (!contentV3Enabled(env)) return res.status(409).json(v3ErrorBody(v3Error('v3_disabled')));
     next();
   };
+  const pass: RequestHandler = (_req, _res, next) => next();
+  const allowance = (step: 'title' | 'town_check' | 'approve') => (deps.freeStepGuard ? deps.freeStepGuard(step) : pass);
 
-  router.post('/wizard/title', deps.auth, requireV3, deps.rateLimit, async (req: AuthenticatedRequest, res: Response) => {
+  router.post('/wizard/title', deps.auth, requireV3, deps.rateLimit, allowance('title'), async (req: AuthenticatedRequest, res: Response) => {
     const parsed = wizardTitleSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json(v3ErrorBody(v3Error('invalid_request', parsed.error.issues[0]?.message ?? 'The request was not valid.')));
@@ -150,6 +165,8 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
     const websiteId = Number(req.website?.id);
     const ids = { userId, websiteId, sessionKey: b.session_key };
     const local = isLocalPost({ seed_keyword: b.seed_keyword, reach: b.reach, target_town: b.target_town, not_about_location: b.not_about_location });
+    // B-3: answer before the plugin stops waiting; past it the title is reported as not written.
+    const deadlineAt = now() + titleMs;
 
     try {
       const store = await deps.store();
@@ -188,7 +205,7 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
 
       let result: TitleStepResult;
       try {
-        result = await deps.runTitle(input, { runId: b.session_key });
+        result = await deps.runTitle(input, { runId: b.session_key, deadlineAt });
       } catch (err) {
         if (err instanceof StepFailedError) {
           log(`[content-v3] title failed run=${b.session_key} attempts=${err.attempts.length}`);
@@ -239,7 +256,7 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
     }
   });
 
-  router.post('/wizard/approve', deps.auth, requireV3, deps.rateLimit, async (req: AuthenticatedRequest, res: Response) => {
+  router.post('/wizard/approve', deps.auth, requireV3, deps.rateLimit, allowance('approve'), async (req: AuthenticatedRequest, res: Response) => {
     const parsed = approveSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json(v3ErrorBody(v3Error('invalid_request', parsed.error.issues[0]?.message ?? 'The request was not valid.')));
@@ -254,6 +271,10 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
     const ids = { userId, websiteId, sessionKey: b.session_key };
     const local = isLocalPost({ seed_keyword: b.seed_keyword, reach: b.reach, target_town: b.target_town, not_about_location: b.not_about_location });
     const town = local ? parseTown(b.target_town ?? '').town || undefined : undefined;
+    // B-3: answer before the plugin stops waiting. Research gives up early enough to leave the
+    // Planner its share; a Planner out of time falls back to the default plan (P4).
+    const deadlineAt = now() + approveMs;
+    const researchDeadlineAt = deadlineAt - Math.min(PLANNER_RESERVE_MS, Math.floor(approveMs / 2));
 
     try {
       const store = await deps.store();
@@ -282,7 +303,7 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
         people_also_ask: sd.block?.people_also_ask ?? [],
         local_domains: sd.meta.local_domains,
         state_hint: b.state_hint,
-      });
+      }, { deadlineAt: researchDeadlineAt });
       cost = addCost(cost, 'research', research.cached ? 0 : research.cost_usd);
       const researchInput = research.research ? toResearchInput(research.research) : undefined;
 
@@ -318,7 +339,7 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
       let fallback = false;
       let plannerPrompt = '';
       try {
-        const r = await deps.runPlanner(plannerInput, { runId: b.session_key });
+        const r = await deps.runPlanner(plannerInput, { runId: b.session_key, deadlineAt });
         plan = r.output;
         plannerPrompt = r.prompt.label;
         cost = addCost(cost, 'planner', r.cost_usd);
@@ -402,12 +423,12 @@ export function createContentV3WizardRouter(deps: ContentV3WizardDeps): Router {
   });
 
   /** The niche list for the plugin's Business details picker (N1: the server's settings are the source). */
-  router.get('/niches', deps.auth, async (_req: AuthenticatedRequest, res: Response) => {
+  router.get('/niches', deps.auth, requireV3, async (_req: AuthenticatedRequest, res: Response) => {
     const settings = deps.nicheSettings ? await deps.nicheSettings().catch(() => DEFAULT_NICHE_SETTINGS) : DEFAULT_NICHE_SETTINGS;
     res.json({ success: true, data: { niches: nicheList(settings), profiles: settings.profiles.map((p) => ({ key: p.key, name: p.name })) } });
   });
 
-  router.post('/wizard/town-check', deps.auth, requireV3, deps.rateLimit, async (req: AuthenticatedRequest, res: Response) => {
+  router.post('/wizard/town-check', deps.auth, requireV3, deps.rateLimit, allowance('town_check'), async (req: AuthenticatedRequest, res: Response) => {
     const parsed = townCheckSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json(v3ErrorBody(v3Error('invalid_request', 'The request was not valid.')));
     const { seed_keyword, target_town } = parsed.data;

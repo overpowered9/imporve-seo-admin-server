@@ -327,3 +327,102 @@ describe('bulk additions (phase 10)', () => {
     assert.equal((await store.getSession(5, 9, KEY))!.bulk_batch, 'bulk_42');
   });
 });
+
+// ---------------------------------------------------------------- B-5 cost exposure, B-3 deadlines
+import { createMemoryQuotaStore, freeStepGuard, QUOTA_MESSAGE, type FreeStep, type FreeStepLimit } from '../services/content-v3/quota.js';
+import { PLANNER_RESERVE_MS } from './content-v3-wizard.handler.js';
+
+async function startGuarded(opts: { limits?: Partial<Record<FreeStep, FreeStepLimit>>; env?: NodeJS.ProcessEnv; now?: number; titleDeadlineMs?: number; approveDeadlineMs?: number } = {}) {
+  const store = createMemoryContentV3Store();
+  const quota = createMemoryQuotaStore();
+  const limits = { title: { base: 2, per_article: 1 }, town_check: { base: 1, per_article: 0 }, approve: { base: 1, per_article: 1 }, ...opts.limits };
+  const seen: { title?: number; research?: number; planner?: number } = {};
+  const router = createContentV3WizardRouter({
+    auth: fakePluginAuth({ id: 5 }, { id: 9 }),
+    rateLimit: (_req, _res, next) => next(),
+    store: async () => store,
+    searchData: async () => SD,
+    runTitle: async (_input, o) => {
+      seen.title = o.deadlineAt;
+      return titleResult('Water heater repair cost in Española');
+    },
+    research: async (_s, _i, _req, o) => {
+      seen.research = o?.deadlineAt;
+      return RESEARCH_OK;
+    },
+    runPlanner: async (_input, o) => {
+      seen.planner = o.deadlineAt;
+      return plannerResult(PLAN);
+    },
+    locations: staticLocationIndexProvider(INDEX),
+    freeStepGuard: (step) => freeStepGuard(step, async () => quota, { limits, log: () => {} }),
+    titleDeadlineMs: opts.titleDeadlineMs,
+    approveDeadlineMs: opts.approveDeadlineMs,
+    now: opts.now !== undefined ? () => opts.now! : undefined,
+    env: opts.env ?? ON,
+    log: () => {},
+  });
+  app = await startTestApp([['/api/v1/content-v3', router]]);
+  return { app, quota, seen };
+}
+
+describe('B-5: daily allowance for the free steps', () => {
+  test('title: refused with 429 and a plain message past the allowance; an article lifts it at once', async () => {
+    const { app, quota } = await startGuarded();
+    assert.equal((await app.post('/api/v1/content-v3/wizard/title', BODY, PLUGIN_HEADERS)).status, 200);
+    assert.equal((await app.post('/api/v1/content-v3/wizard/title', BODY, PLUGIN_HEADERS)).status, 200);
+    const refused = await app.post('/api/v1/content-v3/wizard/title', BODY, PLUGIN_HEADERS);
+    assert.equal(refused.status, 429);
+    assert.equal(refused.body.error, 'rate_limited');
+    assert.equal(refused.body.message, QUOTA_MESSAGE);
+    // Refusals are not counted: one article (allowance 2 + 1) gives exactly one more title.
+    await quota.countArticle(5);
+    assert.equal((await app.post('/api/v1/content-v3/wizard/title', BODY, PLUGIN_HEADERS)).status, 200);
+    assert.equal((await app.post('/api/v1/content-v3/wizard/title', BODY, PLUGIN_HEADERS)).status, 429);
+  });
+
+  test('approve and town check have their own counters', async () => {
+    const { app } = await startGuarded();
+    assert.equal((await app.post('/api/v1/content-v3/wizard/approve', APPROVE, PLUGIN_HEADERS)).status, 200);
+    assert.equal((await app.post('/api/v1/content-v3/wizard/approve', APPROVE, PLUGIN_HEADERS)).status, 429);
+    const town = { seed_keyword: 'roof repair santa fe', target_town: 'Española, NM' };
+    assert.equal((await app.post('/api/v1/content-v3/wizard/town-check', town, PLUGIN_HEADERS)).status, 200);
+    assert.equal((await app.post('/api/v1/content-v3/wizard/town-check', town, PLUGIN_HEADERS)).status, 429);
+    assert.equal((await app.post('/api/v1/content-v3/wizard/title', BODY, PLUGIN_HEADERS)).status, 200, 'title untouched');
+  });
+
+  test('the switch comes first: with v3 off nothing is counted', async () => {
+    const { app, quota } = await startGuarded({ env: {} });
+    assert.equal((await app.post('/api/v1/content-v3/wizard/title', BODY, PLUGIN_HEADERS)).status, 409);
+    assert.equal(quota.counts.size, 0);
+  });
+
+  test('GET /niches answers only while v3 is on', async () => {
+    const off = await startGuarded({ env: {} });
+    const r = await off.app.get('/api/v1/content-v3/niches', PLUGIN_HEADERS);
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error, 'v3_disabled');
+  });
+});
+
+describe('B-3: wizard request deadlines', () => {
+  test('title: the step gets now + 200 s by default', async () => {
+    const { app, seen } = await startGuarded({ now: 1_000_000 });
+    await app.post('/api/v1/content-v3/wizard/title', BODY, PLUGIN_HEADERS);
+    assert.equal(seen.title, 1_000_000 + 200_000);
+  });
+
+  test('approve: the Planner gets now + 360 s; research stops 150 s earlier to leave it time', async () => {
+    const { app, seen } = await startGuarded({ now: 1_000_000 });
+    assert.equal((await app.post('/api/v1/content-v3/wizard/approve', APPROVE, PLUGIN_HEADERS)).status, 200);
+    assert.equal(seen.planner, 1_000_000 + 360_000);
+    assert.equal(seen.research, 1_000_000 + 360_000 - PLANNER_RESERVE_MS);
+  });
+
+  test('a short approve budget keeps half of it for the Planner', async () => {
+    const { app, seen } = await startGuarded({ now: 0, approveDeadlineMs: 120_000 });
+    await app.post('/api/v1/content-v3/wizard/approve', APPROVE, PLUGIN_HEADERS);
+    assert.equal(seen.research, 60_000);
+    assert.equal(seen.planner, 120_000);
+  });
+});

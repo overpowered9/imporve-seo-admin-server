@@ -262,6 +262,7 @@ export async function runPlannerStep(input: PlannerStepInput, deps: StepDeps): P
     parse: (text) => normalizePlannerOutput(parseJsonLoose(text)),
     validate: (o) => validatePlannerOutput(o, { minimumSize, keywordDataInEffect: v2, sentPostIds, evidencePresent: plannerEvidencePresent(input) }),
     runId: deps.runId,
+    deadlineAt: deps.deadlineAt,
     log,
     now,
     env: deps.env,

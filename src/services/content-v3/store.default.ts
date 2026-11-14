@@ -7,6 +7,7 @@ import { contentV3Config } from '../../config/content-v3.config.js';
 import type { SqlLike } from '../keyword-data/keyword-data-cache.js';
 import { createContentV3Store, createMemoryContentV3Store, type ContentV3Store } from './store.js';
 import { createMemoryRunsStore, createPostgresRunsStore, retryPendingRefunds, type RunsStore } from './runs.js';
+import { createMemoryQuotaStore, createPostgresQuotaStore, type QuotaStore } from './quota.js';
 
 const PURGE_EVERY_MS = 60 * 60 * 1000;
 
@@ -61,11 +62,25 @@ export async function getContentV3Runs(): Promise<RunsStore> {
   return runs;
 }
 
+let quota: QuotaStore | null = null;
+
+/** B-5: the daily counters (migration 024); in-process for CONTENT_V3_STORE=memory (local only). */
+export async function getContentV3Quota(): Promise<QuotaStore> {
+  if (quota) return quota;
+  if (process.env.CONTENT_V3_STORE === 'memory') {
+    quota = createMemoryQuotaStore();
+    return quota;
+  }
+  const { default: sql } = await import('../../data/db.js');
+  quota = createPostgresQuotaStore(sql as unknown as SqlLike);
+  return quota;
+}
+
 let refundTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
  * B-3: every 10 minutes, retry refunds that failed (refund_pending); once a day, purge run rows
- * older than 90 days. Started by the routes only while CONTENT_V3_ENABLED is on; unref'd, so it
+ * older than 90 days and daily counters (B-5) older than 30. Started by the routes only while CONTENT_V3_ENABLED is on; unref'd, so it
  * never keeps the process alive.
  */
 export function startRunsHousekeeping(refund: (userId: number, cost: number, reason: string, websiteId?: number) => Promise<void>): void {
@@ -79,6 +94,8 @@ export function startRunsHousekeeping(refund: (userId: number, cost: number, rea
         lastRunsPurge = Date.now();
         const n = await r.purge(90).catch(() => 0);
         if (n > 0) console.log(`[content-v3] purged ${n} run ledger rows older than 90 days`);
+        const q = await (await getContentV3Quota()).purge(30).catch(() => 0);
+        if (q > 0) console.log(`[content-v3] purged ${q} daily counter rows older than 30 days`);
       }
     })().catch((err) => console.log(`[content-v3] runs housekeeping failed: ${err instanceof Error ? err.message : String(err)}`));
   }, 10 * 60 * 1000);

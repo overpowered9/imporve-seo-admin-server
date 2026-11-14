@@ -4,6 +4,8 @@ import { startTestApp, fakePluginAuth, PLUGIN_HEADERS, type TestApp } from '../t
 import { createContentV3ArticleRouter, regulatedV3Allowed, type BillingDeps, type GenerationRow } from './content-v3-article.handler.js';
 import { createMemoryContentV3Store } from '../services/content-v3/store.js';
 import { createMemoryRunsStore, retryPendingRefunds, type RunsStore } from '../services/content-v3/runs.js';
+import { createMemoryQuotaStore, type QuotaStore } from '../services/content-v3/quota.js';
+import type { RequestHandler } from 'express';
 import type { ArticleV3Input, ArticleV3Result } from '../services/writer/article.js';
 
 const KEY = 'iseo_tk_0123456789abcdef0123456789abcdef';
@@ -36,7 +38,7 @@ afterEach(async () => {
   await a?.close();
 });
 
-async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, unknown> | null; generate?: (i: ArticleV3Input) => Promise<ArticleV3Result>; regen?: boolean; reserveOk?: boolean; disclaimerKeys?: string[]; runs?: RunsStore; deadlineMs?: number; refundFails?: boolean } = {}) {
+async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, unknown> | null; generate?: (i: ArticleV3Input) => Promise<ArticleV3Result>; regen?: boolean; reserveOk?: boolean; disclaimerKeys?: string[]; runs?: RunsStore; deadlineMs?: number; refundFails?: boolean; quota?: QuotaStore; rateLimit?: RequestHandler } = {}) {
   const store = createMemoryContentV3Store();
   if (opts.session !== null) await store.mergeSession(7, 3, KEY, opts.session ?? SESSION);
   const events: string[] = [];
@@ -74,6 +76,8 @@ async function start(opts: { env?: NodeJS.ProcessEnv; session?: Record<string, u
     disclaimerKeys: async () => opts.disclaimerKeys ?? [],
     runs: opts.runs,
     deadlineMs: opts.deadlineMs,
+    quota: opts.quota ? async () => opts.quota! : undefined,
+    rateLimit: opts.rateLimit,
   });
   app = await startTestApp([['/api/v1/content-v3', router]]);
   return { app, store, events, rows, inputs, logs };
@@ -241,6 +245,32 @@ describe('POST /content-v3/article', () => {
     assert.equal(r.status, 200);
     assert.deepEqual(events, ['reserve:10', 'generate']);
     assert.match(logs.join('\n'), /runs ledger unavailable — using the in-process lock/);
+  });
+
+  test('B-5: a delivered article is counted for the free steps\' allowance; a replay or a failure is not', async () => {
+    const quota = createMemoryQuotaStore();
+    const runs = createMemoryRunsStore();
+    const ok = await start({ quota, runs });
+    const body = { ...BODY, request_id: 'iseo_rq_0123456789abcdef' };
+    assert.equal((await ok.app.post('/api/v1/content-v3/article', body, PLUGIN_HEADERS)).status, 200);
+    assert.equal((await ok.app.post('/api/v1/content-v3/article', body, PLUGIN_HEADERS)).status, 200, 'replayed');
+    const today = new Date().toISOString().slice(0, 10);
+    assert.equal(quota.counts.get(`7|${today}|article`), 1);
+    await ok.app.close();
+    app = null;
+    const q2 = createMemoryQuotaStore();
+    const failing = await start({ quota: q2, generate: async () => { throw new Error('writer down'); } });
+    assert.notEqual((await failing.app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS)).status, 200);
+    assert.equal(q2.counts.size, 0);
+  });
+
+  test('B-5: the per-minute limiter runs after auth and before anything is charged', async () => {
+    const limiter: RequestHandler = (_req, res) => res.status(429).json({ success: false, error: 'rate_limited', message: 'Too many requests in a short time. Please wait a minute and try again.' });
+    const { app, events } = await start({ rateLimit: limiter });
+    const r = await app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);
+    assert.equal(r.status, 429);
+    assert.deepEqual(events, []);
+    assert.equal((await app.post('/api/v1/content-v3/article', BODY)).status, 401, 'auth still first');
   });
 
   test('v3 off → 409 v3_disabled; bad input → 400', async () => {

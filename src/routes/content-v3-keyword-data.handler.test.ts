@@ -26,7 +26,7 @@ let calls: any[] = [];
 beforeEach(() => { __resetRateLimitBuckets(); calls = []; });
 afterEach(async () => { await app?.close(); app = null; });
 
-async function start(impl: () => Promise<SeedWithRelated>) {
+async function start(impl: () => Promise<SeedWithRelated>, enabled?: () => boolean) {
   const service = {
     configured: true,
     getMetrics: async () => { throw new Error('not used'); },
@@ -37,6 +37,7 @@ async function start(impl: () => Promise<SeedWithRelated>) {
     service: () => service,
     auth: fakePluginAuth(),
     rateLimit: rateLimitPerUser({ limit: 100, windowMs: 60_000, keyPrefix: 'test-prefetch' }),
+    enabled,
     log: () => {},
   });
   app = await startTestApp([['/api/v1/content-v3/keyword-data', router]]);
@@ -46,6 +47,19 @@ async function start(impl: () => Promise<SeedWithRelated>) {
 const URL = '/api/v1/content-v3/keyword-data/prefetch';
 
 describe('prefetch', () => {
+  test('B-5: with v3 or keyword data switched off → 200 "unavailable" (disabled), no lookup', async () => {
+    const a = await start(async () => ({ status: 'ready', seed: null, related: [], cost_usd: 0, source: 'cache' }), () => false);
+    const r = await a.post(URL, { keyword: 'boiler repair' }, PLUGIN_HEADERS);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, { success: true, status: 'unavailable', seed: null, related_count: 0, reason: 'disabled' });
+    assert.equal(calls.length, 0);
+  });
+
+  test('B-5: the live wiring passes the switches (CONTENT_V3_ENABLED and ISEO_V3_KEYWORD_DATA)', () => {
+    const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'content-v3-keyword-data.routes.ts'), 'utf8');
+    assert.match(src, /enabled: \(\) => contentV3Enabled\(\) && keywordDataFlagOn\(\)/);
+  });
+
   test('401 without the plugin headers', async () => {
     const a = await start(async () => ({ status: 'ready', seed: null, related: [], cost_usd: 0, source: 'cache' }));
     assert.equal((await a.post(URL, { keyword: 'a' })).status, 401);

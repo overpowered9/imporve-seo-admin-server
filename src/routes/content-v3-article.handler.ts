@@ -22,6 +22,7 @@ import { randomUUID } from 'node:crypto';
 import { Router, type RequestHandler, type Response } from 'express';
 import { z } from 'zod';
 import { REQUEST_ID_RE, type RunsStore } from '../services/content-v3/runs.js';
+import type { QuotaStore } from '../services/content-v3/quota.js';
 import type { AuthenticatedRequest } from '../middleware/apiAuth.middleware.js';
 import { contentV3Enabled } from '../config/content-v3.config.js';
 import type { ContentV3Store, ContentV3PostRow } from '../services/content-v3/store.js';
@@ -96,6 +97,10 @@ export interface ContentV3ArticleDeps {
    * business whose niche has none stays on v2 (409 v3_regulated_disabled, before any charge).
    */
   disclaimerKeys?: () => Promise<string[]>;
+  /** B-5: per-minute limiter per account (none = no limit). */
+  rateLimit?: RequestHandler;
+  /** B-5: today's counters; a delivered article raises the free steps' daily allowance. */
+  quota?: () => Promise<QuotaStore>;
   env?: NodeJS.ProcessEnv;
   log?: (line: string) => void;
   now?: () => number;
@@ -154,7 +159,8 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
   const router = Router();
   const inFlight = new Set<string>();
 
-  router.post('/article', deps.auth, async (req: AuthenticatedRequest, res: Response) => {
+  const pass: RequestHandler = (_req, _res, next) => next();
+  router.post('/article', deps.auth, deps.rateLimit ?? pass, async (req: AuthenticatedRequest, res: Response) => {
     if (!contentV3Enabled(env)) return res.status(409).json(v3ErrorBody(v3Error('v3_disabled')));
     const parsed = articleRequestSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -349,6 +355,13 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
           timings: { total_ms: now() - startedAt, writer_ms: r.timings.writer_ms, meta_ms: r.timings.meta_ms },
         }),
       );
+      // B-5: count the delivered article (raises today's allowance for the free steps).
+      if (deps.quota) {
+        await deps
+          .quota()
+          .then((q) => q.countArticle(userId))
+          .catch((err) => log(`[content-v3] article not counted run=${b.session_key}: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`));
+      }
       return res.json(body);
     } catch (err) {
       let refundFailed = false;

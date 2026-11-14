@@ -11,7 +11,8 @@
 import { Router } from 'express';
 import { validateApiAccess } from '../middleware/apiAuth.middleware.js';
 import { rateLimitPerUser } from '../middleware/rateLimit.middleware.js';
-import { KEYWORD_DATA_DEFAULTS } from '../config/keyword-data.config.js';
+import { KEYWORD_DATA_DEFAULTS, keywordDataFlagOn } from '../config/keyword-data.config.js';
+import { contentV3Enabled } from '../config/content-v3.config.js';
 import { getKeywordDataService } from '../services/keyword-data/keyword-data.default.js';
 import { createKeywordDataPrefetchRouter } from './content-v3-keyword-data.handler.js';
 import { requireAdmin } from '../middleware/adminAuth.middleware.js';
@@ -33,6 +34,8 @@ router.use(
     service: getKeywordDataService,
     auth: validateApiAccess,
     rateLimit: keywordDataPrefetchRateLimit,
+    // B-5: no DataForSEO spend while v3 or Option B is off (only v3 steps use the cache).
+    enabled: () => contentV3Enabled() && keywordDataFlagOn(),
   }),
 );
 

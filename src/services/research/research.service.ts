@@ -244,6 +244,8 @@ export interface ResearchDeps {
   log?: (line: string) => void;
   now?: () => number;
   runId?: string;
+  /** B-3: epoch ms by which research must give up, so the Planner keeps its share of the request. */
+  deadlineAt?: number;
 }
 
 export function perplexityProviderCall(cfg: ResearchConfig, body: Record<string, unknown>, fetchImpl: typeof fetch = fetch): ProviderCall {
@@ -324,6 +326,7 @@ export async function runResearch(req: ResearchRequest, deps: ResearchDeps = {})
         return { out, results: wrapped.results ?? [] };
       },
       runId: deps.runId,
+      deadlineAt: deps.deadlineAt,
       log,
       now,
     });

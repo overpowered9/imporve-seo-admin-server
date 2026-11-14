@@ -48,6 +48,8 @@ export interface StepDeps {
   timeoutMs?: number;
   /** Correlates the [model-call] lines of one wizard session (the plugin's target_key). */
   runId?: string;
+  /** B-3: epoch ms by which the request must answer; no attempt starts or waits past it. */
+  deadlineAt?: number;
 }
 
 export interface StepKeywordDataInfo {

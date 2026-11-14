@@ -135,6 +135,7 @@ export async function runTitleStep(input: TitleStepInput, deps: StepDeps): Promi
     parse: (text) => normalizeTitleOutput(parseJsonLoose(text)),
     validate: (o) => validateTitleOutput(o, input),
     runId: deps.runId,
+    deadlineAt: deps.deadlineAt,
     log,
     now,
     env: deps.env,
