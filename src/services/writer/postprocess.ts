@@ -70,17 +70,48 @@ function safeHref(href: string | undefined): string | null {
   return null;
 }
 
+/**
+ * B-4: one canonical form of a link for comparison and output. http(s) through the URL parser
+ * (which percent-encodes anything like < > " that could break out of an attribute), mailto:/tel:
+ * trimmed with whitespace removed; anything else is null (never linked).
+ */
+export function normalizeUrl(href: string | null | undefined): string | null {
+  const h = String(href ?? '').trim();
+  if (!h) return null;
+  if (/^(mailto|tel):/i.test(h)) {
+    const v = h.replace(/\s+/g, '');
+    return /[<>"'`]/.test(v) ? null : v.replace(/^(mailto|tel):/i, (m) => m.toLowerCase());
+  }
+  try {
+    const u = new URL(h);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u.href;
+  } catch {
+    return null;
+  }
+}
+
+const sameLink = (a: string | null, b: string | null) => !!a && !!b && a.replace(/\/$/, '') === b.replace(/\/$/, '');
+
+const stripComments = (s: string) => s.replace(/<!--[\s\S]*?(?:-->|$)/g, '');
+
 export interface SanitizeReport {
   unwrapped: string[];
   removed: string[];
 }
 
-export function sanitizeArticle(html: string): { html: string; report: SanitizeReport } {
-  let src = String(html ?? '');
+/**
+ * WR10 + B-4. `ctaUrl`: the only link the Writer may write itself ("The only link is the <cta>
+ * link"); every other link it writes is unwrapped (its text kept). Source links are added later by
+ * code (linkSourceTokens), never taken from the model.
+ */
+export function sanitizeArticle(html: string, opts: { ctaUrl?: string | null } = {}): { html: string; report: SanitizeReport } {
+  let src = stripComments(String(html ?? ''));
   // Code fences / a ```html wrapper the model should not have sent.
   src = src.replace(/^\s*```(?:html)?\s*/i, '').replace(/\s*```\s*$/, '');
   const $ = load(src, null, false);
   const report: SanitizeReport = { unwrapped: [], removed: [] };
+  const cta = normalizeUrl(opts.ctaUrl);
 
   // h1 → h2 (no h1 in the body); h4–h6 → h3.
   $('h1').each((_, el) => {
@@ -118,8 +149,15 @@ export function sanitizeArticle(html: string): { html: string; report: SanitizeR
         (tag === 'a' && name === 'href' && safeHref(attrs[name]) !== null);
       if (!keep) $(el).removeAttr(name);
     }
-    if (tag === 'a' && !safeHref(attrs.href)) {
-      $(el).replaceWith($(el).contents());
+    if (tag === 'a') {
+      // B-4: keep only the CTA link (normalized); any other link the model wrote loses its <a>.
+      const href = normalizeUrl(attrs.href);
+      if (cta && sameLink(href, cta)) {
+        $(el).attr('href', cta);
+      } else {
+        report.unwrapped.push('a');
+        $(el).replaceWith($(el).contents());
+      }
     }
   }
 
@@ -133,7 +171,10 @@ export function sanitizeArticle(html: string): { html: string; report: SanitizeR
 // ---------------------------------------------------------------- source tokens (WR7)
 
 export const MAX_LINKED_SOURCES = 4;
-const TOKEN_RE = /\s?\[(S\d{1,3})\]/g;
+/** One bracket of one or more tokens: [S1], [s2], [S1, S2], [S1; S3] (WR7), with the space before it. */
+const TOKEN_GROUP_RE = /\s?\[\s*[Ss]\d{1,3}(?:\s*[,;]\s*[Ss]\d{1,3})*\s*\]/g;
+/** Anything left that still looks like a source token, for the leftover check. */
+const LEFTOVER_TOKEN_RE = /\s?\[\s*[Ss]\d{1,3}[^\]]{0,40}\]/g;
 
 function domainOf(url: string): string {
   try {
@@ -150,41 +191,132 @@ export interface TokenReport {
   linked: Array<{ token: string; url: string }>;
   removed: number;
   unknown: string[];
+  /** Token-like text that was not a valid token group, stripped by the leftover check. */
+  leftovers: number;
 }
 
 /**
  * The first use of up to 4 different sources becomes " (<a href=url>domain</a>)"; every other
  * token is removed. Tokens inside headings are removed, never linked (headings carry no links).
+ *
+ * B-4/WR7: works on the DOM's text nodes (never a regex over the HTML string, which an attribute
+ * holding ">" could break), accepts token lists ([S1, S2], [S1; S3]) in any case, links a source
+ * only when its URL is a valid http(s) URL (normalized, so nothing in it can break out of the
+ * attribute), and strips anything token-like that is left.
  */
 export function linkSourceTokens(html: string, sources: Record<string, ResearchSource>, max = MAX_LINKED_SOURCES): { html: string; report: TokenReport } {
-  const report: TokenReport = { linked: [], removed: 0, unknown: [] };
+  const report: TokenReport = { linked: [], removed: 0, unknown: [], leftovers: 0 };
   const linked = new Set<string>();
-  // Split on tags so headings can be told apart from body text.
-  const parts = html.split(/(<[^>]+>)/);
-  let inHeading = 0;
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i];
-    if (part.startsWith('<')) {
-      if (/^<h[23]\b/i.test(part)) inHeading++;
-      else if (/^<\/h[23]>/i.test(part)) inHeading = Math.max(0, inHeading - 1);
+  const $ = load(html, null, false);
+  const textNodes: any[] = [];
+  const walk = (node: any, inHeading: boolean, inLink: boolean) => {
+    for (const child of node.children ?? []) {
+      if (child.type === 'text') {
+        textNodes.push({ node: child, inHeading, inLink });
+      } else if (child.type === 'tag') {
+        const t = String(child.tagName ?? child.name ?? '').toLowerCase();
+        walk(child, inHeading || t === 'h2' || t === 'h3', inLink || t === 'a');
+      }
+    }
+  };
+  walk($.root()[0], false, false);
+  for (const { node, inHeading, inLink } of textNodes) {
+    const text: string = node.data ?? '';
+    if (!/\[\s*[Ss]\d/.test(text)) continue;
+    let out = '';
+    let last = 0;
+    let changed = false;
+    for (const m of text.matchAll(TOKEN_GROUP_RE)) {
+      out += escText(text.slice(last, m.index));
+      last = (m.index ?? 0) + m[0].length;
+      changed = true;
+      const tokens = [...m[0].matchAll(/[Ss](\d{1,3})/g)].map((t) => `S${Number(t[1])}`);
+      const links: string[] = [];
+      for (const token of tokens) {
+        const src = sources[token];
+        const url = src ? normalizeUrl(src.url) : null;
+        if (!src || !url || !/^https?:/i.test(url)) {
+          report.unknown.push(token);
+          continue;
+        }
+        if (inHeading || inLink || linked.has(token) || linked.size >= max) {
+          report.removed++;
+          continue;
+        }
+        linked.add(token);
+        report.linked.push({ token, url });
+        links.push(`<a href="${escAttr(url)}" target="_blank" rel="noopener">${escText(domainOf(url))}</a>`);
+      }
+      if (links.length) out += ` (${links.join(', ')})`;
+    }
+    out += escText(text.slice(last));
+    // Leftover check: anything that still looks like a token goes, and is counted.
+    const cleaned = out.replace(LEFTOVER_TOKEN_RE, () => {
+      report.leftovers++;
+      return '';
+    });
+    if (changed || cleaned !== out) $(node).replaceWith(cleaned);
+  }
+  return { html: $.html(), report };
+}
+
+/**
+ * B-4: the last step of post-processing, after the table of contents and the disclaimer: one
+ * allowlist pass over the final HTML. Allowed: the WR10 tags; h2 with data-iseo and id; the TOC
+ * (nav.iseo-toc with aria-label, its ul/li and in-page #links); p.iseo-disclaimer; links only to
+ * the CTA URL or a linked research source (normalized). Everything else is unwrapped or removed.
+ */
+export function finalSanitize(html: string, opts: { ctaUrl?: string | null; sourceUrls?: string[] } = {}): string {
+  const $ = load(stripComments(html), null, false);
+  const cta = normalizeUrl(opts.ctaUrl);
+  const allowedLinks = (opts.sourceUrls ?? []).map((u) => normalizeUrl(u)).filter((u): u is string => !!u);
+  const all = $('*').toArray().reverse();
+  for (const el of all) {
+    const tag = ((el as any).tagName || '').toLowerCase();
+    if (DROP_WITH_CONTENT.has(tag)) {
+      $(el).remove();
       continue;
     }
-    parts[i] = part.replace(TOKEN_RE, (_m, token: string) => {
-      const src = sources[token];
-      if (!src) {
-        report.unknown.push(token);
-        return '';
+    const inToc = $(el).closest('nav.iseo-toc').length > 0;
+    if (!ALLOWED.has(tag) && tag !== 'nav') {
+      $(el).replaceWith($(el).contents());
+      continue;
+    }
+    const attrs = { ...((el as any).attribs ?? {}) } as Record<string, string>;
+    for (const name of Object.keys(attrs)) {
+      const v = attrs[name];
+      const keep =
+        (tag === 'h2' && name === 'data-iseo' && (DATA_ISEO_VALUES as readonly string[]).includes(v)) ||
+        (tag === 'h2' && name === 'id' && /^[a-z0-9-]{1,90}$/.test(v)) ||
+        (tag === 'nav' && name === 'class' && v === 'iseo-toc') ||
+        (tag === 'nav' && name === 'aria-label' && !/[<>]/.test(v)) ||
+        (tag === 'p' && name === 'class' && v === 'iseo-disclaimer') ||
+        (tag === 'a' && (name === 'href' || name === 'target' || name === 'rel'));
+      if (!keep) $(el).removeAttr(name);
+    }
+    if (tag === 'nav' && $(el).attr('class') !== 'iseo-toc') {
+      $(el).replaceWith($(el).contents());
+      continue;
+    }
+    if (tag === 'a') {
+      const raw = attrs.href ?? '';
+      if (inToc && /^#[a-z0-9-]{1,90}$/.test(raw)) {
+        $(el).removeAttr('target').removeAttr('rel');
+        continue;
       }
-      if (inHeading || linked.has(token) || linked.size >= max) {
-        report.removed++;
-        return '';
+      const href = normalizeUrl(raw);
+      const isSource = !!href && allowedLinks.some((u) => sameLink(u, href));
+      const isCta = !!href && sameLink(href, cta);
+      if (!isSource && !isCta) {
+        $(el).replaceWith($(el).contents());
+        continue;
       }
-      linked.add(token);
-      report.linked.push({ token, url: src.url });
-      return ` (<a href="${escAttr(src.url)}" target="_blank" rel="noopener">${escText(domainOf(src.url))}</a>)`;
-    });
+      $(el).attr('href', href!);
+      if (isSource) $(el).attr('target', '_blank').attr('rel', 'noopener');
+      else $(el).removeAttr('target').removeAttr('rel');
+    }
   }
-  return { html: parts.join(''), report };
+  return $.html().trim();
 }
 
 // ---------------------------------------------------------------- structure helpers
@@ -232,16 +364,19 @@ export function addTableOfContents(html: string, opts: { include: boolean; label
   if (!sections.length) return html;
   const used = new Set<string>();
   const withIds = sections.map((s) => {
-    let id = slug(s.heading) || 'section';
+    // The heading's text, entities decoded once ("Pros &amp; cons" → "Pros & cons"), for both the id
+    // and the TOC entry (the raw text gave "pros-amp-cons" and a doubly escaped "&amp;amp;").
+    const text = load(`<i>${s.heading}</i>`, null, false).text();
+    let id = slug(text) || 'section';
     while (used.has(id)) id = `${id}-2`;
     used.add(id);
-    return { ...s, id, html: s.html.replace(/^<h2([^>]*)>/i, (_m, attrs: string) => `<h2${attrs.replace(/\s+id="[^"]*"/, '')} id="${id}">`) };
+    return { ...s, id, text, html: s.html.replace(/^<h2([^>]*)>/i, (_m, attrs: string) => `<h2${attrs.replace(/\s+id="[^"]*"/, '')} id="${id}">`) };
   });
   let toc = '';
   if (opts.include) {
     const items = withIds
       .filter((s) => s.kind === 'body' || s.kind === 'faq' || s.kind === 'closing')
-      .map((s) => `<li><a href="#${s.id}">${escText(s.heading)}</a></li>`);
+      .map((s) => `<li><a href="#${s.id}">${escText(s.text)}</a></li>`);
     if (items.length >= 2) toc = `<nav class="iseo-toc" aria-label="${escAttr(opts.label ?? 'Contents')}"><ul>${items.join('')}</ul></nav>\n`;
   }
   // Right after the summary section (quick answer / takeaways), else after the introduction.

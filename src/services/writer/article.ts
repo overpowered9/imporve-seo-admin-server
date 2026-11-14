@@ -27,6 +27,7 @@ import {
   addTableOfContents,
   extractFaq,
   faqSchema,
+  finalSanitize,
   headingsOf,
   insertDisclaimer,
   linkSourceTokens,
@@ -275,8 +276,10 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
     writerAttempts += r.attempts.length;
     writerUsage.push(...r.usage);
     writerCost = writerCost === null || r.cost_usd === null ? null : Math.round((writerCost + r.cost_usd) * 1e6) / 1e6;
-    const clean = sanitizeArticle(r.value.html);
+    // B-4: only the CTA link survives from the model; source links are added by code.
+    const clean = sanitizeArticle(r.value.html, { ctaUrl: input.cta?.url });
     const linked = linkSourceTokens(clean.html, sources);
+    if (linked.report.leftovers) log(`[content-v3] writer run=${deps.runId ?? '-'} token-like leftovers removed: ${linked.report.leftovers}`);
     const report = validateArticle({
       html: linked.html,
       picks: bp.picks,
@@ -331,6 +334,9 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
   if (proof_level === 'regulated') {
     html = insertDisclaimer(html, disclaimerFor(deps.niche?.disclaimers ?? {}, niche.context.niche?.key, niche.context.profile.key));
   }
+  // B-4: one allowlist pass over the final HTML (TOC and disclaimer included); links only to the CTA
+  // and the sources code linked.
+  html = finalSanitize(html, { ctaUrl: input.cta?.url, sourceUrls: best.linked.map((l) => l.url) });
 
   const tm = now();
   const meta = await generateMetaV3(input.seed_keyword, html, { call: deps.call, model: deps.metaModel, timeoutMs: deps.metaTimeoutMs, runId: deps.runId, log, deadlineAt: deps.deadlineAt });

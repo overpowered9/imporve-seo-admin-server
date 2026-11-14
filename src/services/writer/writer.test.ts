@@ -19,6 +19,7 @@ import {
   linkSourceTokens,
   parseWriterOutput,
   sanitizeArticle,
+  finalSanitize,
   splitSections,
   WRITER_MARKER,
 } from './postprocess.js';
@@ -156,9 +157,55 @@ describe('parse, sanitize, link, TOC, disclaimer, FAQ', () => {
     assert.equal(parseWriterOutput(`${body}\n${WRITER_MARKER}\n\`\`\`json\n{"items_delivered":7}\n\`\`\``).json.items_delivered, 7);
   });
 
-  test('sanitizer keeps only the allowlist (WR10)', () => {
-    const { html } = sanitizeArticle('```html\n<h1>T</h1><div><p class="a" style="b">x <b>y</b> <i>z</i></p></div><h2 data-iseo="body" id="q">H</h2><h2 data-iseo="bogus">H2</h2><h4>sub</h4><script>bad()</script><hr><a href="javascript:x">j</a><a href="tel:+1505">call</a>\n```');
+  test('sanitizer keeps only the allowlist (WR10); the only link kept is the CTA (B-4)', () => {
+    const input = '```html\n<h1>T</h1><div><p class="a" style="b">x <b>y</b> <i>z</i></p></div><h2 data-iseo="body" id="q">H</h2><h2 data-iseo="bogus">H2</h2><h4>sub</h4><script>bad()</script><hr><a href="javascript:x">j</a><a href="tel:+1505">call</a><!-- note -->\n```';
+    const { html } = sanitizeArticle(input, { ctaUrl: 'tel:+1505' });
     assert.equal(html, '<h2>T</h2><p>x <strong>y</strong> <em>z</em></p><h2 data-iseo="body">H</h2><h2>H2</h2><h3>sub</h3>j<a href="tel:+1505">call</a>');
+    // Without that CTA, the model's link loses its <a> (text kept); comments never survive.
+    assert.equal(sanitizeArticle(input).html, '<h2>T</h2><p>x <strong>y</strong> <em>z</em></p><h2 data-iseo="body">H</h2><h2>H2</h2><h3>sub</h3>jcall');
+  });
+
+  test('B-4: links the model invents are unwrapped; the CTA is kept in its normalized form', () => {
+    const cta = 'https://acme.example/book';
+    const { html } = sanitizeArticle('<p>Book <a href="https://acme.example/book">here</a> or see <a href="https://competitor.example/">them</a> or <a href="mailto:x@y.z">mail</a>.</p>', { ctaUrl: cta });
+    assert.equal(html, '<p>Book <a href="https://acme.example/book">here</a> or see them or mail.</p>');
+  });
+
+  test('B-4/WR7: token lists in any case; hostile source URLs never become links; leftovers stripped', () => {
+    const sources = {
+      S1: { url: 'https://www.energy.gov/a', title: 'a', date: null },
+      S2: { url: 'https://extension.nmsu.edu/b', title: 'b', date: null },
+      S3: { url: 'javascript:alert(1)', title: 'c', date: null },
+      S4: { url: 'https://x.example/"><script>alert(1)</script>', title: 'd', date: null },
+    };
+    const { html, report } = linkSourceTokens('<p>Costs vary [S1, S2]. Bad [s3]. Odd [S4]. Stray [S9 x].</p>', sources);
+    assert.match(html, /\(<a href="https:\/\/www\.energy\.gov\/a" target="_blank" rel="noopener">energy\.gov<\/a>, <a href="https:\/\/extension\.nmsu\.edu\/b"/);
+    assert.doesNotMatch(html, /\[[Ss]\d/, 'no token text left');
+    assert.doesNotMatch(html, /<script|javascript:/i);
+    // S4's URL is normalized by the URL parser: its quote and angle brackets are percent-encoded.
+    assert.match(html, /href="https:\/\/x\.example\/%22%3E%3Cscript%3Ealert\(1\)%3C\/script%3E"/);
+    assert.deepEqual(report.unknown, ['S3']);
+    assert.equal(report.leftovers, 1);
+  });
+
+  test('B-4: the final pass keeps the TOC, the disclaimer, the CTA and linked sources — nothing else', () => {
+    const html =
+      '<p>Intro <a href="https://evil.example/">x</a></p><nav class="iseo-toc" aria-label="Contents" onclick="bad()"><ul><li><a href="#costs">Costs</a></li><li><a href="javascript:x">J</a></li></ul></nav>' +
+      '<h2 data-iseo="body" id="costs" style="x">Costs</h2><p>See (<a href="https://www.energy.gov/a" target="_blank" rel="noopener">energy.gov</a>).</p>' +
+      '<p class="iseo-disclaimer"><em>General information.</em></p><p class="other">Call <a href="tel:+1505">us</a></p><img src="x">';
+    const out = finalSanitize(html, { ctaUrl: 'tel:+1505', sourceUrls: ['https://www.energy.gov/a'] });
+    assert.equal(
+      out,
+      '<p>Intro x</p><nav class="iseo-toc" aria-label="Contents"><ul><li><a href="#costs">Costs</a></li><li>J</li></ul></nav>' +
+        '<h2 data-iseo="body" id="costs">Costs</h2><p>See (<a href="https://www.energy.gov/a" target="_blank" rel="noopener">energy.gov</a>).</p>' +
+        '<p class="iseo-disclaimer"><em>General information.</em></p><p>Call <a href="tel:+1505">us</a></p>',
+    );
+  });
+
+  test('TOC entries show the heading text once escaped ("Pros &amp; cons", not "&amp;amp;")', () => {
+    const out = addTableOfContents('<p>i</p><h2 data-iseo="body">Pros &amp; cons</h2><p>a</p><h2 data-iseo="closing">Next</h2><p>b</p>', { include: true });
+    assert.match(out, /<li><a href="#pros-cons">Pros &amp; cons<\/a><\/li>/);
+    assert.doesNotMatch(out, /&amp;amp;/);
   });
 
   test('tokens: first use of up to 4 sources linked, repeats and extras removed, unknown logged, none in headings', () => {
