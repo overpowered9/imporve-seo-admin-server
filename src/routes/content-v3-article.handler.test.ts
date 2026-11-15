@@ -263,6 +263,30 @@ describe('POST /content-v3/article', () => {
     release();
   });
 
+  test('H2: a failure whose run the stale sweep already closed is not refunded twice', async () => {
+    const runs = createMemoryRunsStore();
+    const { app, events } = await start({
+      runs,
+      generate: async () => {
+        // The sweep takes the row while the article is still being written (a stuck instance).
+        for (const r of runs.rows) if (r.status === 'running') { r.status = 'refund_pending'; }
+        throw new Error('writer down');
+      },
+    });
+    const r = await app.post('/api/v1/content-v3/article', { ...BODY, request_id: 'iseo_rq_sweep0000001' }, PLUGIN_HEADERS);
+    assert.notEqual(r.status, 200);
+    assert.deepEqual(events, ['reserve:10', 'generate'], 'no inline refund: the refund queue pays it back once');
+    assert.equal(runs.rows[0].status, 'refund_pending');
+  });
+
+  test('H2: a normal failure takes the row (refunding) and closes it refunded', async () => {
+    const runs = createMemoryRunsStore();
+    const { app, events } = await start({ runs, generate: async () => { throw new Error('writer down'); } });
+    await app.post('/api/v1/content-v3/article', { ...BODY, request_id: 'iseo_rq_normal000001' }, PLUGIN_HEADERS);
+    assert.deepEqual(events, ['reserve:10', 'generate', 'refund:10']);
+    assert.equal(runs.rows[0].status, 'refunded');
+  });
+
   test('M1: with the v3 tables missing the article answers v3 off, before anything', async () => {
     const { app, events } = await start({ ready: async () => false });
     const r = await app.post('/api/v1/content-v3/article', BODY, PLUGIN_HEADERS);

@@ -59,6 +59,12 @@ export interface RunsStore {
   failed(id: number, p: { error: string; refund_pending: boolean }): Promise<void>;
   /** Moves up to `limit` refund_pending rows to `refunding` and returns them. */
   takePendingRefunds(limit: number): Promise<RunRow[]>;
+  /**
+   * The request refunds its own failure: running → refunding, only while still running (throws
+   * RunNotRunningError when the stale sweep already took the row, which then refunds it), so the
+   * request and the sweep can never both refund. Closed with refundDone.
+   */
+  startRefund(id: number, error: string): Promise<void>;
   /** ok: refunding → refunded; not ok: back to refund_pending for the next pass. */
   refundDone(id: number, ok: boolean): Promise<void>;
   /** Every run of one session key, newest first (admin trail). */
@@ -147,6 +153,11 @@ export function createMemoryRunsStore(now: () => number = () => Date.now()): Run
       const r = rows.find((x) => x.id === id && x.status === 'running');
       if (!r) throw new RunNotRunningError(id);
       touch(r, { status: p.refund_pending ? 'refund_pending' : r.cost > 0 ? 'refunded' : 'failed', error: p.error.slice(0, 500) });
+    },
+    async startRefund(id, error) {
+      const r = rows.find((x) => x.id === id && x.status === 'running');
+      if (!r) throw new RunNotRunningError(id);
+      touch(r, { status: 'refunding', error: error.slice(0, 500) });
     },
     async takePendingRefunds(limit) {
       const out = rows.filter((r) => r.status === 'refund_pending').slice(0, limit);
@@ -292,6 +303,14 @@ export function createPostgresRunsStore(sql: SqlLike): RunsStore {
         UPDATE content_v3_runs
            SET status = CASE WHEN ${p.refund_pending} THEN 'refund_pending' WHEN cost > 0 THEN 'refunded' ELSE 'failed' END,
                error = ${p.error.slice(0, 500)}, updated_at = NOW()
+         WHERE id = ${id} AND status = 'running'
+        RETURNING id
+      `;
+      if (!rows.length) throw new RunNotRunningError(id);
+    },
+    async startRefund(id, error) {
+      const rows = await sql`
+        UPDATE content_v3_runs SET status = 'refunding', error = ${error.slice(0, 500)}, updated_at = NOW()
          WHERE id = ${id} AND status = 'running'
         RETURNING id
       `;

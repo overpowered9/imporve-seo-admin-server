@@ -66,12 +66,17 @@ PROMPT 2 on the Perplexity Agent API (`services/research/`), request shape check
 | `POST /api/v1/content-v3/prompts/backup-pre-v3` | admin | The backup alone. |
 | `GET /api/v1/content-v3/prompts/check` | admin | Active DB text vs the doc text per prompt; `all_equal` must be true before launch. |
 
-## Storage (migration 023)
+## Storage (migrations 022, 023, 024)
 
-Apply with `npm run migrate:content-v3-store`, or paste `npm run --silent migrations:print` into the Supabase SQL editor. Code deployed first is safe: the store fails open (`[content-v3] store unavailable`).
+Paste `npm run --silent migrations:print` into the Supabase SQL editor (or run `npm run migrate:keyword-data-cache`, `npm run migrate:content-v3-store`, `npm run migrate:content-v3-runs`). All three are idempotent, record themselves in `schema_migrations`, and have a reversal (`npm run --silent migrations:print -- --down`).
 
-- `content_v3_sessions`: one row per wizard session (user + website + the plugin's `iseo_tk_…` key), JSONB, expires after the TTL, deleted on Leave.
-- `content_v3_posts`: one row per generated v3 article (blueprint picks, fingerprint, headings, type, proof level, validator report); rows older than 365 days are purged.
+**v3 needs 023 and 024.** While their tables are missing, `GET /content-v3/status` answers `enabled: false` even with `CONTENT_V3_ENABLED=true`, the v3 routes answer `v3_disabled`, and every site stays on v2 (`[content-v3] switched on but its tables are missing …` in the log). Deploying the code before the migrations is therefore safe.
+
+- `content_v3_sessions` (023): one row per wizard session (user + website + the plugin's `iseo_tk_…` key), JSONB, expires after the TTL, deleted on Submit and Leave.
+- `content_v3_posts` (023): one row per post (blueprint picks, fingerprint, headings, type, proof level, validator report); a regeneration replaces its row; Leave deletes it; rows older than 365 days are purged.
+- `content_v3_runs` (024): one row per article request (status, credits, step costs, timings, the stored answer for replay); purged after 90 days.
+- `content_v3_quota` (024): daily counters per account for the free steps and delivered articles; purged after 30 days.
+- `keyword_metrics_cache`, `keyword_related_cache` (022): DataForSEO Labs results. Optional: without them keyword data is fetched each time (`cache unavailable` in the log).
 
 ## Logs
 
@@ -102,7 +107,7 @@ Content v3 is off until two switches are on: the server's `CONTENT_V3_ENABLED` a
 ### Steps
 
 1. **Deploy** the server with `CONTENT_V3_ENABLED` unset. `GET /api/v1/content-v3/status` answers `enabled: false`; every site stays on v2.
-2. **Migrations** (Supabase SQL editor, paste `npm run --silent migrations:print`, or `npm run migrate:keyword-data-cache` then `npm run migrate:content-v3-store`): 022 (keyword data cache) and 023 (wizard sessions, post history). Idempotent. Until 023 exists the store fails open: Regenerate recomputes and the blueprint has no history (`[content-v3] store unavailable`).
+2. **Migrations** (Supabase SQL editor, paste `npm run --silent migrations:print`): 022 (keyword data cache), 023 (wizard sessions, post history) and 024 (run ledger, daily counters). Idempotent. v3 stays reported off until 023 and 024 exist (see Storage).
 3. **Prompts** (admin token): `POST /api/v1/content-v3/prompts/seed?mode=replace` — registers every v3 template and makes the doc text active for the doc-sourced ones, backing each old value up first as a version labelled `pre-v3` (nothing is deleted). Then `GET /api/v1/content-v3/prompts/check` must answer `all_equal: true`. Until this runs, the server uses the doc text from code for the three templates the Writer shares with the old chain and logs `still holds the pre-v3 text`.
 4. **Staging**: set `CONTENT_V3_ENABLED=true` on a staging server; on one test site switch "Use Content v3" on (the plugin re-checks the server within 5 minutes; saving the setting re-checks at once). Fill Business details: niche, local/nationwide, towns served, proof level, point of view.
 5. **Smoke test** on that site: Generate title → Approve (step 2 shows type, size, owner questions) → Generate AI Post → publish. Then a bulk project of 5 including a Regulated niche. Watch the logs (below).
@@ -116,11 +121,15 @@ Content v3 is off until two switches are on: the server's `CONTENT_V3_ENABLED` a
 - `validator=fail(…)` with `word_count` on Medium and Large: the Writer wrote about 70% of the body word targets on Medium and about 55% on Large in that run (Small about 95%), so Large articles came out under 2,400 words. A tuning decision for the team lead (aims, ranges or a length note in the second run).
 - `[content-v3] article … validator=fail(…)` — articles that needed review.
 - `[search-data] … local=failed(…)` and `[research] failed` — provider trouble (the chain continues without them).
-- `REFUND FAILED` — must never appear; if it does, refund by hand with the logged user and amount.
+- `REFUND FAILED (will retry)` — a refund failed and is retried every 10 minutes; it should clear on its own.
+- `REFUND APPLIED, LEDGER NOT UPDATED` or `REFUND STATE UNKNOWN` — a person checks the credit ledger for that user and amount, then sets the run row to `refunded` (credits returned) or `refund_pending` (not returned). The code never retries these, so a refund is never paid twice.
+- `[content-v3] swept N run(s) whose process stopped` — articles cut off by a deploy or crash; the charged ones are refunded automatically.
+- `[content-v3] cost over ceiling` — an article that cost us more than its size's ceiling (`CONTENT_V3_COST_CEILING_USD_JSON`); billing is unchanged.
+- One run's every line: search the logs for `run=<session key>`; `GET /api/v1/content-v3/admin/trail?run=<key>` (admin) shows its ledger, generation and post rows.
 
 ### Rollback
 
-- **Everything**: unset `CONTENT_V3_ENABLED`. The plugin answers v2 within 5 minutes (status cache); an in-flight v3 request gets `v3_disabled` and the wizard falls back to v2. No data is lost: sessions expire after 7 days, post history stays.
+- **Everything**: unset `CONTENT_V3_ENABLED`. Changing an env var restarts the server: articles being written at that moment are failed and refunded during the shutdown (or by the sweep a minute after boot), and the plugin shows a plain "try again" message. Within 5 minutes every site uses v2 (status cache); a wizard that started under v3 gets `v3_disabled` on its next step and falls back to v2. No data is lost: sessions expire after 7 days, post history stays, and refunds still run while v3 is off.
 - **One site**: switch "Use Content v3" off in its settings.
 - **One prompt**: in Prompts (V3), activate the version labelled `pre-v3` (or any earlier version). Activation now switches atomically (the new version is activated before the others are deactivated).
 - **Code**: redeploy the previous commit; the migrations are additive and can stay.

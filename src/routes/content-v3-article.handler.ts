@@ -112,6 +112,13 @@ export interface ContentV3ArticleDeps {
 export const DEFAULT_ARTICLE_DEADLINE_MS = 480_000;
 /** A running ledger row older than the deadline plus this is from a dead process (B-3). */
 export const STALE_GRACE_MS = 60_000;
+/**
+ * The longest article deadline any instance can be configured with (CONTENT_V3_ARTICLE_DEADLINE_MS
+ * caps at 570 s). A run counts as stale only past this plus the grace, whatever this instance's own
+ * deadline is, so an instance with a shorter one never closes another instance's live run.
+ */
+export const MAX_ARTICLE_DEADLINE_MS = 570_000;
+export const STALE_AFTER_MS = MAX_ARTICLE_DEADLINE_MS + STALE_GRACE_MS;
 
 /**
  * H2: the article generations this process is running. On shutdown (every deploy and the
@@ -218,7 +225,7 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
       let ledgerId: number | null = null;
       if (deps.runs) {
         try {
-          const claim = await deps.runs.claim({ user_id: userId, website_id: websiteId, session_key: b.session_key, request_id: requestId, stale_after_ms: deadlineMs + STALE_GRACE_MS });
+          const claim = await deps.runs.claim({ user_id: userId, website_id: websiteId, session_key: b.session_key, request_id: requestId, stale_after_ms: Math.max(deadlineMs + STALE_GRACE_MS, STALE_AFTER_MS) });
           if (claim.kind === 'replay') {
             log(`[content-v3] article replayed run=${b.session_key} request=${requestId} (no charge)`);
             return res.json(claim.response);
@@ -250,6 +257,14 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
       let charged = 0;
       const startedAt = now();
       const deadlineAt = startedAt + deadlineMs;
+      // H2: registered before anything is charged, so a shutdown at any point fails this request at
+      // once (the catch refunds) instead of the process dying after the charge.
+      let stop: (err: Error) => void = () => {};
+      const stopped = new Promise<never>((_resolve, reject) => {
+        stop = reject;
+      });
+      stopped.catch(() => {});
+      shutdownHooks.add(stop);
       try {
         const regen = await deps.billing.isRegeneration(userId, b.session_key);
         const action = regen ? 'content_regen' : 'content';
@@ -309,16 +324,9 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
           },
           { runId: b.session_key, deadlineAt },
         );
-        // H2: a shutdown fails this request at once (the catch refunds), instead of the process dying after the charge.
-        let stop: (err: Error) => void = () => {};
-        const stopped = new Promise<never>((_resolve, reject) => {
-          stop = reject;
-        });
-        shutdownHooks.add(stop);
         // B-3: the model calls stop at the deadline; this bounds anything else that could hang.
-        const r = await withDeadline(Promise.race([generation, stopped]), Math.max(1_000, deadlineAt - now()) + DEADLINE_GRACE_MS).finally(() => {
-          shutdownHooks.delete(stop);
-        });
+        const r = await withDeadline(Promise.race([generation, stopped]), Math.max(1_000, deadlineAt - now()) + DEADLINE_GRACE_MS);
+        shutdownHooks.delete(stop);
         const processing = now() - started;
 
         const generationId = await deps.insertGeneration({
@@ -419,23 +427,57 @@ export function createContentV3ArticleRouter(deps: ContentV3ArticleDeps): Router
         }
         return res.json(body);
       } catch (err) {
+        shutdownHooks.delete(stop);
         let refundFailed = false;
-        if (charged > 0) {
-          await deps.billing
-            .refund(userId, charged, `Refund — content v3 generation failed: ${a.seed_keyword.substring(0, 160)}`, websiteId ?? undefined)
-            .catch((e) => {
-              refundFailed = true;
-              log(`[content-v3] REFUND FAILED user=${userId} amount=${charged} (${ledgerId !== null ? 'queued for retry' : 'no ledger: refund by hand'}): ${e instanceof Error ? e.message : String(e)}`);
-            });
-        }
+        let refundedHere = false;
         const message = err instanceof Error ? err.message : String(err);
-        await ledgerWrite('failed', (runs, id) => runs.failed(id, { error: message, refund_pending: refundFailed }));
-        log(`[content-v3] article failed run=${b.session_key} refunded=${refundFailed ? 0 : charged}: ${message}`);
+        if (charged > 0) {
+          // H2: take the row before refunding (running → refunding). If the stale sweep already took
+          // it, the refund queue pays it back instead, so it is never refunded twice.
+          let mayRefund = true;
+          let ledgerHeld = false;
+          if (ledgerId !== null && deps.runs) {
+            try {
+              await deps.runs.startRefund(ledgerId, message);
+              ledgerHeld = true;
+            } catch (e) {
+              if (e instanceof RunNotRunningError) {
+                mayRefund = false;
+                log(`[content-v3] article failed run=${b.session_key}: its run was already closed by the stale sweep, which refunds it`);
+              }
+            }
+          }
+          if (mayRefund) {
+            await deps.billing
+              .refund(userId, charged, `Refund — content v3 generation failed: ${a.seed_keyword.substring(0, 160)}`, websiteId ?? undefined)
+              .then(() => {
+                refundedHere = true;
+              })
+              .catch((e) => {
+                refundFailed = true;
+                log(`[content-v3] REFUND FAILED user=${userId} amount=${charged} (${ledgerId !== null ? 'queued for retry' : 'no ledger: refund by hand'}): ${e instanceof Error ? e.message : String(e)}`);
+              });
+            if (ledgerHeld && deps.runs) {
+              await deps.runs.refundDone(ledgerId!, refundedHere).catch((e) => log(`[content-v3] runs ledger refundDone failed id=${ledgerId}: ${e instanceof Error ? e.message : String(e)}`));
+            } else {
+              await ledgerWrite('failed', (runs, id) => runs.failed(id, { error: message, refund_pending: refundFailed }));
+            }
+          }
+        } else {
+          await ledgerWrite('failed', (runs, id) => runs.failed(id, { error: message, refund_pending: false }));
+        }
+        log(`[content-v3] article failed run=${b.session_key} refunded=${refundedHere ? charged : 0}: ${message}`);
         const e = (err as { shutdown?: boolean }).shutdown
-          ? v3Error('service_unavailable', 'The server restarted while writing this article. Your credits were refunded. Please try again in a minute.')
+          ? v3Error(
+              'service_unavailable',
+              refundedHere
+                ? 'The server restarted while writing this article. Your credits were refunded. Please try again in a minute.'
+                : 'The server restarted while writing this article. Your credits will be refunded automatically. Please try again in a minute.',
+            )
           : toV3UserError(err);
         return res.status(e.status).json(v3ErrorBody(e));
       } finally {
+        shutdownHooks.delete(stop);
         inFlight.delete(lockKey);
       }
     } finally {

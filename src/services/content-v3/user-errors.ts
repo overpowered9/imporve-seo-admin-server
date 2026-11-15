@@ -74,6 +74,13 @@ export function toV3UserError(err: unknown): V3UserError {
   if (err instanceof StepFailedError) {
     const allTimeouts = err.attempts.length > 0 && err.attempts.every((a) => (a.reason ?? '').includes('timed out after') || (a.reason ?? '').startsWith('deadline'));
     if (allTimeouts) return v3Error('timeout');
+    // Every attempt failed to reach the provider (retried, so a 429 / 5xx / 529 / network error):
+    // the service is down or busy, not this request; bulk waits and retries instead of failing.
+    const allCallFailures =
+      err.attempts.length > 0 &&
+      err.attempts.every((a) => (a.reason ?? '').startsWith('call_failed')) &&
+      (err.attempts.length > 1 || err.attempts.some((a) => /\b(429|5\d\d|overloaded|ECONN|ETIMEDOUT|fetch failed|socket)/i.test(a.reason ?? '')));
+    if (allCallFailures) return v3Error('service_unavailable');
     const what = STEP_LABEL[err.step] ?? 'finish this step';
     return v3Error('step_failed', `We couldn't ${what} this time. Please try again.`);
   }

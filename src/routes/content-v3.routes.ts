@@ -85,7 +85,7 @@ import { liveRegulatedTopics, REGULATED_TOPICS_DEF } from '../services/content-v
 import { liveNicheSettings } from '../services/niche-profile/niche-profile.default.js';
 import { createBlueprintRouter } from './content-v3-blueprint.handler.js';
 import { createTrailRouter } from './content-v3-trail.handler.js';
-import { createContentV3ArticleRouter, STALE_GRACE_MS } from './content-v3-article.handler.js';
+import { createContentV3ArticleRouter, STALE_AFTER_MS, STALE_GRACE_MS } from './content-v3-article.handler.js';
 import { liveGenerateArticle } from '../services/writer/article.default.js';
 import { isContentV3Regeneration } from '../services/generation-history.js';
 import { reserveCredits, refundCredits, getLiveBalance, ISEO_CREDIT_TYPE } from '../models/user.models.js';
@@ -140,6 +140,7 @@ const lazyRuns: RunsStore = {
   sweepStale: async (ms) => (await getContentV3Runs()).sweepStale(ms),
   forgetResponses: async (u, k) => (await getContentV3Runs()).forgetResponses(u, k),
   stuckRefunding: async (ms) => (await getContentV3Runs()).stuckRefunding(ms),
+  startRefund: async (id, e) => (await getContentV3Runs()).startRefund(id, e),
 };
 
 /**
@@ -166,7 +167,12 @@ async function v3TablesReady(): Promise<boolean> {
       console.warn(`[content-v3] switched on but its tables are missing (sessions=${!!r.sessions} posts=${!!r.posts} runs=${!!r.runs} quota=${!!r.quota}): apply migrations 023 and 024; v3 is reported off until then`);
     }
   } catch (err) {
-    console.warn(`[content-v3] could not check the v3 tables, v3 reported off: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+    // A database blip keeps the last known answer (re-checked in 10 s) instead of sending every
+    // site to v2; with no answer yet, v3 stays off.
+    console.warn(`[content-v3] could not check the v3 tables (keeping the last answer): ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+    const last = readyCache?.ok ?? false;
+    readyCache = { at: Date.now() - 50_000, ok: last };
+    return last;
   }
   readyCache = { at: Date.now(), ok };
   return ok;
@@ -176,7 +182,7 @@ const refundV3 = async (userId: number, cost: number, reason: string, websiteId?
 };
 // H2: stopped runs are swept and failed refunds retried every 10 minutes, whether v3 is on or not
 // (a rollback must still refund what it interrupted).
-startRunsHousekeeping(refundV3, { staleAfterMs: contentV3Config().articleDeadlineMs + STALE_GRACE_MS });
+startRunsHousekeeping(refundV3, { staleAfterMs: Math.max(contentV3Config().articleDeadlineMs + STALE_GRACE_MS, STALE_AFTER_MS) });
 
 // The paid v3 article (plugin auth). Same price and reserve/refund path as v2's /content-v2/article.
 router.use(

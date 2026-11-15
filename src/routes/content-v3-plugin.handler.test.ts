@@ -127,6 +127,13 @@ describe('POST /session/clear', () => {
 });
 
 describe('user errors (OPS6)', () => {
+  test('a step whose every attempt failed to reach the provider is service_unavailable (bulk waits)', () => {
+    const down = new StepFailedError('writer', [1, 2, 3].map((a) => ({ attempt: a, ok: false, reason: 'call_failed: 529 overloaded_error', ms: 1, raw_length: 0 })));
+    assert.equal(toV3UserError(down).code, 'service_unavailable');
+    const bad = new StepFailedError('writer', [1, 2, 3].map((a) => ({ attempt: a, ok: false, reason: 'unreadable_json: x', ms: 1, raw_length: 5 })));
+    assert.equal(toV3UserError(bad).code, 'step_failed');
+  });
+
   test('raw provider and config errors become plain messages', () => {
     const cases: Array<[unknown, string]> = [
       [new Error('ANTHROPIC_API_KEY is not set — required for the v2 content route'), 'not_configured'],
