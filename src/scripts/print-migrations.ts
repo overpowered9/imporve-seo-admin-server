@@ -39,6 +39,7 @@ const migrations = [
   ['022 — keyword data cache (DataForSEO Labs metrics + related keywords)', '../migrations/022-keyword-data-cache.js'],
   ['023 — Content v3 session store + per-post history', '../migrations/023-content-v3-store.js'],
   ['024 — Content v3 run ledger (credits once), daily quotas, schema_migrations', '../migrations/024-content-v3-runs.js'],
+  ['025 — rank tracker (keyword/domain targets + position history)', '../migrations/025-rank-tracker.js'],
 ] as const;
 // NOTE: 009–013 are absent from this list and were before 014 was added. Left
 // alone deliberately rather than fixed in passing — whoever added them either

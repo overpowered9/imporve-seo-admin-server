@@ -44,6 +44,7 @@ function emptyResult(over: Partial<FinderResult> = {}): FinderResult {
     notice: null,
     geo_ladder: [],
     keywords_without_data: 0,
+    serp_checked: 0,
     cost_usd: 0.03,
     rules: {} as FinderResult['rules'],
     ...over,

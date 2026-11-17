@@ -236,9 +236,11 @@ describe('reasonFor', () => {
     volume_used: 500,
     volume_scope: 'national' as const,
     keyword_difficulty: 10,
+    difficulty_reported: 10,
     intent: 'commercial' as const,
     opportunity_score: 50,
     light: 'green' as const,
+    serp: null,
   };
 
   test('says plainly what is known and never implies what is not', () => {

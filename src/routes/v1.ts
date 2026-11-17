@@ -8,6 +8,7 @@ import generationRoutes from './generation.routes.js';
 import contentV2Routes from './content-v2.routes.js';
 import contentV3Routes from './content-v3.routes.js';
 import keywordFinderRoutes from './keyword-finder.routes.js';
+import rankTrackerRoutes from './rank-tracker.routes.js';
 import authRoutes from './auth.routes.js';
 import websitesRoutes from './websites.routes.js';
 import usersRoutes from './users.routes.js';
@@ -147,6 +148,7 @@ router.use('/content-v2', contentV2Routes);
 // then uses /content-v2) unless CONTENT_V3_ENABLED is "true".
 router.use('/content-v3', contentV3Routes);
 router.use('/keyword-finder', keywordFinderRoutes);
+router.use('/rank-tracker', rankTrackerRoutes);
 router.use('/auth', authRoutes);
 router.use('/websites', websitesRoutes);
 router.use('/users', usersRoutes);

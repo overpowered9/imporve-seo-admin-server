@@ -35,6 +35,11 @@ function getClient() {
   return client;
 }
 
+/** The shared client, for other keyword-data services (the rank tracker) that need SERP access. */
+export function getSerpClient() {
+  return getClient();
+}
+
 export function getGeoService(): GeoService {
   if (geoSingleton) return geoSingleton;
   geoSingleton = createGeoService({ client: getClient() });

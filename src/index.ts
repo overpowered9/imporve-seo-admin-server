@@ -13,6 +13,7 @@ import { startPlanCreditSync } from './services/billing/plan-credit-sync.js';
 import generationsRoutes from './routes/generations.routes.js';
 import { testConnection } from './data/db.js';
 import { startTrialEmailScheduler } from './services/trial-emails.service.js';
+import { startRankTrackerScheduler } from './services/keyword-data/rank-tracker.default.js';
 // BILL-007/008 — replaces lifecycle-emails.service.ts, which sent inline and
 // had no dry-run, no lead-time config and no shared runner. That module is left
 // in place but is no longer started; see notification-jobs.ts.
@@ -103,6 +104,7 @@ async function startServer() {
 
     // Start the trial-email drip scheduler (no-op unless TRIAL_EMAILS_ENABLED=true)
     startTrialEmailScheduler();
+    startRankTrackerScheduler();
 
     // Credit-expiry + inactivity notifications (BILL-007, BILL-008).
     // No-op unless LIFECYCLE_EMAILS_ENABLED=true, so this changes nothing until
