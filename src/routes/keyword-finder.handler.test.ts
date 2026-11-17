@@ -225,3 +225,32 @@ describe('GET /locations', () => {
     assert.equal(r.body.code, 'VALIDATION_ERROR');
   });
 });
+
+describe('limit', () => {
+  test('both modes accept 1 to 100 and refuse anything outside it', async () => {
+    const { router, calls } = build();
+    app = await startTestApp([['/api/v1/keyword-finder', router]]);
+    const h = { Authorization: 'Bearer admin' };
+
+    for (const mode of ['list', 'recommend'] as const) {
+      for (const limit of [1, 50, 100]) {
+        const r = await app.post('/api/v1/keyword-finder/discover', { seed: 'x', mode, limit }, h);
+        assert.equal(r.status, 200, `${mode} ${limit}`);
+        assert.equal(calls[calls.length - 1].limit, limit);
+        assert.equal(calls[calls.length - 1].mode, mode);
+      }
+      for (const limit of [0, -1, 101, 1000]) {
+        const r = await app.post('/api/v1/keyword-finder/discover', { seed: 'x', mode, limit }, h);
+        assert.equal(r.status, 400, `${mode} ${limit}`);
+        assert.equal(r.body.code, 'VALIDATION_ERROR');
+      }
+    }
+  });
+
+  test('omitting it falls back to the mode default', async () => {
+    const { router, calls } = build();
+    app = await startTestApp([['/api/v1/keyword-finder', router]]);
+    await app.post('/api/v1/keyword-finder/discover', { seed: 'x', mode: 'list' }, { Authorization: 'Bearer admin' });
+    assert.equal(calls[0].limit, undefined, 'the service applies the mode default, not the route');
+  });
+});

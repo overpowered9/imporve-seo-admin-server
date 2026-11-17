@@ -38,8 +38,12 @@ export const FINDER_DEFAULTS = Object.freeze({
   limit: Object.freeze({ list: 100, recommend: 25 } satisfies Record<FinderMode, number>),
   /** Labs related_keywords depth: 1 returns up to 8, 2 up to 72, 3 up to 584. */
   depthForLimit: (limit: number) => (limit <= 60 ? 2 : 3),
-  /** Hard ceiling, matching the Labs cap. */
-  maxLimit: 1000,
+  /**
+   * Hard ceiling for both modes. 100 is a product decision, not a provider one: Labs would serve
+   * far more, but a list nobody will read through is not worth paying for, and the Google Ads
+   * ladder prices per request either way. The caller chooses anything from 1 to this.
+   */
+  maxLimit: 100,
 });
 
 export interface FinderItem {
