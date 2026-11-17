@@ -193,10 +193,15 @@ export function createRankTracker(deps: RankTrackerDeps) {
   /**
    * Every active target not checked within `staleHours`, oldest first, capped.
    *
-   * The cap is the cost control: a scheduler tick can never spend more than `max` SERP calls,
-   * however many targets accumulate, and whatever it misses it picks up on the next tick.
+   * staleHours 0 means "everything", which is what the panel's Check all button sends: a person
+   * who just pressed a button is not asking about staleness. It works without a special case
+   * because NOW() - INTERVAL '0 hours' is NOW(), and every past check is before that.
+   *
+   * The cap is the cost control: one run can never spend more than `max` SERP calls, however
+   * many targets accumulate, and whatever it misses is picked up by the next run.
    */
   async function runDue(opts: { staleHours?: number; max?: number } = {}): Promise<{ checked: number; cost_usd: number }> {
+    // ?? not ||, so an explicit 0 ("check everything") survives.
     const staleHours = opts.staleHours ?? 24 * 7;
     const max = opts.max ?? 50;
 

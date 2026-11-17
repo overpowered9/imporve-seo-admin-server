@@ -40,7 +40,8 @@ export const addTargetSchema = z.object({
 });
 
 export const runSchema = z.object({
-  stale_hours: z.number().int().min(1).max(24 * 90).optional(),
+  /** 0 means "check everything now", which is what the panel's Check all button sends. */
+  stale_hours: z.number().int().min(0).max(24 * 90).optional(),
   max: z.number().int().min(1).max(200).optional(),
 });
 

@@ -233,22 +233,39 @@ describe('addTarget', () => {
 });
 
 describe('rankTrackerSchedulerEnabled', () => {
-  test('runs by default, because with no targets a tick costs nothing', () => {
-    assert.equal(rankTrackerSchedulerEnabled({}), true);
-    assert.equal(rankTrackerSchedulerEnabled({ RANK_TRACKER_ENABLED: '' }), true);
-    assert.equal(rankTrackerSchedulerEnabled({ RANK_TRACKER_ENABLED: 'true' }), true);
+  test('is off unless switched on, because the tracker is driven by hand', () => {
+    assert.equal(rankTrackerSchedulerEnabled({}), false);
+    assert.equal(rankTrackerSchedulerEnabled({ RANK_TRACKER_ENABLED: '' }), false);
   });
 
-  test('only an explicit negative stops it', () => {
-    for (const raw of ['false', 'FALSE', '0', 'off', 'no', ' false ']) {
-      assert.equal(rankTrackerSchedulerEnabled({ RANK_TRACKER_ENABLED: raw }), false, raw);
+  test('only an explicit positive starts it', () => {
+    for (const raw of ['true', 'TRUE', '1', 'on', 'yes', ' true ']) {
+      assert.equal(rankTrackerSchedulerEnabled({ RANK_TRACKER_ENABLED: raw }), true, raw);
     }
   });
 
-  test('a typo does not silently disable it', () => {
-    // "disabled" is not in the opt-out list, so it reads as on. A deploy that meant to stop the
-    // scheduler and got the value wrong keeps running, which is the recoverable direction: the
-    // bill is capped, whereas silently stopping rank history cannot be backfilled.
-    assert.equal(rankTrackerSchedulerEnabled({ RANK_TRACKER_ENABLED: 'disabled' }), true);
+  test('a typo never starts unattended spending', () => {
+    for (const raw of ['enabled', 'y', 'ON!', 'tru']) {
+      assert.equal(rankTrackerSchedulerEnabled({ RANK_TRACKER_ENABLED: raw }), false, raw);
+    }
+  });
+});
+
+describe('runDue with staleHours 0', () => {
+  test('passes an explicit 0 through rather than falling back to the weekly default', async () => {
+    const captured: string[] = [];
+    const db = ((strings: TemplateStringsArray, ...vals: unknown[]) => {
+      captured.push(JSON.stringify(vals));
+      return Promise.resolve([]);
+    }) as never;
+    const tracker = createRankTracker({
+      db,
+      log: () => {},
+      serp: { check: async () => ({ signal: signal([]), cost_usd: 0 }) },
+    });
+
+    await tracker.runDue({ staleHours: 0 });
+    // The first query is the due-targets select; its first value is the staleness.
+    assert.ok(captured[0].startsWith('[0'), `expected an explicit 0, got ${captured[0]}`);
   });
 });

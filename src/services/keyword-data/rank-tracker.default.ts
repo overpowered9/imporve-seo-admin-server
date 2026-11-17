@@ -3,15 +3,13 @@
  *
  * Follows trial-emails.service.ts: a setInterval loop started from index.ts.
  *
- * ON BY DEFAULT, which is safe for one specific reason: the scheduler only ever checks targets
- * somebody has explicitly added. With no targets a tick costs nothing and makes no provider call
- * at all, so the feature cannot start spending on its own — it spends only after a human asks for
- * a keyword to be watched. The cadence and the per-tick ceiling are still explicit, and
- * credentials are still required.
+ * OFF BY DEFAULT. The tracker is driven by hand from the admin panel: "Check now" on a row, or
+ * "Check all" in the toolbar. The scheduler is kept, because unattended checking is the only way
+ * to get a rank history with no holes in it — a week nobody presses the button is a week of data
+ * that cannot be recovered afterwards — but it does not run unless someone turns it on.
  *
- *   RANK_TRACKER_ENABLED     Opt-out. "false", "0", "off" or "no" stops the scheduler; anything
- *                            else (including unset) runs it. The panel's Check and Run buttons
- *                            work either way.
+ *   RANK_TRACKER_ENABLED     Opt-in. "true", "1", "on" or "yes" starts the scheduler. Unset or
+ *                            anything else leaves it off; the panel's buttons work either way.
  *   RANK_TRACKER_STALE_HOURS How old a check must be before it is redone. Default 168 (weekly):
  *                            positions do not move fast enough to be worth paying for daily.
  *   RANK_TRACKER_MAX_PER_RUN Hard ceiling on SERP calls per tick. Default 50, so a tick can never
@@ -34,14 +32,14 @@ export function __resetRankTracker(): void {
 }
 
 /**
- * Whether the scheduler should run. Opt-out, not opt-in: only an explicit negative stops it.
+ * Whether the scheduler should run. Opt-in: nothing happens unless it is switched on explicitly.
  *
  * Exported so the rule is testable without starting a timer — the thing that decides whether a
- * deploy starts spending money should not be reachable only through a side effect.
+ * deploy spends money unattended should not be reachable only through a side effect.
  */
 export function rankTrackerSchedulerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = (env.RANK_TRACKER_ENABLED ?? '').trim().toLowerCase();
-  return !['false', '0', 'off', 'no'].includes(raw);
+  return ['true', '1', 'on', 'yes'].includes(raw);
 }
 
 function intFromEnv(name: string, fallback: number): number {
@@ -58,7 +56,7 @@ let timer: NodeJS.Timeout | null = null;
 export function startRankTrackerScheduler(): void {
   if (timer) return;
   if (!rankTrackerSchedulerEnabled()) {
-    console.log('ℹ️  Rank tracker scheduler disabled (RANK_TRACKER_ENABLED). On-demand checks still work.');
+    console.log('ℹ️  Rank tracker scheduler off (set RANK_TRACKER_ENABLED=true to run it). Checks from the admin panel still work.');
     return;
   }
   if (!isKeywordFinderConfigured()) {

@@ -152,3 +152,19 @@ describe('the paid routes', () => {
     assert.equal(calls.length, 0);
   });
 });
+
+describe('check all', () => {
+  test('stale_hours 0 is allowed, because a person who pressed a button is not asking about staleness', async () => {
+    const { router } = build();
+    app = await startTestApp([['/api/v1/rank-tracker', router]]);
+    const r = await app.post('/api/v1/rank-tracker/run', { stale_hours: 0 }, H);
+    assert.equal(r.status, 200);
+    assert.equal(r.body.checked, 3);
+  });
+
+  test('a negative staleness is still refused', async () => {
+    const { router } = build();
+    app = await startTestApp([['/api/v1/rank-tracker', router]]);
+    assert.equal((await app.post('/api/v1/rank-tracker/run', { stale_hours: -1 }, H)).status, 400);
+  });
+});
