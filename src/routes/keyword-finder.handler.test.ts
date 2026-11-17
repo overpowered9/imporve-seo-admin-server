@@ -254,3 +254,26 @@ describe('limit', () => {
     assert.equal(calls[0].limit, undefined, 'the service applies the mode default, not the route');
   });
 });
+
+describe('serp_check', () => {
+  test('defaults to off, so a search never spends SERP money by accident', async () => {
+    const { router, calls } = build();
+    app = await startTestApp([['/api/v1/keyword-finder', router]]);
+    await app.post('/api/v1/keyword-finder/discover', { seed: 'x' }, { Authorization: 'Bearer admin' });
+    assert.equal(calls[0].serp_check, 'off');
+  });
+
+  test('passes through when asked for, and refuses anything else', async () => {
+    const { router, calls } = build();
+    app = await startTestApp([['/api/v1/keyword-finder', router]]);
+    const h = { Authorization: 'Bearer admin' };
+
+    const ok = await app.post('/api/v1/keyword-finder/discover', { seed: 'x', serp_check: 'top' }, h);
+    assert.equal(ok.status, 200);
+    assert.equal(calls[0].serp_check, 'top');
+
+    const bad = await app.post('/api/v1/keyword-finder/discover', { seed: 'x', serp_check: 'yes' }, h);
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.code, 'VALIDATION_ERROR');
+  });
+});

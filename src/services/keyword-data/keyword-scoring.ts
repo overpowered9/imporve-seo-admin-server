@@ -12,9 +12,12 @@
  *    all, so it is not far behind. Navigational is someone looking for a named brand; unless that
  *    brand is yours, it is close to worthless, and the spec gave it the same 0.8 as "unknown".
  *
- * 2. The spec's fourth gate ("a page-1 result with domain_rank < 30") needs a live SERP call per
- *    keyword. On a 100-keyword list that is 100 paid calls to compute a filter. It is kept out of
- *    the free path and offered as a paid add-on instead; `serp_weakness` is the slot it fills.
+ * 2. The spec's fourth gate ("a page-1 result with domain_rank < 30") is doubly impossible. It
+ *    needs a live SERP call per keyword, which on a 100-keyword list is 100 paid calls to compute
+ *    a filter; and `/serp/google/organic/live/advanced` returns no `domain_rank` field at all
+ *    (verified live, 17 Nov 2026). What the page DOES show is whether Google is serving shopping
+ *    units, and whether Reddit/Facebook/Quora hold the top ten. Those replace it, as an opt-in
+ *    paid check — see SerpVerdict and serp-signal.service.ts.
  *
  * 3. The spec has no honest answer for a keyword DataForSEO knows nothing about, and would colour
  *    it red ("tough fight"). That is a lie: we do not know that it is hard, we know nothing at all.
@@ -27,6 +30,17 @@
 import type { KeywordIntent } from './keyword-data.types.js';
 
 export type TrafficLight = 'green' | 'yellow' | 'red' | 'unknown';
+
+/**
+ * What the optional SERP check concluded. Only the two fields that change a verdict; the full
+ * picture lives on SerpSignal.
+ */
+export interface SerpVerdict {
+  /** False when Google is showing shopping units: a decision about the query, not a difficulty. */
+  article_viable: boolean;
+  /** Reddit / Facebook / Quora / YouTube results inside the top ten. */
+  ugc_results: number;
+}
 
 /** Whether the volume being scored is a local figure or a national one. Changes the volume bar. */
 export type VolumeScope = 'local' | 'national';
@@ -52,6 +66,11 @@ export const SCORING_DEFAULTS = Object.freeze({
   minVolume: Object.freeze({ local: 20, national: 100 } satisfies Record<VolumeScope, number>),
   /** Divisor that maps the raw product onto roughly 0-100. See rawToScore. */
   scoreDivisor: 6.5,
+  /**
+   * User-generated results in the top ten before we call a SERP beatable. One Reddit thread is
+   * noise; two or more means Google could not find enough good pages, which is the opening.
+   */
+  minUgcForWeakSerp: 2,
 });
 
 export type ScoringRules = typeof SCORING_DEFAULTS;
@@ -92,8 +111,10 @@ export interface GateResult {
   volume_ok: boolean | null;
   /** Useful: not someone hunting for a brand that is not yours. */
   intent_ok: boolean | null;
-  /** Beatable: a weak page-1 competitor exists. Null unless the paid SERP check ran. */
+  /** Beatable: user-generated results hold part of page one. Null unless the SERP check ran. */
   serp_weakness: boolean | null;
+  /** False when Google serves shopping units for this query. Null unless the SERP check ran. */
+  serp_article_viable: boolean | null;
 }
 
 export function evaluateGates(
@@ -102,15 +123,17 @@ export function evaluateGates(
     keyword_difficulty: number | null;
     intent: KeywordIntent | null;
     volume_scope: VolumeScope;
-    serp_weakness?: boolean | null;
+    serp?: SerpVerdict | null;
   },
   rules: ScoringRules = SCORING_DEFAULTS,
 ): GateResult {
+  const serp = input.serp ?? null;
   return {
     difficulty_ok: input.keyword_difficulty === null ? null : input.keyword_difficulty <= rules.easyDifficulty,
     volume_ok: input.search_volume === null ? null : input.search_volume >= rules.minVolume[input.volume_scope],
     intent_ok: input.intent === null ? null : input.intent !== 'navigational',
-    serp_weakness: input.serp_weakness ?? null,
+    serp_weakness: serp === null ? null : serp.ugc_results >= rules.minUgcForWeakSerp,
+    serp_article_viable: serp === null ? null : serp.article_viable,
   };
 }
 
@@ -122,9 +145,15 @@ export function evaluateGates(
  *   red     — tough fight: difficulty is genuinely high, or there is no demand to win.
  *   unknown — we have no data. Not a judgement, an absence of one.
  *
- * The paid SERP check can only ever PROMOTE: finding a weak page-1 competitor turns a yellow
- * green. It never demotes, because "no weak competitor found" is weak evidence on a 10-result
- * sample, and a user who paid for extra information should not be punished by it.
+ * The paid SERP check moves a verdict in one of two ways, and only on positive evidence:
+ *
+ *   PROMOTES when user-generated threads hold part of the top ten. Google could not find enough
+ *   good pages, so a competent article has room. A yellow becomes green.
+ *
+ *   DEMOTES to red when Google is serving shopping units. That is not a measure of competition,
+ *   it is Google deciding the query is a purchase — and no article outranks a product carousel.
+ *   This is the one demotion allowed, because it rests on something the check SAW, not on an
+ *   absence of evidence. "No UGC found" never demotes: on a ten-result sample that is weak.
  */
 export function trafficLight(
   input: {
@@ -132,11 +161,16 @@ export function trafficLight(
     keyword_difficulty: number | null;
     intent: KeywordIntent | null;
     volume_scope: VolumeScope;
-    serp_weakness?: boolean | null;
+    serp?: SerpVerdict | null;
   },
   rules: ScoringRules = SCORING_DEFAULTS,
 ): TrafficLight {
   const { keyword_difficulty: difficulty, search_volume: volume } = input;
+
+  // Seen, not inferred: Google is selling here, so an article is the wrong tool whatever the
+  // difficulty score says. Checked before the unknown branch, because this is exactly the case
+  // where difficulty is reported as 0 and we would otherwise have nothing to say.
+  if (input.serp && !input.serp.article_viable) return 'red';
 
   // Nothing to judge on. Never call this red: we do not know that it is hard.
   if (difficulty === null && volume === null) return 'unknown';
@@ -173,7 +207,7 @@ export function evaluateScoreAndLight(
     keyword_difficulty: number | null;
     intent: KeywordIntent | null;
     volume_scope: VolumeScope;
-    serp_weakness?: boolean | null;
+    serp?: SerpVerdict | null;
   },
   rules: ScoringRules = SCORING_DEFAULTS,
 ): { score: number | null; light: TrafficLight } {

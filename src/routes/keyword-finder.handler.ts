@@ -43,6 +43,8 @@ export const discoverRequestSchema = z.object({
     .optional(),
   language_code: languageCodeSchema,
   mode: z.enum(['list', 'recommend'], { invalid_type_error: 'mode must be "list" or "recommend"' }).default('list'),
+  /** Opt-in and paid: one SERP call per checked row. Never on by default. */
+  serp_check: z.enum(['off', 'top'], { invalid_type_error: 'serp_check must be "off" or "top"' }).default('off'),
   limit: z
     .number({ invalid_type_error: 'limit must be a number' })
     .int('limit must be an integer')
@@ -75,6 +77,7 @@ export interface DiscoverCall {
   language_code: string;
   mode: FinderMode;
   limit?: number;
+  serp_check: 'off' | 'top';
 }
 
 const NOT_CONFIGURED = {
@@ -145,6 +148,7 @@ export function createKeywordFinderRouter(deps: KeywordFinderDeps): Router {
         language_code: body.language_code,
         mode: body.mode,
         limit: body.limit,
+        serp_check: body.serp_check,
       });
       res.json({ success: true, ...result });
     } catch (err) {

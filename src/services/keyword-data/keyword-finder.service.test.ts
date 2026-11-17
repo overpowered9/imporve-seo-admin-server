@@ -304,3 +304,77 @@ describe('a reported difficulty of 0', () => {
     assert.match(blank.reason, /nothing to judge it on/);
   });
 });
+
+describe('the optional SERP check', () => {
+  const SHOPPING = { keyword: 'leather wallets for women', organic_count: 2, shopping_units: 6, has_ai_overview: true, ugc_results: 0, article_viable: false, top: [] };
+  const FORUMS = { keyword: 'water heater repair cost', organic_count: 7, shopping_units: 0, has_ai_overview: true, ugc_results: 3, article_viable: true, top: [] };
+
+  function serpSvc(byKeyword: Record<string, any>, opts: { fail?: string } = {}) {
+    const calls: string[] = [];
+    return {
+      calls,
+      check: async ({ keyword }: { keyword: string }) => {
+        calls.push(keyword);
+        if (opts.fail === keyword) throw new Error('provider exploded');
+        return { signal: { ...(byKeyword[keyword] ?? FORUMS), keyword }, cost_usd: 0.0035 };
+      },
+    };
+  }
+
+  test('is off by default and spends nothing', async () => {
+    const serp = serpSvc({});
+    const finder = createKeywordFinderService({ labs: labsFor(SEED_ROW, RELATED), serp, log: () => {} });
+    const r = await finder.discover({ seed: 'leather wallets', country_iso: 'us', country_location_code: US });
+    assert.equal(serp.calls.length, 0);
+    assert.equal(r.serp_checked, 0);
+    assert.ok(r.items.every((i) => i.serp === null));
+  });
+
+  test('covers only the top rows, so the cost does not scale with the list', async () => {
+    const serp = serpSvc({});
+    const finder = createKeywordFinderService({ labs: labsFor(SEED_ROW, RELATED), serp, log: () => {} });
+    const r = await finder.discover({ seed: 'leather wallets', country_iso: 'us', country_location_code: US, serp_check: 'top' });
+    assert.ok(serp.calls.length <= FINDER_DEFAULTS.serpTopN);
+    assert.equal(r.serp_checked, serp.calls.length);
+    assert.ok(r.cost_usd > 0);
+  });
+
+  test('shopping units demote a row that otherwise looked like a win', async () => {
+    const serp = serpSvc({ 'leather wallets for women': SHOPPING });
+    const finder = createKeywordFinderService({ labs: labsFor(SEED_ROW, RELATED), serp, log: () => {} });
+    const r = await finder.discover({ seed: 'leather wallets', country_iso: 'us', country_location_code: US, serp_check: 'top' });
+
+    const row = r.items.find((i) => i.keyword === 'leather wallets for women')!;
+    assert.equal(row.light, 'red');
+    assert.match(row.reason, /Google shows product listings/);
+    assert.equal(row.serp?.shopping_units, 6);
+  });
+
+  test('forum results promote a row and say why', async () => {
+    const serp = serpSvc({ 'how to clean a leather wallet': FORUMS });
+    const finder = createKeywordFinderService({ labs: labsFor(SEED_ROW, RELATED), serp, log: () => {} });
+    const r = await finder.discover({ seed: 'leather wallets', country_iso: 'us', country_location_code: US, serp_check: 'top' });
+
+    const row = r.items.find((i) => i.keyword === 'how to clean a leather wallet')!;
+    assert.equal(row.light, 'green');
+    assert.match(row.reason, /Forum and social threads hold 3 of the top 7/);
+  });
+
+  test('one failed SERP call does not lose the search the user already paid for', async () => {
+    const serp = serpSvc({}, { fail: 'leather wallets for women' });
+    const finder = createKeywordFinderService({ labs: labsFor(SEED_ROW, RELATED), serp, log: () => {} });
+    const r = await finder.discover({ seed: 'leather wallets', country_iso: 'us', country_location_code: US, serp_check: 'top' });
+
+    assert.ok(r.items.length > 0);
+    assert.equal(r.items.find((i) => i.keyword === 'leather wallets for women')?.serp, null);
+    assert.ok(r.serp_checked < serp.calls.length, 'the failure is not counted as a check');
+  });
+
+  test('asking for the check without the service is a programming error, not a silent skip', async () => {
+    const finder = createKeywordFinderService({ labs: labsFor(SEED_ROW, RELATED), log: () => {} });
+    await assert.rejects(
+      () => finder.discover({ seed: 'x', country_iso: 'us', country_location_code: US, serp_check: 'top' }),
+      /needs the serp service/,
+    );
+  });
+});

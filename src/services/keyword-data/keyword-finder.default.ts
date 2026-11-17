@@ -13,6 +13,7 @@ import { dataForSeoCredentials } from '../../config/keyword-data.config.js';
 import { ADS_DEFAULT_TIMEOUT_MS, createDataForSeoClient } from './dataforseo.client.js';
 import { createGeoService, type GeoService } from './keyword-geo.service.js';
 import { createKeywordFinderService } from './keyword-finder.service.js';
+import { createSerpSignalService } from './serp-signal.service.js';
 
 const FINDER_TIMEOUT_MS = Math.max(ADS_DEFAULT_TIMEOUT_MS, 30_000);
 
@@ -42,7 +43,11 @@ export function getGeoService(): GeoService {
 
 export function getKeywordFinderService() {
   if (finderSingleton) return finderSingleton;
-  finderSingleton = createKeywordFinderService({ labs: getClient(), geo: getGeoService() });
+  finderSingleton = createKeywordFinderService({
+    labs: getClient(),
+    geo: getGeoService(),
+    serp: createSerpSignalService({ client: getClient() }),
+  });
   return finderSingleton;
 }
 

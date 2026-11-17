@@ -30,8 +30,17 @@ import {
   type VolumeScope,
 } from './keyword-scoring.js';
 import type { GeoService, GeoStep } from './keyword-geo.service.js';
+import type { SerpSignal } from './serp-signal.service.js';
 
 export type FinderMode = 'list' | 'recommend';
+
+/**
+ * Whether to pay for the SERP check.
+ *   off — Labs and Google Ads only. No SERP spend.
+ *   top — check the highest-scoring rows after ranking. Bounded, so the cost of a search stays
+ *         predictable however long the list is.
+ */
+export type SerpCheckMode = 'off' | 'top';
 
 /**
  * A reported difficulty of exactly 0 is not evidence that a keyword is easy.
@@ -69,6 +78,11 @@ export const FINDER_DEFAULTS = Object.freeze({
   /** Labs related_keywords depth: 1 returns up to 8, 2 up to 72, 3 up to 584. */
   depthForLimit: (limit: number) => (limit <= 60 ? 2 : 3),
   /**
+   * How many of the top rows the SERP check covers. Ten keeps an opt-in check at roughly four
+   * cents a search (measured: $0.0035 per SERP call) rather than scaling with the list length.
+   */
+  serpTopN: 10,
+  /**
    * Hard ceiling for both modes. 100 is a product decision, not a provider one: Labs would serve
    * far more, but a list nobody will read through is not worth paying for, and the Google Ads
    * ladder prices per request either way. The caller chooses anything from 1 to this.
@@ -95,6 +109,8 @@ export interface FinderItem {
   opportunity_score: number | null;
   light: TrafficLight;
   light_label: string;
+  /** What the first page of Google looks like. Null unless the SERP check ran for this row. */
+  serp: SerpSignal | null;
   /** One sentence a non-technical owner can act on. */
   reason: string;
 }
@@ -111,6 +127,8 @@ export interface FinderResult {
   /** What Google Ads was asked, rung by rung. Empty when no local level was requested. */
   geo_ladder: unknown[];
   keywords_without_data: number;
+  /** How many rows the SERP check covered. 0 when it was off. */
+  serp_checked: number;
   cost_usd: number;
   rules: ScoringRules;
 }
@@ -119,6 +137,10 @@ export interface FinderDeps {
   labs: DataForSeoClient;
   /** Only needed when a non-country location is asked for. */
   geo?: GeoService;
+  /** Only needed when the SERP check is asked for. */
+  serp?: {
+    check: (p: { keyword: string; location_code: number; language_code?: string }) => Promise<{ signal: SerpSignal; cost_usd: number }>;
+  };
   log?: (line: string) => void;
 }
 
@@ -133,11 +155,20 @@ export interface DiscoverParams {
   language_code?: string;
   mode?: FinderMode;
   limit?: number;
+  /** Default 'off'. The SERP check costs money, so it is never on by accident. */
+  serp_check?: SerpCheckMode;
   rules?: ScoringRules;
 }
 
 /** The sentence under the traffic light. Plain words, no jargon, never implies data we lack. */
 export function reasonFor(item: Omit<FinderItem, 'reason' | 'light_label'>, levelName: string | null): string {
+  // Seen on the page, so it outranks anything else we might say about the row.
+  if (item.serp && !item.serp.article_viable) {
+    return 'Google shows product listings for this search, so an article is unlikely to rank. Better suited to a product or service page.';
+  }
+  if (item.serp && item.serp.ugc_results >= 2) {
+    return `Forum and social threads hold ${item.serp.ugc_results} of the top ${item.serp.organic_count} results, so a solid article has room here.`;
+  }
   const where = item.volume_scope === 'local' && levelName ? ` in ${levelName}` : '';
   const vol = item.volume_used;
   const kd = item.keyword_difficulty;
@@ -167,7 +198,7 @@ export function reasonFor(item: Omit<FinderItem, 'reason' | 'light_label'>, leve
 }
 
 export function createKeywordFinderService(deps: FinderDeps) {
-  const { labs, geo, log = (l: string) => console.log(l) } = deps;
+  const { labs, geo, serp, log = (l: string) => console.log(l) } = deps;
 
   async function discover(params: DiscoverParams): Promise<FinderResult> {
     const mode: FinderMode = params.mode ?? 'list';
@@ -287,6 +318,7 @@ export function createKeywordFinderService(deps: FinderDeps) {
         intent: nat.intent,
         opportunity_score: scored.score,
         light: scored.light,
+        serp: null as SerpSignal | null,
       };
 
       return { ...partial, light_label: TRAFFIC_LIGHT_LABELS[scored.light], reason: reasonFor(partial, levelName) };
@@ -301,10 +333,60 @@ export function createKeywordFinderService(deps: FinderDeps) {
       return b.opportunity_score - a.opportunity_score;
     });
 
+    // ---- 4. The optional SERP check, on the best rows only. ----
+    let serpChecked = 0;
+    if ((params.serp_check ?? 'off') === 'top') {
+      if (!serp) throw new Error('the SERP check needs the serp service');
+      const targets = items.slice(0, FINDER_DEFAULTS.serpTopN);
+
+      // A small pool: enough to keep an interactive search quick, not enough to trip the
+      // provider's per-minute ceiling.
+      const queue = [...targets];
+      const workers = Array.from({ length: Math.min(3, queue.length) }, async () => {
+        for (;;) {
+          const row = queue.shift();
+          if (!row) return;
+          try {
+            const r = await serp.check({
+              keyword: row.keyword,
+              location_code: params.location_code ?? country,
+              language_code: language,
+            });
+            row.serp = r.signal;
+            cost += r.cost_usd;
+            serpChecked += 1;
+          } catch (err) {
+            // One failed SERP call must not lose a search the user has already paid for.
+            log(`[keyword-finder] SERP check failed for "${row.keyword}": ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      });
+      await Promise.all(workers);
+
+      // Re-judge only the rows the check covered. The score does not read the SERP, so the
+      // ordering stands; only the verdict and its sentence move.
+      for (const row of targets) {
+        if (!row.serp) continue;
+        const rescored = evaluateScoreAndLight(
+          {
+            search_volume: row.volume_used,
+            keyword_difficulty: row.keyword_difficulty,
+            intent: row.intent,
+            volume_scope: row.volume_scope,
+            serp: { article_viable: row.serp.article_viable, ugc_results: row.serp.ugc_results },
+          },
+          rules,
+        );
+        row.light = rescored.light;
+        row.light_label = TRAFFIC_LIGHT_LABELS[rescored.light];
+        row.reason = reasonFor(row, levelName);
+      }
+    }
+
     const withoutData = items.filter((i) => i.opportunity_score === null).length;
     log(
       `[keyword-finder] seed="${seed}" mode=${mode} returned=${items.length} no_data=${withoutData} ` +
-        `scope=${scope} level=${levelUsed?.location_name ?? 'national'} cost_usd=${cost.toFixed(4)}`,
+        `scope=${scope} level=${levelUsed?.location_name ?? 'national'} serp_checked=${serpChecked} cost_usd=${cost.toFixed(4)}`,
     );
 
     return {
@@ -316,6 +398,7 @@ export function createKeywordFinderService(deps: FinderDeps) {
       notice,
       geo_ladder: ladder,
       keywords_without_data: withoutData,
+      serp_checked: serpChecked,
       cost_usd: Number(cost.toFixed(6)),
       rules,
     };

@@ -114,25 +114,75 @@ describe('trafficLight', () => {
     assert.equal(trafficLight({ ...row, volume_scope: 'national' }), 'yellow');
   });
 
-  test('the paid SERP check promotes a yellow but never demotes a green', () => {
+  test('the SERP check promotes on user-generated results holding the top ten', () => {
+    // Measured live: "water heater repair cost" had five Reddit/Facebook threads in the top ten.
+    // Google could not find enough good pages, which is exactly when an article can win.
     const thin = { search_volume: 800, keyword_difficulty: 42, intent: 'commercial' as const, ...base };
     assert.equal(trafficLight(thin), 'yellow');
-    assert.equal(trafficLight({ ...thin, serp_weakness: true }), 'green');
+    assert.equal(trafficLight({ ...thin, serp: { article_viable: true, ugc_results: 5 } }), 'green');
+  });
 
+  test('one lone forum result is noise, not an opening', () => {
+    const thin = { search_volume: 800, keyword_difficulty: 42, intent: 'commercial' as const, ...base };
+    assert.equal(trafficLight({ ...thin, serp: { article_viable: true, ugc_results: 1 } }), 'yellow');
+  });
+
+  test('finding no user-generated results never demotes', () => {
     const good = { search_volume: 1200, keyword_difficulty: 12, intent: 'commercial' as const, ...base };
-    assert.equal(trafficLight({ ...good, serp_weakness: false }), 'green', 'a null result must not punish the user who paid');
+    assert.equal(
+      trafficLight({ ...good, serp: { article_viable: true, ugc_results: 0 } }),
+      'green',
+      'absence of evidence on a ten-result sample must not punish the user who paid',
+    );
+  });
+
+  test('shopping units demote to red whatever the difficulty says', () => {
+    // "leather wallets for women": 14,800 searches, difficulty reported 0, and six product
+    // carousels on page one. Google has decided this is a purchase; no article outranks that.
+    const looksEasy = { search_volume: 14800, keyword_difficulty: 5, intent: 'transactional' as const, ...base };
+    assert.equal(trafficLight(looksEasy), 'green', 'without the check it reads as an easy win');
+    assert.equal(trafficLight({ ...looksEasy, serp: { article_viable: false, ugc_results: 0 } }), 'red');
+
+    // And it settles the case the difficulty-0 rule leaves open.
+    const unmeasured = { search_volume: 14800, keyword_difficulty: null, intent: 'transactional' as const, ...base };
+    assert.equal(trafficLight(unmeasured), 'yellow');
+    assert.equal(trafficLight({ ...unmeasured, serp: { article_viable: false, ugc_results: 0 } }), 'red');
   });
 });
 
 describe('evaluateGates', () => {
   test('an unknown input yields a null gate, not a false one', () => {
     const g = evaluateGates({ search_volume: null, keyword_difficulty: null, intent: null, ...base });
-    assert.deepEqual(g, { difficulty_ok: null, volume_ok: null, intent_ok: null, serp_weakness: null });
+    assert.deepEqual(g, {
+      difficulty_ok: null,
+      volume_ok: null,
+      intent_ok: null,
+      serp_weakness: null,
+      serp_article_viable: null,
+    });
   });
 
   test('gates read the thresholds they are given', () => {
     const g = evaluateGates({ search_volume: 150, keyword_difficulty: 25, intent: 'informational', ...base });
-    assert.deepEqual(g, { difficulty_ok: true, volume_ok: true, intent_ok: true, serp_weakness: null });
+    assert.deepEqual(g, {
+      difficulty_ok: true,
+      volume_ok: true,
+      intent_ok: true,
+      serp_weakness: null,
+      serp_article_viable: null,
+    });
+  });
+
+  test('the SERP gates reflect what the check saw', () => {
+    const g = evaluateGates({
+      search_volume: 150,
+      keyword_difficulty: 25,
+      intent: 'informational',
+      ...base,
+      serp: { article_viable: false, ugc_results: 3 },
+    });
+    assert.equal(g.serp_weakness, true);
+    assert.equal(g.serp_article_viable, false);
   });
 });
 
