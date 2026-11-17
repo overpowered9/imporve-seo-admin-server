@@ -18,8 +18,11 @@ import { fileURLToPath } from 'node:url';
 import {
   createDataForSeoClient,
   DataForSeoError,
+  ADS_ENDPOINTS,
+  ADS_MAX_KEYWORDS_PER_TASK,
   LABS_ENDPOINTS,
   SERP_ENDPOINTS,
+  isAdsKeywordAcceptable,
   assertAllowedPath,
   assertLabsPath,
   kindForStatusCode,
@@ -283,24 +286,83 @@ describe('Labs-only guarantee', () => {
     assert.throws(() => assertLabsPath('/keywords_data/google_ads/search_volume/live'), /only Labs endpoints/);
   });
 
-  test('the client source names no Google Ads / Keywords Data path', () => {
+  test('the only Keywords Data paths named in the client source are the two allow-listed ones', () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const src = fs.readFileSync(path.join(here, 'dataforseo.client.ts'), 'utf8');
     const code = src.split('\n').filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*')).join('\n');
-    // Content v3 (search data lookup, approved 14 Nov) deliberately adds the Google SERP organic
-    // live/advanced and locations endpoints; the Google Ads / Keywords Data family stays banned.
-    // Was: assert.doesNotMatch(code, /keywords_data|google_ads|serp\/google\/organic/);
-    assert.doesNotMatch(code, /keywords_data|google_ads/);
+    // History of this guard:
+    //   v1: assert.doesNotMatch(code, /keywords_data|google_ads|serp\/google\/organic/);
+    //   Content v3 (14 Nov): the two Google SERP paths were added.
+    //   Keyword Finder (17 Nov): local volume needs Google Ads, so a blanket ban would have to go.
+    // It is replaced rather than deleted: the source may still only name the exact two Ads paths,
+    // so a later edit cannot quietly reach keywords_for_site, google_trends, the task_post queue or
+    // any other Keywords Data endpoint. Deleting this test is the thing it exists to prevent.
+    const named = [...code.matchAll(/'(\/keywords_data\/[^']*)'/g)].map((m) => m[1]);
+    assert.deepEqual([...new Set(named)].sort(), [...Object.values(ADS_ENDPOINTS)].sort());
   });
 
-  test('SERP access is exactly the two Content v3 paths', () => {
+  test('non-Labs access is exactly the two SERP paths and the two Google Ads paths', () => {
     assert.deepEqual(Object.values(SERP_ENDPOINTS), ['/serp/google/organic/live/advanced', '/serp/google/locations']);
+    assert.deepEqual(Object.values(ADS_ENDPOINTS), [
+      '/keywords_data/google_ads/search_volume/live',
+      '/keywords_data/google_ads/locations',
+    ]);
     assertAllowedPath('/serp/google/organic/live/advanced');
     assertAllowedPath('/serp/google/locations/us');
     assertAllowedPath(LABS_ENDPOINTS.keyword_overview);
-    for (const bad of ['/keywords_data/google_ads/search_volume/live', '/serp/google/organic/task_post', '/serp/bing/organic/live/advanced', '/serp/google/locations/usa', '/serp/google/locations/us/extra', '/backlinks/summary/live']) {
+    assertAllowedPath('/keywords_data/google_ads/search_volume/live');
+    assertAllowedPath('/keywords_data/google_ads/locations/us');
+    for (const bad of [
+      '/serp/google/organic/task_post',
+      '/serp/bing/organic/live/advanced',
+      '/serp/google/locations/usa',
+      '/serp/google/locations/us/extra',
+      '/backlinks/summary/live',
+      // Still refused, and this is the point of the narrow list: the rest of Keywords Data.
+      '/keywords_data/google_ads/keywords_for_site/live',
+      '/keywords_data/google_ads/keywords_for_keywords/live',
+      '/keywords_data/google_ads/search_volume/task_post',
+      '/keywords_data/google_trends/explore/live',
+      '/keywords_data/clickstream_data/dataforseo_search_volume/live',
+      // The worldwide locations list is deliberately unreachable; only the per-country form is.
+      '/keywords_data/google_ads/locations',
+      '/keywords_data/google_ads/locations/usa',
+    ]) {
       assert.throws(() => assertAllowedPath(bad), /not allowed/, bad);
     }
+  });
+
+  test('Google Ads keyword limits are enforced before a task is built', () => {
+    // Google Ads fails the WHOLE task on one unacceptable keyword, and bills per request, so a
+    // batch must be filtered before it is sent rather than after it fails.
+    assert.equal(isAdsKeywordAcceptable('leather wallets for women'), true);
+    assert.equal(isAdsKeywordAcceptable(''), false);
+    assert.equal(isAdsKeywordAcceptable('   '), false);
+    assert.equal(isAdsKeywordAcceptable('a'.repeat(81)), false);
+    assert.equal(isAdsKeywordAcceptable('a'.repeat(80)), true);
+    assert.equal(isAdsKeywordAcceptable('one two three four five six seven eight nine ten'), true);
+    assert.equal(isAdsKeywordAcceptable('one two three four five six seven eight nine ten eleven'), false);
+    assert.equal(isAdsKeywordAcceptable('leather wallet 🧡'), false);
+  });
+
+  test('adsSearchVolume refuses an oversized or unfiltered batch without calling out', async () => {
+    let called = 0;
+    const client = createDataForSeoClient({
+      login: 'l',
+      password: 'p',
+      fetchImpl: (async () => {
+        called += 1;
+        throw new Error('should not be reached');
+      }) as unknown as typeof fetch,
+    });
+    const ok = { location_code: 2840, language_code: 'en' };
+    assert.throws(() => client.adsSearchVolume({ keywords: [], ...ok }), /no keywords/);
+    assert.throws(
+      () => client.adsSearchVolume({ keywords: new Array(ADS_MAX_KEYWORDS_PER_TASK + 1).fill('x'), ...ok }),
+      /exceeds the 1000 per-task cap/,
+    );
+    assert.throws(() => client.adsSearchVolume({ keywords: ['fine', 'a'.repeat(81)], ...ok }), /breaks a Google Ads limit/);
+    assert.equal(called, 0, 'a rejected batch must never reach the network, because Ads bills per request');
   });
 
   test('refuses to build without credentials', () => {

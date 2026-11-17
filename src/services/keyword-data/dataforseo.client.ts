@@ -9,7 +9,21 @@
  * CONTENT V3 ADDITION (search data lookup, decided 30 Oct): two Google SERP endpoints, listed by
  * exact path in SERP_ENDPOINTS — organic live/advanced (POST, with People Also Ask and related
  * searches) and the free locations list (GET, per country). `assertAllowedPath` admits Labs paths
- * and exactly those; the Google Ads / Keywords Data family is still refused.
+ * and exactly those.
+ *
+ * KEYWORD FINDER ADDITION (local volume, decided 17 Nov): the blanket refusal of the Google Ads /
+ * Keywords Data family is replaced by an exact two-path allow-list in ADS_ENDPOINTS — search volume
+ * (POST, live) and the free locations list (GET, per country). The original rail existed to stop
+ * scope and spend creep, not because Ads data is unfit for organic SEO: DataForSEO's own Labs
+ * volume is "based on Google Ads API" already, so this widens the geography we may ask for
+ * (country-only to state and city), not the provenance of the number. Every other path under
+ * /keywords_data/ stays refused.
+ *
+ * ADS DATA IS VOLUME ONLY. `competition`, `competition_index` and `cpc` describe the ad auction and
+ * must never be read as organic ranking difficulty — a word can be fiercely bid on and trivial to
+ * rank for, and the reverse. They are typed on the wire item so nothing is silently dropped, but
+ * difficulty stays Labs-only (`keyword_properties.keyword_difficulty`, derived from the link
+ * profiles of the top 10 organic pages).
  *
  * CREDENTIALS come from the caller (the config module reads DATAFORSEO_LOGIN / DATAFORSEO_PASSWORD
  * from env). They are sent as HTTP Basic auth and never logged: the per-call log line carries the
@@ -261,6 +275,43 @@ export interface DataForSeoSerpClient {
   serpGoogleLocations(countryIso: string, opts?: { timeoutMs?: number }): Promise<DataForSeoCallResult<DfsLocation>>;
 }
 
+// ---------- Google Ads (Keyword Finder local volume) ----------
+
+/**
+ * keywords_data/google_ads/search_volume/live -> tasks[].result[] (flat items, not nested).
+ *
+ * `competition`, `competition_index` and `cpc` are AD AUCTION signals. They are here so the wire
+ * shape is honest; they are not ranking difficulty and must not be normalised into it.
+ */
+export interface DfsAdsSearchVolumeItem {
+  keyword: string;
+  location_code?: number | null;
+  language_code?: string | null;
+  search_volume?: number | null;
+  /** HIGH | MEDIUM | LOW. Ad auction, not organic difficulty. */
+  competition?: string | null;
+  /** 0-100. Ad auction, not organic difficulty. */
+  competition_index?: number | null;
+  /** Ad auction. */
+  cpc?: number | null;
+  monthly_searches?: Array<{ year?: number | null; month?: number | null; search_volume?: number | null }> | null;
+}
+
+export interface AdsSearchVolumeParams {
+  /** At most ADS_MAX_KEYWORDS_PER_TASK, each already passing isAdsKeywordAcceptable. */
+  keywords: string[];
+  /** A Google Ads location code: a country, a state or a city. */
+  location_code: number;
+  language_code: string;
+  timeoutMs?: number;
+}
+
+export interface DataForSeoAdsClient {
+  adsSearchVolume(params: AdsSearchVolumeParams): Promise<DataForSeoCallResult<DfsAdsSearchVolumeItem>>;
+  /** Free. ISO 3166-1 alpha-2, e.g. "us". Returns countries, states and cities with parent codes. */
+  adsLocations(countryIso: string, opts?: { timeoutMs?: number }): Promise<DataForSeoCallResult<DfsLocation>>;
+}
+
 export interface DataForSeoClientOptions {
   login: string;
   password: string;
@@ -299,7 +350,45 @@ export const SERP_ENDPOINTS = Object.freeze({
 });
 
 export type SerpEndpointKey = keyof typeof SERP_ENDPOINTS;
-type EndpointKey = LabsEndpointKey | SerpEndpointKey;
+
+/**
+ * The Google Ads paths the Keyword Finder may call, by exact path. Nothing else under
+ * /keywords_data/ is reachable — see assertAllowedPath.
+ */
+export const ADS_ENDPOINTS = Object.freeze({
+  ads_search_volume: '/keywords_data/google_ads/search_volume/live',
+  ads_locations: '/keywords_data/google_ads/locations',
+});
+
+export type AdsEndpointKey = keyof typeof ADS_ENDPOINTS;
+type EndpointKey = LabsEndpointKey | SerpEndpointKey | AdsEndpointKey;
+
+/** Google Ads limits, enforced here because breaking one fails the whole task, not one keyword. */
+export const ADS_MAX_KEYWORDS_PER_TASK = 1000;
+export const ADS_MAX_KEYWORD_CHARS = 80;
+export const ADS_MAX_KEYWORD_WORDS = 10;
+
+/**
+ * Google Ads is billed per REQUEST, not per keyword, and accepts up to 1000 keywords per task.
+ * That is what makes the city -> state -> country ladder affordable: one task per level for a
+ * whole list, rather than one call per keyword. It is also slower than Labs, hence its own
+ * timeout rather than the 8 s Labs default.
+ */
+export const ADS_DEFAULT_TIMEOUT_MS = 20_000;
+
+/**
+ * Whether Google Ads will accept this keyword. Callers filter with this BEFORE building a task:
+ * one unacceptable keyword can cost the whole batch, and a keyword Google will not price is not
+ * an error worth failing a user's search over.
+ */
+export function isAdsKeywordAcceptable(keyword: string): boolean {
+  const k = String(keyword ?? '').trim();
+  if (!k || k.length > ADS_MAX_KEYWORD_CHARS) return false;
+  if (k.split(/\s+/).length > ADS_MAX_KEYWORD_WORDS) return false;
+  // Google Ads rejects emoji and assorted pictographic symbols.
+  if (/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/u.test(k)) return false;
+  return true;
+}
 
 const LABS_PREFIX = '/dataforseo_labs/';
 
@@ -318,7 +407,12 @@ export function assertAllowedPath(path: string): void {
   if (path.startsWith(LABS_PREFIX)) return;
   if (path === SERP_ENDPOINTS.serp_organic_advanced) return;
   if (/^\/serp\/google\/locations\/[a-z]{2}$/.test(path)) return;
-  throw new Error(`DataForSEO path "${path}" is not allowed; only Labs and the Content v3 SERP endpoints are`);
+  if (path === ADS_ENDPOINTS.ads_search_volume) return;
+  if (/^\/keywords_data\/google_ads\/locations\/[a-z]{2}$/.test(path)) return;
+  throw new Error(
+    `DataForSEO path "${path}" is not allowed; only Labs, the Content v3 SERP endpoints and the two ` +
+      `Google Ads paths in ADS_ENDPOINTS are`,
+  );
 }
 
 /** DataForSEO-reported volumes of related keywords are capped per depth; depth 2 covers the Planner's 30. */
@@ -367,7 +461,9 @@ function describe(err: unknown): string {
   return String(err);
 }
 
-export function createDataForSeoClient(options: DataForSeoClientOptions): DataForSeoClient & DataForSeoSerpClient {
+export function createDataForSeoClient(
+  options: DataForSeoClientOptions,
+): DataForSeoClient & DataForSeoSerpClient & DataForSeoAdsClient {
   const {
     login,
     password,
@@ -601,6 +697,42 @@ export function createDataForSeoClient(options: DataForSeoClientOptions): DataFo
     serpGoogleLocations(countryIso, opts) {
       const iso = String(countryIso || '').trim().toLowerCase();
       return request<DfsLocation>('serp_google_locations', `${SERP_ENDPOINTS.serp_google_locations}/${iso}`, null, opts?.timeoutMs ?? Math.max(timeoutMs, 20_000));
+    },
+    adsSearchVolume(params) {
+      const keywords = params.keywords ?? [];
+      if (keywords.length === 0) {
+        throw new Error('adsSearchVolume: no keywords');
+      }
+      if (keywords.length > ADS_MAX_KEYWORDS_PER_TASK) {
+        throw new Error(
+          `adsSearchVolume: ${keywords.length} keywords exceeds the ${ADS_MAX_KEYWORDS_PER_TASK} per-task cap`,
+        );
+      }
+      const rejected = keywords.find((k) => !isAdsKeywordAcceptable(k));
+      if (rejected !== undefined) {
+        throw new Error(
+          `adsSearchVolume: keyword "${rejected}" breaks a Google Ads limit (${ADS_MAX_KEYWORD_CHARS} chars, ` +
+            `${ADS_MAX_KEYWORD_WORDS} words, no emoji); filter with isAdsKeywordAcceptable first`,
+        );
+      }
+      return request<DfsAdsSearchVolumeItem>(
+        'ads_search_volume',
+        ADS_ENDPOINTS.ads_search_volume,
+        JSON.stringify([
+          {
+            keywords,
+            location_code: params.location_code,
+            language_code: params.language_code,
+            search_partners: false,
+            include_adult_keywords: false,
+          },
+        ]),
+        params.timeoutMs ?? Math.max(timeoutMs, ADS_DEFAULT_TIMEOUT_MS),
+      );
+    },
+    adsLocations(countryIso, opts) {
+      const iso = String(countryIso || '').trim().toLowerCase();
+      return request<DfsLocation>('ads_locations', `${ADS_ENDPOINTS.ads_locations}/${iso}`, null, opts?.timeoutMs ?? Math.max(timeoutMs, 20_000));
     },
   };
 }
