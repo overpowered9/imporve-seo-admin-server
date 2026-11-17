@@ -380,3 +380,52 @@ describe('the optional SERP check', () => {
     );
   });
 });
+
+describe('resilience', () => {
+  // Measured in production: DataForSEO returns transient 500s. A search that throws away the
+  // calls that already succeeded also throws away the money they cost.
+  function labsWithFailingOverview(): DataForSeoClient {
+    const base = labsFor(SEED_ROW, RELATED);
+    return {
+      ...base,
+      async keywordOverview() {
+        throw new Error('HTTP 500: upstream hiccup');
+      },
+    };
+  }
+
+  test('a failed seed lookup does not lose the list it came with', async () => {
+    const finder = createKeywordFinderService({ labs: labsWithFailingOverview(), log: () => {} });
+    const r = await finder.discover({ seed: 'leather wallets', country_iso: 'us', country_location_code: US });
+
+    assert.equal(r.items.length, RELATED.length + 1, 'the related list survives, plus the seed row');
+    assert.ok(r.items.some((i) => i.keyword === 'best leather wallets for men'));
+
+    // The seed is still present, just without its own figures.
+    const seed = r.items.find((i) => i.is_seed)!;
+    assert.equal(seed.keyword, 'leather wallets');
+    assert.equal(seed.light, 'unknown');
+  });
+
+  test('a failed related lookup does fail the search, because there is no list without it', async () => {
+    const base = labsFor(SEED_ROW, RELATED);
+    const labs: DataForSeoClient = {
+      ...base,
+      async relatedKeywords() {
+        throw new Error('HTTP 500: upstream hiccup');
+      },
+    };
+    const finder = createKeywordFinderService({ labs, log: () => {} });
+    await assert.rejects(
+      () => finder.discover({ seed: 'leather wallets', country_iso: 'us', country_location_code: US }),
+      /upstream hiccup/,
+    );
+  });
+
+  test('the cost of a lost call is not billed to the search', async () => {
+    const finder = createKeywordFinderService({ labs: labsWithFailingOverview(), log: () => {} });
+    const r = await finder.discover({ seed: 'leather wallets', country_iso: 'us', country_location_code: US });
+    // related_keywords costs 0.0156 in the fixture; the failed overview's 0.012 is not added.
+    assert.equal(r.cost_usd, 0.0156);
+  });
+});

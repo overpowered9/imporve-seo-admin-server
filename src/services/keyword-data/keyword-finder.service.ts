@@ -18,7 +18,7 @@
  *   list       — a bulk list to pick many from and hand to a bulk content project.
  *   recommend  — a short shortlist for one post, each row carrying the sentence that explains it.
  */
-import type { DataForSeoClient } from './dataforseo.client.js';
+import type { DataForSeoCallResult, DataForSeoClient, DfsKeywordOverviewResult } from './dataforseo.client.js';
 import { normalizeKeyword, normalizeLanguageCode, type KeywordIntent } from './keyword-data.types.js';
 import { normalizeDifficulty, normalizeIntent, normalizeVolume } from './normalize.js';
 import {
@@ -215,7 +215,11 @@ export function createKeywordFinderService(deps: FinderDeps) {
 
     // ---- 1. Discovery and the seed itself, nationally. Labs cannot do better than a country. ----
     let cost = 0;
-    const [related, overview] = await Promise.all([
+    // Two independent calls, and they are not equally important. related_keywords IS the product:
+    // without it there is no list and nothing to show. keyword_overview only fills in the seed's
+    // own row. So a failure of the second must not throw away the first — along with the money
+    // already spent on it. Settled rather than all.
+    const [relatedSettled, overviewSettled] = await Promise.allSettled([
       labs.relatedKeywords({
         keyword: seed,
         location_code: country,
@@ -225,7 +229,22 @@ export function createKeywordFinderService(deps: FinderDeps) {
       }),
       labs.keywordOverview({ keywords: [seed], location_code: country, language_code: language }),
     ]);
-    cost += related.cost + overview.cost;
+
+    if (relatedSettled.status === 'rejected') throw relatedSettled.reason;
+    const related = relatedSettled.value;
+    cost += related.cost;
+
+    let overview = null as DataForSeoCallResult<DfsKeywordOverviewResult> | null;
+    if (overviewSettled.status === 'fulfilled') {
+      overview = overviewSettled.value;
+      cost += overview.cost;
+    } else {
+      const why = overviewSettled.reason;
+      log(
+        `[keyword-finder] seed lookup failed for "${seed}", continuing with the related list: ` +
+          `${why instanceof Error ? why.message : String(why)}`,
+      );
+    }
 
     const national = new Map<string, { volume: number | null; difficulty: number | null; intent: KeywordIntent | null }>();
     const order: string[] = [];
@@ -244,7 +263,7 @@ export function createKeywordFinderService(deps: FinderDeps) {
       });
     };
 
-    for (const r of overview.result ?? []) {
+    for (const r of overview?.result ?? []) {
       for (const item of r?.items ?? []) absorb(item?.keyword, item);
     }
     for (const r of related.result ?? []) {

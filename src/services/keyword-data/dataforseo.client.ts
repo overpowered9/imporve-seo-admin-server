@@ -643,10 +643,14 @@ export function createDataForSeoClient(
                 retryable: true,
               });
         const willRetry = dfsErr.retryable && attempt <= maxRetries;
+        // The message matters more than the codes. On an upstream 5xx DataForSEO still returns
+        // its standard envelope with status_code 20000, so "http=500 status=20000" looks like a
+        // contradiction and says nothing about what went wrong; the message is where the reason is.
         log(
           `[dataforseo]${runTag()} endpoint=${key} error kind=${dfsErr.kind} level=${dfsErr.level} ` +
             `http=${dfsErr.httpStatus ?? '-'} status=${dfsErr.statusCode ?? '-'} ` +
-            `latency_ms=${latencyMs} attempt=${attempt} retry=${willRetry ? 'yes' : 'no'}`,
+            `latency_ms=${latencyMs} attempt=${attempt} retry=${willRetry ? 'yes' : 'no'} ` +
+            `msg="${dfsErr.message.replace(/"/g, "'")}"`,
         );
         if (!willRetry) throw dfsErr;
         await sleep(retryBackoffMs * attempt);

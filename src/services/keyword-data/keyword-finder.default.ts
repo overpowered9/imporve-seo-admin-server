@@ -31,7 +31,17 @@ function getClient() {
   if (!creds) {
     throw new Error('DATAFORSEO_LOGIN / DATAFORSEO_PASSWORD are not set');
   }
-  client = createDataForSeoClient({ ...creds, timeoutMs: FINDER_TIMEOUT_MS });
+  client = createDataForSeoClient({
+    ...creds,
+    timeoutMs: FINDER_TIMEOUT_MS,
+    // Measured in production: DataForSEO returns transient 500s that clear on a later attempt.
+    // The default single retry 300 ms later is not enough to ride one out, and a failed search
+    // throws away the calls that already succeeded and were already paid for. Four attempts with
+    // a longer backoff costs at most a few extra seconds on a search where someone is waiting
+    // deliberately, and turns a hiccup into a delay rather than an error.
+    maxRetries: 3,
+    retryBackoffMs: 600,
+  });
   return client;
 }
 
