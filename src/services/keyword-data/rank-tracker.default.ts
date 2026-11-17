@@ -1,12 +1,17 @@
 /**
  * The live rank tracker, and its scheduler.
  *
- * Follows trial-emails.service.ts: a setInterval loop started from index.ts, off unless its env
- * flag says otherwise. Rank checks cost money on every tick, so the default is OFF and both the
- * cadence and the per-tick ceiling are explicit.
+ * Follows trial-emails.service.ts: a setInterval loop started from index.ts.
  *
- *   RANK_TRACKER_ENABLED     "true" starts the scheduler. Anything else leaves it off, and the
- *                            admin panel's Check and Run buttons still work on demand.
+ * ON BY DEFAULT, which is safe for one specific reason: the scheduler only ever checks targets
+ * somebody has explicitly added. With no targets a tick costs nothing and makes no provider call
+ * at all, so the feature cannot start spending on its own — it spends only after a human asks for
+ * a keyword to be watched. The cadence and the per-tick ceiling are still explicit, and
+ * credentials are still required.
+ *
+ *   RANK_TRACKER_ENABLED     Opt-out. "false", "0", "off" or "no" stops the scheduler; anything
+ *                            else (including unset) runs it. The panel's Check and Run buttons
+ *                            work either way.
  *   RANK_TRACKER_STALE_HOURS How old a check must be before it is redone. Default 168 (weekly):
  *                            positions do not move fast enough to be worth paying for daily.
  *   RANK_TRACKER_MAX_PER_RUN Hard ceiling on SERP calls per tick. Default 50, so a tick can never
@@ -28,6 +33,17 @@ export function __resetRankTracker(): void {
   singleton = null;
 }
 
+/**
+ * Whether the scheduler should run. Opt-out, not opt-in: only an explicit negative stops it.
+ *
+ * Exported so the rule is testable without starting a timer — the thing that decides whether a
+ * deploy starts spending money should not be reachable only through a side effect.
+ */
+export function rankTrackerSchedulerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.RANK_TRACKER_ENABLED ?? '').trim().toLowerCase();
+  return !['false', '0', 'off', 'no'].includes(raw);
+}
+
 function intFromEnv(name: string, fallback: number): number {
   const raw = (process.env[name] ?? '').trim();
   if (!/^\d+$/.test(raw)) return fallback;
@@ -41,12 +57,12 @@ let timer: NodeJS.Timeout | null = null;
 
 export function startRankTrackerScheduler(): void {
   if (timer) return;
-  if ((process.env.RANK_TRACKER_ENABLED ?? '').trim() !== 'true') {
-    console.log('ℹ️  Rank tracker scheduler off (RANK_TRACKER_ENABLED is not "true"). On-demand checks still work.');
+  if (!rankTrackerSchedulerEnabled()) {
+    console.log('ℹ️  Rank tracker scheduler disabled (RANK_TRACKER_ENABLED). On-demand checks still work.');
     return;
   }
   if (!isKeywordFinderConfigured()) {
-    console.warn('⚠️  RANK_TRACKER_ENABLED is true but DataForSEO credentials are missing; scheduler not started.');
+    console.warn('⚠️  Rank tracker scheduler not started: DataForSEO credentials are missing.');
     return;
   }
 

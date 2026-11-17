@@ -15,6 +15,7 @@ import {
   siteMatchesDomain,
   RANK_CHECK_DEPTH,
 } from './rank-tracker.service.js';
+import { rankTrackerSchedulerEnabled } from './rank-tracker.default.js';
 import type { SerpSignal } from './serp-signal.service.js';
 
 function signal(sites: Array<string | null>): SerpSignal {
@@ -228,5 +229,26 @@ describe('addTarget', () => {
 
     await assert.rejects(() => tracker.addTarget({ domain: '', keyword: 'x' }), /domain is required/);
     await assert.rejects(() => tracker.addTarget({ domain: 'example.com', keyword: '   ' }), /keyword is required/);
+  });
+});
+
+describe('rankTrackerSchedulerEnabled', () => {
+  test('runs by default, because with no targets a tick costs nothing', () => {
+    assert.equal(rankTrackerSchedulerEnabled({}), true);
+    assert.equal(rankTrackerSchedulerEnabled({ RANK_TRACKER_ENABLED: '' }), true);
+    assert.equal(rankTrackerSchedulerEnabled({ RANK_TRACKER_ENABLED: 'true' }), true);
+  });
+
+  test('only an explicit negative stops it', () => {
+    for (const raw of ['false', 'FALSE', '0', 'off', 'no', ' false ']) {
+      assert.equal(rankTrackerSchedulerEnabled({ RANK_TRACKER_ENABLED: raw }), false, raw);
+    }
+  });
+
+  test('a typo does not silently disable it', () => {
+    // "disabled" is not in the opt-out list, so it reads as on. A deploy that meant to stop the
+    // scheduler and got the value wrong keeps running, which is the recoverable direction: the
+    // bill is capped, whereas silently stopping rank history cannot be backfilled.
+    assert.equal(rankTrackerSchedulerEnabled({ RANK_TRACKER_ENABLED: 'disabled' }), true);
   });
 });
