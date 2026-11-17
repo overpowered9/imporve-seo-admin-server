@@ -255,3 +255,52 @@ describe('reasonFor', () => {
     assert.ok(!/in Austin/.test(reasonFor(row, 'Austin')));
   });
 });
+
+describe('a reported difficulty of 0', () => {
+  // Measured on live data: "leather wallets" scored 0 at 27,100 searches/month while "best
+  // leather wallets" scored 3 at 1,600. A head term is never easier than its own modifier, so a
+  // 0 cannot be read as "trivial". It is treated as unknown instead.
+  const ZEROS: Row[] = [
+    { keyword: 'leather wallets for women', volume: 14800, kd: 0, intent: 'transactional' },
+    { keyword: 'best leather wallets', volume: 1600, kd: 3, intent: 'commercial' },
+    { keyword: 'vegan wallet alternatives', volume: null, kd: null, intent: null },
+  ];
+
+  test('is kept as reported but not used for scoring', async () => {
+    const finder = createKeywordFinderService({ labs: labsFor(null, ZEROS), log: () => {} });
+    const r = await finder.discover({ seed: 'leather wallets', country_iso: 'us', country_location_code: US });
+
+    const row = r.items.find((i) => i.keyword === 'leather wallets for women')!;
+    assert.equal(row.difficulty_reported, 0, 'nothing is hidden');
+    assert.equal(row.keyword_difficulty, null, 'but it is not treated as a measurement');
+  });
+
+  test('can never be green, however good the volume and intent', async () => {
+    const finder = createKeywordFinderService({ labs: labsFor(null, ZEROS), log: () => {} });
+    const r = await finder.discover({ seed: 'leather wallets', country_iso: 'us', country_location_code: US });
+
+    const row = r.items.find((i) => i.keyword === 'leather wallets for women')!;
+    assert.equal(row.light, 'yellow', '14,800 transactional searches is real demand, but we cannot call it easy');
+    assert.match(row.reason, /could not be measured/);
+    assert.match(row.reason, /check it before committing/);
+  });
+
+  test('a measured low difficulty is still green', async () => {
+    const finder = createKeywordFinderService({ labs: labsFor(null, ZEROS), log: () => {} });
+    const r = await finder.discover({ seed: 'leather wallets', country_iso: 'us', country_location_code: US });
+
+    const row = r.items.find((i) => i.keyword === 'best leather wallets')!;
+    assert.equal(row.keyword_difficulty, 3);
+    assert.equal(row.light, 'green', 'the rule must not swallow genuine easy wins');
+  });
+
+  test('is distinguished from a keyword with no data at all', async () => {
+    const finder = createKeywordFinderService({ labs: labsFor(null, ZEROS), log: () => {} });
+    const r = await finder.discover({ seed: 'leather wallets', country_iso: 'us', country_location_code: US });
+
+    const blank = r.items.find((i) => i.keyword === 'vegan wallet alternatives')!;
+    assert.equal(blank.difficulty_reported, null);
+    assert.equal(blank.light, 'unknown');
+    assert.match(blank.reason, /nothing to judge it on/);
+  });
+});

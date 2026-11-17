@@ -33,6 +33,36 @@ import type { GeoService, GeoStep } from './keyword-geo.service.js';
 
 export type FinderMode = 'list' | 'recommend';
 
+/**
+ * A reported difficulty of exactly 0 is not evidence that a keyword is easy.
+ *
+ * Measured on live data (17 Nov 2026), two seeds, Labs related_keywords:
+ *   "leather wallets"     23 of 37 rows scored exactly 0, including the head term itself at
+ *                         27,100 searches/month. Every one of the 8 high-volume zeros was
+ *                         transactional.
+ *   "water heater repair" 11 of 32 rows scored 0, but only 1 above 1,000 searches. By intent:
+ *                         transactional 83% zero, commercial 33%, informational 30%,
+ *                         navigational 0%.
+ *
+ * The distribution is not a clean sentinel — genuine 1s, 2s and 3s exist alongside the zeros — so
+ * 0 cannot simply be read as "missing". But it cannot be read as "trivial" either: "leather
+ * wallets" (27,100) scored 0 while "best leather wallets" (1,600) scored 3, and a head term is
+ * never easier than its own modifier. The pattern tracks shopping-dominated SERPs, where a score
+ * derived from the link profiles of the top 10 organic pages has little organic material left to
+ * work with.
+ *
+ * So 0 is treated as UNKNOWN for scoring. The consequence is deliberate: such a row can never be
+ * coloured green off the back of a 0. It becomes a yellow when volume and intent are good, which
+ * is the honest answer — there is demand, and we cannot tell you how hard it is. The paid SERP
+ * check is what resolves exactly these rows.
+ *
+ * The reported value is kept on the item as difficulty_reported so nothing is hidden and the
+ * rule can be revisited against more data.
+ */
+export function usableDifficulty(reported: number | null): number | null {
+  return reported === 0 ? null : reported;
+}
+
 export const FINDER_DEFAULTS = Object.freeze({
   /** Rows returned. The Ads ladder prices per request, so a bigger list costs no more to localise. */
   limit: Object.freeze({ list: 100, recommend: 25 } satisfies Record<FinderMode, number>),
@@ -57,7 +87,10 @@ export interface FinderItem {
   /** The figure the score and the light were computed from. */
   volume_used: number | null;
   volume_scope: VolumeScope;
+  /** What the score and the light were computed from. Null when unknown OR reported as 0. */
   keyword_difficulty: number | null;
+  /** Exactly what DataForSEO said, including a 0 we decline to trust. */
+  difficulty_reported: number | null;
   intent: KeywordIntent | null;
   opportunity_score: number | null;
   light: TrafficLight;
@@ -108,14 +141,19 @@ export function reasonFor(item: Omit<FinderItem, 'reason' | 'light_label'>, leve
   const where = item.volume_scope === 'local' && levelName ? ` in ${levelName}` : '';
   const vol = item.volume_used;
   const kd = item.keyword_difficulty;
+  // A reported 0 is not "unknown because nothing came back"; it is a number we decline to trust.
+  const unmeasurable = kd === null && item.difficulty_reported === 0;
 
-  if (vol === null && kd === null) {
+  if (vol === null && kd === null && !unmeasurable) {
     return 'No search data for this phrase, so there is nothing to judge it on.';
   }
   if (vol === 0) {
     return `Nobody appears to search this${where}.`;
   }
   const volPart = vol === null ? 'Search volume unknown' : `About ${vol.toLocaleString('en-US')} searches a month${where}`;
+  if (unmeasurable) {
+    return `${volPart}. How hard it is to rank for could not be measured — the first page is mostly shop listings, so check it before committing.`;
+  }
   if (kd === null) {
     return `${volPart}, but how hard it is to rank for is unknown.`;
   }
@@ -226,10 +264,11 @@ export function createKeywordFinderService(deps: FinderDeps) {
       const local = localVolumes.get(keyword) ?? null;
       const volumeUsed = scope === 'local' ? local : nat.volume;
 
+      const usable = usableDifficulty(nat.difficulty);
       const scored = evaluateScoreAndLight(
         {
           search_volume: volumeUsed,
-          keyword_difficulty: nat.difficulty,
+          keyword_difficulty: usable,
           intent: nat.intent,
           volume_scope: scope,
         },
@@ -243,7 +282,8 @@ export function createKeywordFinderService(deps: FinderDeps) {
         local_volume: local,
         volume_used: volumeUsed,
         volume_scope: scope,
-        keyword_difficulty: nat.difficulty,
+        keyword_difficulty: usable,
+        difficulty_reported: nat.difficulty,
         intent: nat.intent,
         opportunity_score: scored.score,
         light: scored.light,
