@@ -528,7 +528,16 @@ router.post('/article/test', requireAdmin, async (req: Request, res: Response) =
           prompts: r.prompts,
           blueprint_directive: a.messages.blueprint,
           niche_profile: a.messages.niche_profile,
-          prompt_sources: [],
+          prompt_sources: [
+            ...(r.step_prompts.title
+              ? [{ templateType: r.step_prompts.title.templateType, displayName: `Title step (${r.step_prompts.title.version})`, source: r.step_prompts.title.source }]
+              : []),
+            ...(r.step_prompts.planner
+              ? [{ templateType: r.step_prompts.planner.templateType, displayName: `Planner step (${r.step_prompts.planner.version})`, source: r.step_prompts.planner.source }]
+              : []),
+            ...a.prompt_sources,
+          ],
+          prompt_versions: { ...a.prompt_versions, title: r.step_prompts.title?.label ?? null, planner: r.step_prompts.planner?.label ?? null },
           profile_warnings: warnings,
           validator: a.validator,
           writer_json: a.writer_json,

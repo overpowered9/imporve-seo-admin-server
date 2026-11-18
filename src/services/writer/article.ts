@@ -151,6 +151,9 @@ export interface ArticleV3Result {
   /** OPS2: every text the article was built from, by version (the Writer system prompt, the niche
    *  profile block with its type adjustment lines, the blueprint pieces, the interim meta prompt). */
   prompt_versions: { writer: string; niche_profile: string; blueprint: string; meta: string };
+  /** Where each of the seven Writer parts came from: an activated registry version, or the in-code
+   *  text. The admin tester shows this, so "my panel edit is live" stops being a guess. */
+  prompt_sources: WriterPromptSource[];
   model: string;
   messages: { system: string; user: string; blueprint: string; niche_profile: string };
   timings: { writer_ms: number; meta_ms: number; total_ms: number };
@@ -169,6 +172,27 @@ export function finalProofLevel(business: 'standard' | 'regulated', suggested: b
  * content_v3_writer@code#<hash>, or @db<n>of7#<hash> when n of the 7 parts came from the registry.
  * The hash covers the exact system text sent, so equal hashes mean byte-identical prompts.
  */
+export interface WriterPromptSource {
+  templateType: string;
+  displayName: string;
+  source: 'db' | 'fallback';
+  dbVersion?: number | null;
+}
+
+/** One row per Writer part, in the order the system prompt assembles them. */
+export function writerPromptSources(parts: ArticleV3Deps['writerParts']): WriterPromptSource[] {
+  return (Object.keys(WRITER_PROMPT_DEFS) as WriterPart[]).map((part) => {
+    const def = WRITER_PROMPT_DEFS[part];
+    const got = parts?.[part];
+    return {
+      templateType: def.templateType,
+      displayName: def.displayName,
+      source: got?.source === 'db' ? 'db' : 'fallback',
+      dbVersion: got?.source === 'db' ? got.dbVersion ?? null : null,
+    };
+  });
+}
+
 export function writerPromptLabel(system: string, parts: ArticleV3Deps['writerParts']): string {
   const db = Object.values(parts ?? {}).filter((p) => p?.source === 'db').length;
   const base = promptVersionLabel({ templateType: 'content_v3_writer', source: 'fallback', text: system });
@@ -372,6 +396,7 @@ export async function generateArticleV3(input: ArticleV3Input, deps: ArticleV3De
     cost: { writer: writerCost, meta: meta.cost_usd },
     usage: { writer: writerUsage, meta: meta.usage },
     prompt_version: promptVersion,
+    prompt_sources: writerPromptSources(deps.writerParts),
     prompt_versions: {
       writer: promptVersion,
       niche_profile: promptVersionLabel({ templateType: 'content_v3_niche_profile', source: 'fallback', text: niche.block }),

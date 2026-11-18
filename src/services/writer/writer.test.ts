@@ -588,4 +588,18 @@ describe('OPS2: version labels for the code-held texts', () => {
     assert.match(r.prompt_versions.blueprint, /^content_v3_blueprint_pieces@code#[0-9a-f]{8}$/);
     assert.equal(r.prompt_versions.meta, META_PROMPT_VERSION);
   });
+
+  test('prompt_sources names all seven Writer parts and where each came from', async () => {
+    const input = INPUT();
+    const s = scripted([writerText(input)]);
+    const r = await generateArticleV3(input, {
+      ...DEPS(s.call),
+      writerParts: { core: { text: 'CORE FROM DB', source: 'db', dbVersion: 4 } },
+    });
+    assert.equal(r.prompt_sources.length, 7);
+    const core = r.prompt_sources.find((p) => p.templateType === 'content_v3_system');
+    assert.deepEqual({ source: core?.source, dbVersion: core?.dbVersion }, { source: 'db', dbVersion: 4 });
+    assert.equal(r.prompt_sources.filter((p) => p.source === 'fallback').length, 6);
+    assert.match(r.prompt_version, /@db1of7#/);
+  });
 });
